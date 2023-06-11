@@ -253,8 +253,35 @@ fn ublk_del(opt: &DelArgs) -> AnyRes<i32> {
     Ok(0)
 }
 
+fn __ublk_list(id: i32) {
+    let mut ctrl = UblkCtrl::new(id, 0, 0, false).unwrap();
+
+    ctrl.get_info().unwrap();
+    ctrl.dump();
+}
+
 fn ublk_list(opt: &UblkArgs) -> AnyRes<i32> {
-    trace!("ublk list {}", opt.number);
+    if opt.number > 0 {
+        __ublk_list(opt.number);
+        return Ok(0);
+    }
+
+    if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let f = entry.path();
+                if f.is_file() {
+                    if let Some(file_stem) = f.file_stem() {
+                        if let Some(stem) = file_stem.to_str() {
+                            if let Ok(num) = stem.parse::<i32>() {
+                                __ublk_list(num);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(0)
 }
 
