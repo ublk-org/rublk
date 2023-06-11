@@ -140,7 +140,7 @@ fn ublk_queue_fn(
 }
 
 fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
-    let mut ctrl = UblkCtrl::new(opt.number, opt.queue, opt.depth, true)?;
+    let mut ctrl = UblkCtrl::new(opt.number, opt.queue, opt.depth, 512_u32 * 1024, 0, true)?;
     let ublk_dev = Arc::new(UblkDev::new(Box::new(NoneOps {}), &mut ctrl, &opt.r#type)?);
 
     let nr_queues = ublk_dev.dev_info.nr_hw_queues;
@@ -216,7 +216,7 @@ fn ublk_recover(opt: &UblkArgs) -> AnyRes<i32> {
 }
 
 fn __ublk_del(id: i32) -> AnyRes<i32> {
-    let mut ctrl = UblkCtrl::new(id, 0, 0, false)?;
+    let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
 
     ctrl.stop()?;
     ctrl.del()?;
@@ -254,7 +254,7 @@ fn ublk_del(opt: &DelArgs) -> AnyRes<i32> {
 }
 
 fn __ublk_list(id: i32) {
-    let mut ctrl = UblkCtrl::new(id, 0, 0, false).unwrap();
+    let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
 
     ctrl.get_info().unwrap();
     ctrl.dump();
