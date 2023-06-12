@@ -188,6 +188,8 @@ fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
 
     trace!("ctrl {} start {:?}", ctrl.dev_info.dev_id, ctrl.dev_info);
 
+    ctrl.dump();
+
     for qh in threads {
         qh.join().unwrap_or_else(|_| {
             error!("dev-{} join queue thread failed", ublk_dev.dev_info.dev_id)
