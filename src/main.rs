@@ -145,6 +145,7 @@ fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
         Box::new(NoneOps {}),
         &mut ctrl,
         &opt.r#type,
+        0,
         serde_json::json!({}),
     )?);
 
