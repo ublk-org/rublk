@@ -107,6 +107,14 @@ struct UblkArgs {
     number: i32,
 }
 
+fn ublk_tgt_ops(_tgt_type: &String) -> Box<dyn libublk::UblkTgtOps> {
+    Box::new(NoneOps {})
+}
+
+fn ublk_queue_ops(_tgt_type: &String) -> Box<dyn libublk::UblkQueueOps> {
+    Box::new(NoneQueueOps {})
+}
+
 fn ublk_queue_fn(
     dev: &UblkDev,
     q_id: u16,
@@ -115,7 +123,15 @@ fn ublk_queue_fn(
 ) {
     let cq_depth = dev.dev_info.queue_depth as u32;
     let sq_depth = cq_depth;
-    let q = UblkQueue::new(Box::new(NoneQueueOps {}), q_id, dev, sq_depth, cq_depth, 0).unwrap();
+    let q = UblkQueue::new(
+        ublk_queue_ops(&dev.tgt.borrow().tgt_type),
+        q_id,
+        dev,
+        sq_depth,
+        cq_depth,
+        0,
+    )
+    .unwrap();
 
     let (lock, cvar) = &*tid;
     unsafe {
@@ -141,10 +157,11 @@ fn ublk_queue_fn(
 
 fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
     let mut ctrl = UblkCtrl::new(opt.number, opt.queue, opt.depth, 512_u32 * 1024, 0, true)?;
+    let tgt_type = &opt.r#type;
     let ublk_dev = Arc::new(UblkDev::new(
-        Box::new(NoneOps {}),
+        ublk_tgt_ops(tgt_type),
         &mut ctrl,
-        &opt.r#type,
+        tgt_type,
         0,
         serde_json::json!({}),
     )?);
