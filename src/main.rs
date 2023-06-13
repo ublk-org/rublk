@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+mod r#loop;
 mod null;
 
 #[derive(Parser)]
@@ -66,11 +67,17 @@ struct UblkArgs {
 }
 
 fn ublk_tgt_ops(_tgt_type: &String) -> Box<dyn libublk::UblkTgtOps> {
-    Box::new(null::NoneOps {})
+    match _tgt_type.as_str() {
+        "loop" => Box::new(r#loop::LoopOps {}),
+        _ => Box::new(null::NullOps {}),
+    }
 }
 
 fn ublk_queue_ops(_tgt_type: &String) -> Box<dyn libublk::UblkQueueOps> {
-    Box::new(null::NoneQueueOps {})
+    match _tgt_type.as_str() {
+        "loop" => Box::new(r#loop::LoopQueueOps {}),
+        _ => Box::new(null::NullQueueOps {}),
+    }
 }
 
 fn ublk_queue_fn(
