@@ -10,7 +10,7 @@ struct NoneOps {}
 struct NoneQueueOps {}
 
 impl libublk::UblkTgtOps for NoneOps {
-    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
+    fn init_tgt(&self, dev: &UblkDev, _tgt_data: serde_json::Value) -> AnyRes<serde_json::Value> {
         trace!("none: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
@@ -141,7 +141,12 @@ fn ublk_queue_fn(
 
 fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
     let mut ctrl = UblkCtrl::new(opt.number, opt.queue, opt.depth, 512_u32 * 1024, 0, true)?;
-    let ublk_dev = Arc::new(UblkDev::new(Box::new(NoneOps {}), &mut ctrl, &opt.r#type)?);
+    let ublk_dev = Arc::new(UblkDev::new(
+        Box::new(NoneOps {}),
+        &mut ctrl,
+        &opt.r#type,
+        serde_json::json!({}),
+    )?);
 
     let nr_queues = ublk_dev.dev_info.nr_hw_queues;
     let mut qdata = Vec::new();
