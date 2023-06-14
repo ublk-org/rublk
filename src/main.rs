@@ -1,11 +1,11 @@
 use anyhow::Result as AnyRes;
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use libublk::{UblkCtrl, UblkDev, UblkQueue};
 use log::{error, trace};
-use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+mod args;
 mod r#loop;
 mod null;
 
@@ -19,51 +19,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Adds ublk target
-    Add(AddArgs),
+    Add(args::AddArgs),
     /// Deletes ublk target
-    Del(DelArgs),
+    Del(args::DelArgs),
     /// Lists ublk targets
-    List(UblkArgs),
+    List(args::UblkArgs),
     /// Recover ublk targets
-    Recover(UblkArgs),
-}
-
-#[derive(Args)]
-struct AddArgs {
-    ///For ublk-loop only
-    #[clap(long, short = 'f')]
-    file: Option<PathBuf>,
-
-    ///Config file for creating ublk(json format)
-    #[clap(long)]
-    config: Option<PathBuf>,
-
-    #[clap(long, short = 'n', default_value_t=-1)]
-    number: i32,
-
-    #[clap(long, short = 't', default_value = "none")]
-    r#type: String,
-
-    #[clap(long, short = 'q', default_value_t = 1)]
-    queue: u32,
-
-    #[clap(long, short = 'd', default_value_t = 128)]
-    depth: u32,
-}
-
-#[derive(Args)]
-struct DelArgs {
-    #[clap(long, short = 'n', default_value_t = -1)]
-    number: i32,
-
-    #[clap(long, short = 'a', default_value_t = false)]
-    all: bool,
-}
-
-#[derive(Args)]
-struct UblkArgs {
-    #[clap(long, short = 'n', default_value_t = -1)]
-    number: i32,
+    Recover(args::UblkArgs),
 }
 
 fn ublk_tgt_ops(_tgt_type: &String) -> Box<dyn libublk::UblkTgtOps> {
@@ -120,7 +82,7 @@ fn ublk_queue_fn(
     }
 }
 
-fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
+fn ublk_daemon_work(opt: &args::AddArgs) -> AnyRes<i32> {
     let mut ctrl = UblkCtrl::new(opt.number, opt.queue, opt.depth, 512_u32 * 1024, 0, true)?;
     let tgt_type = &opt.r#type;
     let ublk_dev = Arc::new(UblkDev::new(
@@ -189,7 +151,7 @@ fn ublk_daemon_work(opt: &AddArgs) -> AnyRes<i32> {
     Ok(0)
 }
 
-fn ublk_add(opt: &AddArgs) -> AnyRes<i32> {
+fn ublk_add(opt: &args::AddArgs) -> AnyRes<i32> {
     let daemonize = daemonize::Daemonize::new()
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());
@@ -200,7 +162,7 @@ fn ublk_add(opt: &AddArgs) -> AnyRes<i32> {
     }
 }
 
-fn ublk_recover(opt: &UblkArgs) -> AnyRes<i32> {
+fn ublk_recover(opt: &args::UblkArgs) -> AnyRes<i32> {
     trace!("ublk recover {}", opt.number);
     Ok(0)
 }
@@ -214,7 +176,7 @@ fn __ublk_del(id: i32) -> AnyRes<i32> {
     Ok(0)
 }
 
-fn ublk_del(opt: &DelArgs) -> AnyRes<i32> {
+fn ublk_del(opt: &args::DelArgs) -> AnyRes<i32> {
     trace!("ublk del {} {}", opt.number, opt.all);
 
     if !opt.all {
@@ -250,7 +212,7 @@ fn __ublk_list(id: i32) {
     ctrl.dump();
 }
 
-fn ublk_list(opt: &UblkArgs) -> AnyRes<i32> {
+fn ublk_list(opt: &args::UblkArgs) -> AnyRes<i32> {
     if opt.number > 0 {
         __ublk_list(opt.number);
         return Ok(0);
