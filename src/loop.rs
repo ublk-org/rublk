@@ -4,7 +4,6 @@ use libublk::{ublk_tgt_priv_data, UblkDev, UblkIO, UblkQueue};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 // Generate ioctl function
@@ -78,8 +77,13 @@ impl libublk::UblkTgtOps for LoopOps {
         pd.file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_DIRECT)
             .open(&lo_arg.back_file)?;
+
+        if lo_arg.direct_io != 0 {
+            unsafe {
+                libc::fcntl(pd.file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
+            }
+        }
 
         let nr_fds = td.nr_fds;
         td.fds[nr_fds as usize] = pd.file.as_raw_fd();
@@ -87,6 +91,8 @@ impl libublk::UblkTgtOps for LoopOps {
 
         let mut tgt = dev.tgt.borrow_mut();
         tgt.dev_size = lo_file_size(&mut pd.file).unwrap();
+
+        //todo: figure out correct block size
         tgt.params = libublk::ublk_params {
             types: libublk::UBLK_PARAM_TYPE_BASIC,
             basic: libublk::ublk_param_basic {
@@ -104,7 +110,13 @@ impl libublk::UblkTgtOps for LoopOps {
         Ok(serde_json::json!({"loop": lo_arg,}))
     }
     fn deinit_tgt(&self, dev: &UblkDev) {
-        trace!("none: deinit_tgt {}", dev.dev_info.dev_id);
+        trace!("loop: deinit_tgt {}", dev.dev_info.dev_id);
+
+        let td = dev.tdata.borrow_mut();
+        let mut _pd = ublk_tgt_priv_data::<LoPriData>(&td).unwrap();
+        let pd = unsafe { &mut *_pd };
+
+        drop(pd);
     }
 }
 
