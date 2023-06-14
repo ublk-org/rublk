@@ -5,6 +5,9 @@ use log::{error, trace};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+#[macro_use]
+extern crate nix;
+
 mod args;
 mod r#loop;
 mod null;
