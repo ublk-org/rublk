@@ -42,6 +42,13 @@ fn ublk_queue_ops(_tgt_type: &String) -> Box<dyn libublk::UblkQueueOps> {
     }
 }
 
+fn ublk_json_params(opt: &args::AddArgs, _tgt_type: &String) -> serde_json::Value {
+    match _tgt_type.as_str() {
+        "loop" => r#loop::loop_build_args_json(opt),
+        _ => serde_json::json!({}),
+    }
+}
+
 fn ublk_queue_fn(
     dev: &UblkDev,
     q_id: u16,
@@ -90,7 +97,7 @@ fn ublk_daemon_work(opt: &args::AddArgs) -> AnyRes<i32> {
         &mut ctrl,
         tgt_type,
         0,
-        serde_json::json!({}),
+        ublk_json_params(opt, tgt_type),
     )?);
 
     let nr_queues = ublk_dev.dev_info.nr_hw_queues;

@@ -10,6 +10,7 @@ libublk = { path = "../libublk" }
 clap = { version = "4.3.0", features = ["derive"] }
 libc = "0.2"
 anyhow = {version = "1.0.66", features = ["default"]}
+serde = {version = "1.0.99", features = ["derive"]}
 serde_json = "1.0.79"
 log = {version = "0.4", features = ["release_max_level_off"]}
 env_logger = "0.9"

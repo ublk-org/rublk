@@ -1,18 +1,39 @@
 use anyhow::Result as AnyRes;
 use libublk::{UblkDev, UblkIO, UblkQueue};
 use log::trace;
+use serde::{Deserialize, Serialize};
+
+use crate::args::AddArgs;
 
 pub struct LoopOps {}
 pub struct LoopQueueOps {}
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LoopArgs {
+    back_file: String,
+    direct_io: i32,
+}
+
+pub fn loop_build_args_json(a: &AddArgs) -> serde_json::Value {
+    let lo_args = LoopArgs {
+        back_file: (&a)
+            .file
+            .as_ref()
+            .map(|path_buf| path_buf.to_string_lossy().into_owned())
+            .unwrap_or(String::new()),
+        direct_io: a.direct_io as i32,
+    };
+
+    serde_json::json!({"loop": lo_args,})
+}
+
 impl libublk::UblkTgtOps for LoopOps {
-    fn init_tgt(&self, dev: &UblkDev, _tgt_data: serde_json::Value) -> AnyRes<serde_json::Value> {
-        trace!("none: init_tgt {}", dev.dev_info.dev_id);
+    fn init_tgt(&self, dev: &UblkDev, _tdj: serde_json::Value) -> AnyRes<serde_json::Value> {
+        trace!("loop: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
 
         let mut tgt = dev.tgt.borrow_mut();
-
         tgt.dev_size = dev_size;
         tgt.params = libublk::ublk_params {
             types: libublk::UBLK_PARAM_TYPE_BASIC,

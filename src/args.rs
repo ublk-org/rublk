@@ -3,9 +3,13 @@ use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct AddArgs {
-    ///For ublk-loop only
+    ///backing file of ublk target(loop)
     #[clap(long, short = 'f')]
     pub file: Option<PathBuf>,
+
+    ///if direct io is applied for backing file of ublk target(loop)
+    #[clap(long, default_value_t = true)]
+    pub direct_io: bool,
 
     ///Config file for creating ublk(json format)
     #[clap(long)]
