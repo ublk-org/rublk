@@ -1,9 +1,14 @@
+use crate::args::AddArgs;
 use anyhow::Result as AnyRes;
-use libublk::{UblkDev, UblkIO, UblkQueue};
+use libublk::{ublk_tgt_priv_data, UblkDev, UblkIO, UblkQueue};
 use log::trace;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::OpenOptionsExt;
 
-use crate::args::AddArgs;
+#[derive(Debug)]
+pub struct LoPriData {
+    file: std::fs::File,
+}
 
 pub struct LoopOps {}
 pub struct LoopQueueOps {}
@@ -14,7 +19,7 @@ struct LoopArgs {
     direct_io: i32,
 }
 
-pub fn loop_build_args_json(a: &AddArgs) -> serde_json::Value {
+pub fn loop_build_args_json(a: &AddArgs) -> (usize, serde_json::Value) {
     let lo_args = LoopArgs {
         back_file: (&a)
             .file
@@ -24,7 +29,10 @@ pub fn loop_build_args_json(a: &AddArgs) -> serde_json::Value {
         direct_io: a.direct_io as i32,
     };
 
-    serde_json::json!({"loop": lo_args,})
+    (
+        core::mem::size_of::<LoPriData>(),
+        serde_json::json!({"loop": lo_args,}),
+    )
 }
 
 impl libublk::UblkTgtOps for LoopOps {
@@ -32,6 +40,18 @@ impl libublk::UblkTgtOps for LoopOps {
         trace!("loop: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
+
+        let mut td = dev.tdata.borrow_mut();
+        let tdj = _tdj.get("loop").unwrap().clone();
+        let lo_arg = serde_json::from_value::<LoopArgs>(tdj).unwrap();
+
+        let mut _pd = ublk_tgt_priv_data::<LoPriData>(&td).unwrap();
+        let mut pd = unsafe { &mut *_pd };
+        pd.file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(lo_arg.back_file)?;
 
         let mut tgt = dev.tgt.borrow_mut();
         tgt.dev_size = dev_size;

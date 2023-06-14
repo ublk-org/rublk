@@ -42,10 +42,10 @@ fn ublk_queue_ops(_tgt_type: &String) -> Box<dyn libublk::UblkQueueOps> {
     }
 }
 
-fn ublk_json_params(opt: &args::AddArgs, _tgt_type: &String) -> serde_json::Value {
+fn ublk_json_params(opt: &args::AddArgs, _tgt_type: &String) -> (usize, serde_json::Value) {
     match _tgt_type.as_str() {
         "loop" => r#loop::loop_build_args_json(opt),
-        _ => serde_json::json!({}),
+        _ => (0, serde_json::json!({})),
     }
 }
 
@@ -92,12 +92,13 @@ fn ublk_queue_fn(
 fn ublk_daemon_work(opt: &args::AddArgs) -> AnyRes<i32> {
     let mut ctrl = UblkCtrl::new(opt.number, opt.queue, opt.depth, 512_u32 * 1024, 0, true)?;
     let tgt_type = &opt.r#type;
+    let tgt_paras = ublk_json_params(opt, tgt_type);
     let ublk_dev = Arc::new(UblkDev::new(
         ublk_tgt_ops(tgt_type),
         &mut ctrl,
         tgt_type,
-        0,
-        ublk_json_params(opt, tgt_type),
+        tgt_paras.0,
+        tgt_paras.1,
     )?);
 
     let nr_queues = ublk_dev.dev_info.nr_hw_queues;
