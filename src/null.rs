@@ -43,5 +43,6 @@ impl libublk::UblkQueueOps for NullQueueOps {
         q.complete_io(io, tag as u16, bytes);
         Ok(0)
     }
-    fn tgt_io_done(&self, _q: &UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
+    fn tgt_io_done(&self, _q: &UblkQueue, _io: &mut UblkIO, _tag: u32, _res: i32, _user_data: u64) {
+    }
 }

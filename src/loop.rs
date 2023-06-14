@@ -1,6 +1,7 @@
 use crate::args::AddArgs;
 use anyhow::Result as AnyRes;
-use libublk::{ublk_tgt_priv_data, UblkDev, UblkIO, UblkQueue};
+use io_uring::{opcode, squeue, types};
+use libublk::{ublk_tgt_priv_data, ublksrv_io_desc, UblkDev, UblkIO, UblkQueue};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
@@ -120,13 +121,79 @@ impl libublk::UblkTgtOps for LoopOps {
     }
 }
 
+fn loop_queue_tgt_io(
+    q: &UblkQueue,
+    io: &mut UblkIO,
+    tag: u32,
+    iod: &ublksrv_io_desc,
+) -> AnyRes<i32> {
+    let off = (iod.start_sector << 9) as u64;
+    let bytes = (iod.nr_sectors << 9) as u32;
+    let op = iod.op_flags & 0xff;
+    let data = libublk::build_user_data(tag as u16, op, 0, true);
+    let mut r = q.q_ring.borrow_mut();
+
+    if op == libublk::UBLK_IO_OP_WRITE_ZEROES || op == libublk::UBLK_IO_OP_DISCARD {
+        return Err(anyhow::anyhow!("unexpected discard"));
+    }
+
+    match op {
+        libublk::UBLK_IO_OP_FLUSH => {
+            let sqe = &opcode::SyncFileRange::new(types::Fixed(1), bytes)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+                .user_data(data);
+            unsafe {
+                r.submission().push(sqe).expect("submission fail");
+            }
+        }
+        libublk::UBLK_IO_OP_READ => {
+            let sqe = &opcode::Read::new(types::Fixed(1), io.buf_addr, bytes)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+                .user_data(data);
+            unsafe {
+                r.submission().push(sqe).expect("submission fail");
+            }
+        }
+        libublk::UBLK_IO_OP_WRITE => {
+            let sqe = &opcode::Write::new(types::Fixed(1), io.buf_addr, bytes)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+                .user_data(data);
+            unsafe {
+                r.submission().push(sqe).expect("submission fail");
+            }
+        }
+        _ => return Err(anyhow::anyhow!("unexpected op")),
+    }
+
+    Ok(1)
+}
+
 impl libublk::UblkQueueOps for LoopQueueOps {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
-        let iod = q.get_iod(tag);
-        let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let _iod = q.get_iod(tag);
+        let iod = unsafe { &*_iod };
 
-        q.complete_io(io, tag as u16, bytes);
-        Ok(0)
+        loop_queue_tgt_io(q, io, tag, iod)
     }
-    fn tgt_io_done(&self, _q: &UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
+
+    fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64) {
+        let cqe_tag = libublk::user_data_to_tag(user_data);
+
+        assert!(cqe_tag == tag);
+
+        if res != -(libc::EAGAIN) {
+            q.complete_io(io, tag as u16, res);
+        } else {
+            let _iod = q.get_iod(tag);
+            let iod = unsafe { &*_iod };
+
+            loop_queue_tgt_io(q, io, tag, iod).unwrap();
+        }
+    }
 }
