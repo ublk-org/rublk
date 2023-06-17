@@ -1,7 +1,6 @@
-use crate::args::AddArgs;
 use anyhow::Result as AnyRes;
 use io_uring::{opcode, squeue, types};
-use libublk::{ublk_tgt_priv_data, ublksrv_io_desc, UblkDev, UblkIO, UblkQueue};
+use libublk::{ublksrv_io_desc, UblkDev, UblkIO, UblkQueue};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
@@ -12,13 +11,19 @@ const BLKGETSIZE64_CODE: u8 = 0x12; // Defined in linux/fs.h
 const BLKGETSIZE64_SEQ: u8 = 114;
 ioctl_read!(ioctl_blkgetsize64, BLKGETSIZE64_CODE, BLKGETSIZE64_SEQ, u64);
 
-#[derive(Debug)]
-pub struct LoPriData {
-    file: std::fs::File,
+#[derive(Debug, Serialize)]
+struct LoJson {
+    back_file_path: String,
+    direct_io: i32,
 }
 
-pub struct LoopOps {}
-pub struct LoopQueueOps {}
+pub struct LoopTgt {
+    pub back_file_path: String,
+    pub back_file: std::fs::File,
+    pub direct_io: i32,
+}
+
+pub struct LoopQueue {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LoopArgs {
@@ -26,23 +31,7 @@ struct LoopArgs {
     direct_io: i32,
 }
 
-pub fn loop_build_args_json(a: &AddArgs) -> (usize, serde_json::Value) {
-    let lo_args = LoopArgs {
-        back_file: (&a)
-            .file
-            .as_ref()
-            .map(|path_buf| path_buf.to_string_lossy().into_owned())
-            .unwrap_or(String::new()),
-        direct_io: a.direct_io as i32,
-    };
-
-    (
-        core::mem::size_of::<LoPriData>(),
-        serde_json::json!({"loop": lo_args,}),
-    )
-}
-
-fn lo_file_size(f: &mut std::fs::File) -> AnyRes<u64> {
+fn lo_file_size(f: &std::fs::File) -> AnyRes<u64> {
     if let Ok(meta) = f.metadata() {
         if meta.file_type().is_block_device() {
             let fd = f.as_raw_fd();
@@ -64,34 +53,24 @@ fn lo_file_size(f: &mut std::fs::File) -> AnyRes<u64> {
     }
 }
 
-impl libublk::UblkTgtOps for LoopOps {
-    fn init_tgt(&self, dev: &UblkDev, _tdj: serde_json::Value) -> AnyRes<serde_json::Value> {
+impl libublk::UblkTgtImpl for LoopTgt {
+    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
         trace!("loop: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
 
-        let mut td = dev.tdata.borrow_mut();
-        let tdj = _tdj.get("loop").unwrap().clone();
-        let lo_arg = serde_json::from_value::<LoopArgs>(tdj).unwrap();
-
-        let mut _pd = ublk_tgt_priv_data::<LoPriData>(&td).unwrap();
-        let mut pd = unsafe { &mut *_pd };
-        pd.file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lo_arg.back_file)?;
-
-        if lo_arg.direct_io != 0 {
+        if self.direct_io != 0 {
             unsafe {
-                libc::fcntl(pd.file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
+                libc::fcntl(self.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
             }
         }
 
+        let mut td = dev.tdata.borrow_mut();
         let nr_fds = td.nr_fds;
-        td.fds[nr_fds as usize] = pd.file.as_raw_fd();
+        td.fds[nr_fds as usize] = self.back_file.as_raw_fd();
         td.nr_fds = nr_fds + 1;
 
         let mut tgt = dev.tgt.borrow_mut();
-        tgt.dev_size = lo_file_size(&mut pd.file).unwrap();
+        tgt.dev_size = lo_file_size(&self.back_file).unwrap();
 
         //todo: figure out correct block size
         tgt.params = libublk::ublk_params {
@@ -108,16 +87,12 @@ impl libublk::UblkTgtOps for LoopOps {
             ..Default::default()
         };
 
-        Ok(serde_json::json!({"loop": lo_arg,}))
+        Ok(
+            serde_json::json!({"loop": LoJson { back_file_path: self.back_file_path.clone(), direct_io: 1 } }),
+        )
     }
     fn deinit_tgt(&self, dev: &UblkDev) {
         trace!("loop: deinit_tgt {}", dev.dev_info.dev_id);
-
-        let td = dev.tdata.borrow_mut();
-        let mut _pd = ublk_tgt_priv_data::<LoPriData>(&td).unwrap();
-        let pd = unsafe { &mut *_pd };
-
-        drop(pd);
     }
 }
 
@@ -174,7 +149,7 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-impl libublk::UblkQueueOps for LoopQueueOps {
+impl libublk::UblkQueueImpl for LoopQueue {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };

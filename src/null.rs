@@ -2,11 +2,11 @@ use anyhow::Result as AnyRes;
 use libublk::{UblkDev, UblkIO, UblkQueue};
 use log::trace;
 
-pub struct NullOps {}
-pub struct NullQueueOps {}
+pub struct NullTgt {}
+pub struct NullQueue {}
 
-impl libublk::UblkTgtOps for NullOps {
-    fn init_tgt(&self, dev: &UblkDev, _tgt_data: serde_json::Value) -> AnyRes<serde_json::Value> {
+impl libublk::UblkTgtImpl for NullTgt {
+    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
         trace!("none: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
@@ -35,7 +35,7 @@ impl libublk::UblkTgtOps for NullOps {
     }
 }
 
-impl libublk::UblkQueueOps for NullQueueOps {
+impl libublk::UblkQueueImpl for NullQueue {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
