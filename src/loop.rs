@@ -94,6 +94,9 @@ impl libublk::UblkTgtImpl for LoopTgt {
     fn deinit_tgt(&self, dev: &UblkDev) {
         trace!("loop: deinit_tgt {}", dev.dev_info.dev_id);
     }
+    fn tgt_type(&self) -> &'static str {
+        "loop"
+    }
 }
 
 fn loop_queue_tgt_io(

@@ -33,6 +33,9 @@ impl libublk::UblkTgtImpl for NullTgt {
     fn deinit_tgt(&self, dev: &UblkDev) {
         trace!("none: deinit_tgt {}", dev.dev_info.dev_id);
     }
+    fn tgt_type(&self) -> &'static str {
+        "null"
+    }
 }
 
 impl libublk::UblkQueueImpl for NullQueue {

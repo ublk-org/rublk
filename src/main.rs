@@ -31,7 +31,6 @@ enum Commands {
 }
 
 fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
-    let tgt_type = opt.r#type.clone();
     let file = match opt.file {
         Some(p) => p.display().to_string(),
         _ => "".to_string(),
@@ -49,7 +48,6 @@ fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
         depth,
         512_u32 * 1024,
         0,
-        tgt_type.clone().to_string(),
         move || match tgt_type2.as_str() {
             "loop" => Box::new(r#loop::LoopTgt {
                 back_file: std::fs::OpenOptions::new()
