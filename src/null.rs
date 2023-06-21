@@ -1,5 +1,6 @@
 use anyhow::Result as AnyRes;
-use libublk::{UblkDev, UblkIO, UblkQueue};
+use core::any::Any;
+use libublk::{UblkDev, UblkQueue};
 use log::trace;
 
 pub struct NullTgt {}
@@ -36,16 +37,18 @@ impl libublk::UblkTgtImpl for NullTgt {
     fn tgt_type(&self) -> &'static str {
         "null"
     }
+    #[inline(always)]
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl libublk::UblkQueueImpl for NullQueue {
-    fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        q.complete_io(io, tag as u16, bytes);
+        q.complete_io(tag as u16, bytes);
         Ok(0)
-    }
-    fn tgt_io_done(&self, _q: &UblkQueue, _io: &mut UblkIO, _tag: u32, _res: i32, _user_data: u64) {
     }
 }
