@@ -1,5 +1,6 @@
 use anyhow::Result as AnyRes;
 use core::any::Any;
+use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::{ublksrv_io_desc, UblkDev, UblkQueue};
 use log::trace;
@@ -8,9 +9,22 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 
 // Generate ioctl function
-const BLKGETSIZE64_CODE: u8 = 0x12; // Defined in linux/fs.h
-const BLKGETSIZE64_SEQ: u8 = 114;
-ioctl_read!(ioctl_blkgetsize64, BLKGETSIZE64_CODE, BLKGETSIZE64_SEQ, u64);
+const BLK_IOCTL_TYPE: u8 = 0x12; // Defined in linux/fs.h
+const BLKGETSIZE64_NR: u8 = 114;
+const BLKSSZGET_NR: u8 = 104;
+const BLKPBSZGET_NR: u8 = 123;
+
+ioctl_read!(ioctl_blkgetsize64, BLK_IOCTL_TYPE, BLKGETSIZE64_NR, u64);
+ioctl_read_bad!(
+    ioctl_blksszget,
+    request_code_none!(BLK_IOCTL_TYPE, BLKSSZGET_NR),
+    i32
+);
+ioctl_read_bad!(
+    ioctl_blkpbszget,
+    request_code_none!(BLK_IOCTL_TYPE, BLKPBSZGET_NR),
+    u32
+);
 
 #[derive(Debug, Serialize)]
 struct LoJson {
@@ -32,20 +46,27 @@ struct LoopArgs {
     direct_io: i32,
 }
 
-fn lo_file_size(f: &std::fs::File) -> AnyRes<u64> {
+fn lo_file_size(f: &std::fs::File) -> AnyRes<(u64, u8, u8)> {
     if let Ok(meta) = f.metadata() {
         if meta.file_type().is_block_device() {
             let fd = f.as_raw_fd();
-            let mut cap = 0u64;
-            let cap_ptr = &mut cap as *mut u64;
+            let mut cap = 0_u64;
+            let mut ssz = 0_i32;
+            let mut pbsz = 0_u32;
 
             unsafe {
+                let cap_ptr = &mut cap as *mut u64;
+                let ssz_ptr = &mut ssz as *mut i32;
+                let pbsz_ptr = &mut pbsz as *mut u32;
+
                 ioctl_blkgetsize64(fd, cap_ptr).unwrap();
+                ioctl_blksszget(fd, ssz_ptr).unwrap();
+                ioctl_blkpbszget(fd, pbsz_ptr).unwrap();
             }
 
-            Ok(cap)
+            Ok((cap, ssz.log2() as u8, pbsz.log2() as u8))
         } else if meta.file_type().is_file() {
-            Ok(f.metadata().unwrap().len())
+            Ok((f.metadata().unwrap().len(), 9, 12))
         } else {
             Err(anyhow::anyhow!("unsupported file"))
         }
@@ -71,14 +92,15 @@ impl libublk::UblkTgtImpl for LoopTgt {
         td.nr_fds = nr_fds + 1;
 
         let mut tgt = dev.tgt.borrow_mut();
-        tgt.dev_size = lo_file_size(&self.back_file).unwrap();
+        let sz = lo_file_size(&self.back_file).unwrap();
 
+        tgt.dev_size = sz.0;
         //todo: figure out correct block size
         tgt.params = libublk::ublk_params {
             types: libublk::UBLK_PARAM_TYPE_BASIC,
             basic: libublk::ublk_param_basic {
-                logical_bs_shift: 9,
-                physical_bs_shift: 12,
+                logical_bs_shift: sz.1,
+                physical_bs_shift: sz.2,
                 io_opt_shift: 12,
                 io_min_shift: 9,
                 max_sectors: info.max_io_buf_bytes >> 9,
