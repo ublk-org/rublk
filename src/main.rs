@@ -96,7 +96,7 @@ fn __ublk_del(id: i32) -> AnyRes<i32> {
     let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
 
     ctrl.stop()?;
-    ctrl.del()?;
+    ctrl.del_dev()?;
 
     Ok(0)
 }
