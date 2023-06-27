@@ -133,8 +133,9 @@ fn ublk_del(opt: args::DelArgs) -> AnyRes<i32> {
 fn __ublk_list(id: i32) {
     let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
 
-    ctrl.get_info().unwrap();
-    ctrl.dump();
+    if let Ok(_) = ctrl.get_info() {
+        ctrl.dump();
+    }
 }
 
 fn ublk_list(opt: args::UblkArgs) -> AnyRes<i32> {
