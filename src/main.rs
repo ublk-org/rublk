@@ -48,6 +48,7 @@ fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
         depth,
         512_u32 * 1024,
         0,
+        true,
         move || match tgt_type2.as_str() {
             "loop" => Box::new(r#loop::LoopTgt {
                 back_file: std::fs::OpenOptions::new()
