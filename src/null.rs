@@ -1,13 +1,12 @@
-use anyhow::Result as AnyRes;
 use core::any::Any;
-use libublk::{UblkDev, UblkQueue};
+use libublk::{UblkDev, UblkError, UblkQueue};
 use log::trace;
 
 pub struct NullTgt {}
 pub struct NullQueue {}
 
 impl libublk::UblkTgtImpl for NullTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         trace!("none: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
@@ -44,7 +43,7 @@ impl libublk::UblkTgtImpl for NullTgt {
 }
 
 impl libublk::UblkQueueImpl for NullQueue {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32> {
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
