@@ -1,6 +1,6 @@
 use anyhow::Result as AnyRes;
 use clap::{Parser, Subcommand};
-use libublk::{UblkCtrl, UblkQueueImpl};
+use libublk::{ctrl::UblkCtrl, io::UblkQueueImpl};
 use log::trace;
 use std::sync::Arc;
 
