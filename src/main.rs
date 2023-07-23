@@ -2,7 +2,6 @@ use anyhow::Result as AnyRes;
 use clap::{Parser, Subcommand};
 use libublk::{ctrl::UblkCtrl, io::UblkQueueImpl};
 use log::trace;
-use std::sync::Arc;
 
 #[macro_use]
 extern crate nix;
@@ -49,7 +48,7 @@ fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
         512_u32 * 1024,
         0,
         true,
-        move || match tgt_type2.as_str() {
+        move |_| match tgt_type2.as_str() {
             "loop" => Box::new(r#loop::LoopTgt {
                 back_file: std::fs::OpenOptions::new()
                     .read(true)
@@ -61,10 +60,10 @@ fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
             }),
             _ => Box::new(null::NullTgt {}),
         },
-        Arc::new(move || match tgt_type3.clone().as_str() {
+        move |_| match tgt_type3.clone().as_str() {
             "loop" => Box::new(r#loop::LoopQueue {}) as Box<dyn UblkQueueImpl>,
             _ => Box::new(null::NullQueue {}) as Box<dyn UblkQueueImpl>,
-        }),
+        },
         |dev_id| {
             let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
             ctrl.dump();
