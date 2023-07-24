@@ -177,7 +177,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
 }
 
 impl UblkQueueImpl for LoopQueue {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
 

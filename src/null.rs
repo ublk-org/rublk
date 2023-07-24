@@ -44,7 +44,7 @@ impl UblkTgtImpl for NullTgt {
 }
 
 impl UblkQueueImpl for NullQueue {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
