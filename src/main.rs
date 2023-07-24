@@ -58,11 +58,13 @@ fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
                 direct_io: if dio { 1 } else { 0 },
                 back_file_path: file.clone(),
             }),
-            _ => Box::new(null::NullTgt {}),
+            "none" => Box::new(null::NullTgt {}),
+            _ => panic!("wrong target type"),
         },
-        move |_| match tgt_type3.clone().as_str() {
+        move |_| match tgt_type3.as_str() {
             "loop" => Box::new(r#loop::LoopQueue {}) as Box<dyn UblkQueueImpl>,
-            _ => Box::new(null::NullQueue {}) as Box<dyn UblkQueueImpl>,
+            "none" => Box::new(null::NullQueue {}) as Box<dyn UblkQueueImpl>,
+            _ => panic!("wrong target type"),
         },
         |dev_id| {
             let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
