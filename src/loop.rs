@@ -1,12 +1,11 @@
 use anyhow::Result as AnyRes;
-use core::any::Any;
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
-use libublk::sys::ublksrv_io_desc;
+use libublk::ctrl::UblkCtrl;
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::UblkError;
 use log::trace;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 
@@ -40,14 +39,6 @@ pub struct LoopTgt {
     pub direct_io: i32,
 }
 
-pub struct LoopQueue {}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct LoopArgs {
-    back_file: String,
-    direct_io: i32,
-}
-
 fn lo_file_size(f: &std::fs::File) -> AnyRes<(u64, u8, u8)> {
     if let Ok(meta) = f.metadata() {
         if meta.file_type().is_block_device() {
@@ -77,62 +68,17 @@ fn lo_file_size(f: &std::fs::File) -> AnyRes<(u64, u8, u8)> {
     }
 }
 
-impl UblkTgtImpl for LoopTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-        trace!("loop: init_tgt {}", dev.dev_info.dev_id);
-        let info = dev.dev_info;
-
-        if self.direct_io != 0 {
-            unsafe {
-                libc::fcntl(self.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
-            }
-        }
-
-        let mut tgt = dev.tgt.borrow_mut();
-        let nr_fds = tgt.nr_fds;
-        tgt.fds[nr_fds as usize] = self.back_file.as_raw_fd();
-        tgt.nr_fds = nr_fds + 1;
-
-        let sz = lo_file_size(&self.back_file).unwrap();
-
-        tgt.dev_size = sz.0;
-        //todo: figure out correct block size
-        tgt.params = libublk::sys::ublk_params {
-            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::sys::ublk_param_basic {
-                logical_bs_shift: sz.1,
-                physical_bs_shift: sz.2,
-                io_opt_shift: 12,
-                io_min_shift: 9,
-                max_sectors: info.max_io_buf_bytes >> 9,
-                dev_sectors: tgt.dev_size >> 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        Ok(
-            serde_json::json!({"loop": LoJson { back_file_path: self.back_file_path.clone(), direct_io: 1 } }),
-        )
-    }
-    fn deinit_tgt(&self, dev: &UblkDev) {
-        trace!("loop: deinit_tgt {}", dev.dev_info.dev_id);
-    }
-    fn tgt_type(&self) -> &'static str {
-        "loop"
-    }
-    #[inline(always)]
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Result<i32, UblkError> {
+fn loop_queue_tgt_io(
+    io: &mut UblkIOCtx,
+    tag: u32,
+    iod: &libublk::sys::ublksrv_io_desc,
+) -> Result<i32, UblkError> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
-    let data = libublk::io::build_user_data(tag as u16, op, 0, true);
-    let buf_addr = q.get_buf_addr(tag);
+    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
+    let buf_addr = io.io_buf_addr();
+    let r = io.get_ring();
 
     if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
         return Err(UblkError::OtherError(-libc::EINVAL));
@@ -146,7 +92,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                q.q_ring.submission().push(sqe).expect("submission fail");
+                r.submission().push(sqe).expect("submission fail");
             }
         }
         libublk::sys::UBLK_IO_OP_READ => {
@@ -156,7 +102,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                q.q_ring.submission().push(sqe).expect("submission fail");
+                r.submission().push(sqe).expect("submission fail");
             }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
@@ -166,7 +112,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                q.q_ring.submission().push(sqe).expect("submission fail");
+                r.submission().push(sqe).expect("submission fail");
             }
         }
         _ => return Err(UblkError::OtherError(-libc::EINVAL)),
@@ -175,26 +121,103 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
     Ok(1)
 }
 
-impl UblkQueueImpl for LoopQueue {
-    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
-        let _iod = q.get_iod(tag);
-        let iod = unsafe { &*_iod };
+fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<i32, UblkError> {
+    let tag = i.get_tag();
 
-        loop_queue_tgt_io(q, tag, iod)
-    }
-
-    fn tgt_io_done(&self, q: &mut UblkQueue, tag: u32, res: i32, user_data: u64) {
-        let cqe_tag = libublk::io::user_data_to_tag(user_data);
+    // our IO on backing file is done
+    if i.is_tgt_io() {
+        let user_data = i.user_data();
+        let res = i.result();
+        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io(tag as u16, res);
-        } else {
-            let _iod = q.get_iod(tag);
-            let iod = unsafe { &*_iod };
+            i.complete_io(res);
 
-            loop_queue_tgt_io(q, tag, iod).unwrap();
+            return Ok(0);
         }
     }
+
+    // either start to handle or retry
+    let _iod = ctx.get_iod(tag);
+    let iod = unsafe { &*_iod };
+
+    loop_queue_tgt_io(i, tag, iod)
+}
+
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, UblkError> {
+    trace!("loop: init_tgt {}", dev.dev_info.dev_id);
+    let info = dev.dev_info;
+
+    if lo.direct_io != 0 {
+        unsafe {
+            libc::fcntl(lo.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
+        }
+    }
+
+    let tgt = &mut dev.tgt;
+    let nr_fds = tgt.nr_fds;
+    tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
+    tgt.nr_fds = nr_fds + 1;
+
+    let sz = lo_file_size(&lo.back_file).unwrap();
+
+    tgt.dev_size = sz.0;
+    //todo: figure out correct block size
+    tgt.params = libublk::sys::ublk_params {
+        types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
+        basic: libublk::sys::ublk_param_basic {
+            logical_bs_shift: sz.1,
+            physical_bs_shift: sz.2,
+            io_opt_shift: 12,
+            io_min_shift: 9,
+            max_sectors: info.max_io_buf_bytes >> 9,
+            dev_sectors: tgt.dev_size >> 9,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    Ok(
+        serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } }),
+    )
+}
+
+pub fn ublk_add_loop(opt: super::args::AddArgs) {
+    let file = match opt.file {
+        Some(p) => p.display().to_string(),
+        _ => "".to_string(),
+    };
+    let lo = LoopTgt {
+        back_file: std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.clone())
+            .unwrap(),
+        direct_io: if opt.direct_io { 1 } else { 0 },
+        back_file_path: file.clone(),
+    };
+
+    let sess = libublk::UblkSessionBuilder::default()
+        .name(opt.r#type.clone())
+        .depth(opt.depth)
+        .nr_queues(opt.queue)
+        .id(opt.number)
+        .build()
+        .unwrap();
+    let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+    let wh = {
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let lo_handle_io = move |ctx: &UblkQueueCtx,
+                                 io: &mut UblkIOCtx|
+              -> Result<i32, UblkError> { _lo_handle_io(ctx, io) };
+
+        sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            d_ctrl.dump();
+        })
+        .unwrap()
+    };
+    wh.join().unwrap();
 }

@@ -1,6 +1,6 @@
 use anyhow::Result as AnyRes;
 use clap::{Parser, Subcommand};
-use libublk::{ctrl::UblkCtrl, io::UblkQueueImpl};
+use libublk::ctrl::UblkCtrl;
 use log::trace;
 
 #[macro_use]
@@ -30,50 +30,13 @@ enum Commands {
 }
 
 fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
-    let file = match opt.file {
-        Some(p) => p.display().to_string(),
-        _ => "".to_string(),
-    };
-    let id = opt.number;
-    let queues = opt.queue;
-    let depth = opt.depth;
-    let dio = opt.direct_io;
-    let tgt_type2 = opt.r#type.clone();
-    let tgt_type3 = opt.r#type.clone();
+    let tgt_type = opt.r#type.clone();
 
-    libublk::ublk_tgt_worker(
-        id,
-        queues,
-        depth,
-        512_u32 * 1024,
-        0,
-        true,
-        move |_| match tgt_type2.as_str() {
-            "loop" => Box::new(r#loop::LoopTgt {
-                back_file: std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(file.clone())
-                    .unwrap(),
-                direct_io: if dio { 1 } else { 0 },
-                back_file_path: file.clone(),
-            }),
-            "none" => Box::new(null::NullTgt {}),
-            _ => panic!("wrong target type"),
-        },
-        move |_| match tgt_type3.as_str() {
-            "loop" => Box::new(r#loop::LoopQueue {}) as Box<dyn UblkQueueImpl>,
-            "none" => Box::new(null::NullQueue {}) as Box<dyn UblkQueueImpl>,
-            _ => panic!("wrong target type"),
-        },
-        |dev_id| {
-            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
-            ctrl.dump();
-        },
-    )
-    .unwrap()
-    .join()
-    .unwrap();
+    match tgt_type.as_str() {
+        "loop" => r#loop::ublk_add_loop(opt),
+        "null" => null::ublk_add_null(opt),
+        _ => panic!("wrong target type"),
+    }
 
     Ok(0)
 }

@@ -1,54 +1,32 @@
-use core::any::Any;
-use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::ctrl::UblkCtrl;
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::UblkError;
-use log::trace;
 
-pub struct NullTgt {}
-pub struct NullQueue {}
-
-impl UblkTgtImpl for NullTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-        trace!("none: init_tgt {}", dev.dev_info.dev_id);
-        let info = dev.dev_info;
-        let dev_size = 250_u64 << 30;
-
-        let mut tgt = dev.tgt.borrow_mut();
-
-        tgt.dev_size = dev_size;
-        tgt.params = libublk::sys::ublk_params {
-            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::sys::ublk_param_basic {
-                logical_bs_shift: 9,
-                physical_bs_shift: 12,
-                io_opt_shift: 12,
-                io_min_shift: 9,
-                max_sectors: info.max_io_buf_bytes >> 9,
-                dev_sectors: dev_size >> 9,
-                ..Default::default()
-            },
-            ..Default::default()
+pub fn ublk_add_null(opt: super::args::AddArgs) {
+    let sess = libublk::UblkSessionBuilder::default()
+        .name(opt.r#type.clone())
+        .depth(opt.depth)
+        .nr_queues(opt.queue)
+        .id(opt.number)
+        .build()
+        .unwrap();
+    let tgt_init = |dev: &mut UblkDev| {
+        dev.set_default_params(250_u64 << 30);
+        Ok(serde_json::json!({}))
+    };
+    let wh = {
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+            let iod = ctx.get_iod(io.get_tag());
+            io.complete_io(unsafe { (*iod).nr_sectors << 9 } as i32);
+            Ok(0)
         };
 
-        Ok(serde_json::json!({}))
-    }
-    fn deinit_tgt(&self, dev: &UblkDev) {
-        trace!("none: deinit_tgt {}", dev.dev_info.dev_id);
-    }
-    fn tgt_type(&self) -> &'static str {
-        "null"
-    }
-    #[inline(always)]
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl UblkQueueImpl for NullQueue {
-    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
-        let iod = q.get_iod(tag);
-        let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
-
-        q.complete_io(tag as u16, bytes);
-        Ok(0)
-    }
+        sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            d_ctrl.dump();
+        })
+        .unwrap()
+    };
+    wh.join().unwrap();
 }
