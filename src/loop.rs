@@ -195,8 +195,8 @@ pub fn ublk_add_loop(opt: super::args::AddArgs) {
             .write(true)
             .open(file.clone())
             .unwrap(),
-        direct_io: if opt.direct_io { 1 } else { 0 },
-        back_file_path: file.clone(),
+        direct_io: i32::from(opt.direct_io),
+        back_file_path: file,
     };
 
     let sess = libublk::UblkSessionBuilder::default()

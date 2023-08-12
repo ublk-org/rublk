@@ -76,15 +76,13 @@ fn ublk_del(opt: args::DelArgs) -> AnyRes<i32> {
     }
 
     if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let f = entry.path();
-                if f.is_file() {
-                    if let Some(file_stem) = f.file_stem() {
-                        if let Some(stem) = file_stem.to_str() {
-                            if let Ok(num) = stem.parse::<i32>() {
-                                __ublk_del(num)?;
-                            }
+        for entry in entries.flatten() {
+            let f = entry.path();
+            if f.is_file() {
+                if let Some(file_stem) = f.file_stem() {
+                    if let Some(stem) = file_stem.to_str() {
+                        if let Ok(num) = stem.parse::<i32>() {
+                            __ublk_del(num)?;
                         }
                     }
                 }
@@ -98,7 +96,7 @@ fn ublk_del(opt: args::DelArgs) -> AnyRes<i32> {
 fn __ublk_list(id: i32) {
     let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
 
-    if let Ok(_) = ctrl.get_info() {
+    if ctrl.get_info().is_ok() {
         ctrl.dump();
     }
 }
@@ -110,15 +108,13 @@ fn ublk_list(opt: args::UblkArgs) -> AnyRes<i32> {
     }
 
     if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let f = entry.path();
-                if f.is_file() {
-                    if let Some(file_stem) = f.file_stem() {
-                        if let Some(stem) = file_stem.to_str() {
-                            if let Ok(num) = stem.parse::<i32>() {
-                                __ublk_list(num);
-                            }
+        for entry in entries.flatten() {
+            let f = entry.path();
+            if f.is_file() {
+                if let Some(file_stem) = f.file_stem() {
+                    if let Some(stem) = file_stem.to_str() {
+                        if let Ok(num) = stem.parse::<i32>() {
+                            __ublk_list(num);
                         }
                     }
                 }
