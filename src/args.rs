@@ -1,8 +1,7 @@
-use super::r#loop::LoopArgs;
 use clap::{Args, Subcommand};
 
 #[derive(Args, Debug)]
-pub struct DefAddArgs {
+pub struct GenAddArgs {
     #[clap(long, short = 'n', default_value_t=-1)]
     pub number: i32,
 
@@ -11,6 +10,18 @@ pub struct DefAddArgs {
 
     #[clap(long, short = 'd', default_value_t = 128)]
     pub depth: u32,
+}
+
+impl GenAddArgs {
+    pub fn new_ublk_session(&self, name: &'static str) -> libublk::UblkSession {
+        libublk::UblkSessionBuilder::default()
+            .name(name)
+            .depth(self.depth)
+            .nr_queues(self.queue)
+            .id(self.number)
+            .build()
+            .unwrap()
+    }
 }
 
 #[derive(Args)]
@@ -30,8 +41,8 @@ pub struct UblkArgs {
 
 #[derive(Subcommand)]
 pub enum AddCommands {
-    Loop(LoopArgs),
-    Null(DefAddArgs),
+    Loop(super::r#loop::LoopArgs),
+    Null(super::null::NullAddArgs),
 }
 
 #[derive(Subcommand)]

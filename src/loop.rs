@@ -12,14 +12,8 @@ use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
 pub struct LoopArgs {
-    #[clap(long, short = 'n', default_value_t=-1)]
-    pub number: i32,
-
-    #[clap(long, short = 'q', default_value_t = 1)]
-    pub queue: u32,
-
-    #[clap(long, short = 'd', default_value_t = 128)]
-    pub depth: u32,
+    #[command(flatten)]
+    pub gen_arg: super::args::GenAddArgs,
 
     ///backing file of ublk target(loop)
     #[clap(long, short = 'f')]
@@ -220,13 +214,7 @@ pub fn ublk_add_loop(opt: LoopArgs) {
         back_file_path: file,
     };
 
-    let sess = libublk::UblkSessionBuilder::default()
-        .name("loop")
-        .depth(opt.depth)
-        .nr_queues(opt.queue)
-        .id(opt.number)
-        .build()
-        .unwrap();
+    let sess = opt.gen_arg.new_ublk_session("loop");
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
