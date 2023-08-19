@@ -1,25 +1,10 @@
-use clap::Args;
-use std::path::PathBuf;
+use super::r#loop::LoopArgs;
+use clap::{Args, Subcommand};
 
-#[derive(Args)]
-pub struct AddArgs {
-    ///backing file of ublk target(loop)
-    #[clap(long, short = 'f')]
-    pub file: Option<PathBuf>,
-
-    ///if direct io is applied for backing file of ublk target(loop)
-    #[clap(long, default_value_t = true)]
-    pub direct_io: bool,
-
-    ///Config file for creating ublk(json format)
-    #[clap(long)]
-    pub config: Option<PathBuf>,
-
+#[derive(Args, Debug)]
+pub struct DefAddArgs {
     #[clap(long, short = 'n', default_value_t=-1)]
     pub number: i32,
-
-    #[clap(long, short = 't', default_value = "none")]
-    pub r#type: String,
 
     #[clap(long, short = 'q', default_value_t = 1)]
     pub queue: u32,
@@ -41,4 +26,23 @@ pub struct DelArgs {
 pub struct UblkArgs {
     #[clap(long, short = 'n', default_value_t = -1)]
     pub number: i32,
+}
+
+#[derive(Subcommand)]
+pub enum AddCommands {
+    Loop(LoopArgs),
+    Null(DefAddArgs),
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Adds ublk target
+    #[clap(subcommand)]
+    Add(AddCommands),
+    /// Deletes ublk target
+    Del(DelArgs),
+    /// Lists ublk targets
+    List(UblkArgs),
+    /// Recover ublk targets
+    Recover(UblkArgs),
 }

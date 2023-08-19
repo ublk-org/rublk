@@ -8,6 +8,27 @@ use log::trace;
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+
+#[derive(clap::Args, Debug)]
+pub struct LoopArgs {
+    #[clap(long, short = 'n', default_value_t=-1)]
+    pub number: i32,
+
+    #[clap(long, short = 'q', default_value_t = 1)]
+    pub queue: u32,
+
+    #[clap(long, short = 'd', default_value_t = 128)]
+    pub depth: u32,
+
+    ///backing file of ublk target(loop)
+    #[clap(long, short = 'f')]
+    pub file: Option<PathBuf>,
+
+    ///if direct io is applied for backing file of ublk target(loop)
+    #[clap(long, default_value_t = true)]
+    pub direct_io: bool,
+}
 
 // Generate ioctl function
 const BLK_IOCTL_TYPE: u8 = 0x12; // Defined in linux/fs.h
@@ -184,7 +205,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-pub fn ublk_add_loop(opt: super::args::AddArgs) {
+pub fn ublk_add_loop(opt: LoopArgs) {
     let file = match opt.file {
         Some(p) => p.display().to_string(),
         _ => "".to_string(),
@@ -200,7 +221,7 @@ pub fn ublk_add_loop(opt: super::args::AddArgs) {
     };
 
     let sess = libublk::UblkSessionBuilder::default()
-        .name(opt.r#type.clone())
+        .name("loop")
         .depth(opt.depth)
         .nr_queues(opt.queue)
         .id(opt.number)

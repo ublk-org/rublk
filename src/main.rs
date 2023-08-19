@@ -1,5 +1,6 @@
 use anyhow::Result as AnyRes;
-use clap::{Parser, Subcommand};
+use args::{AddCommands, Commands};
+use clap::Parser;
 use libublk::ctrl::UblkCtrl;
 use log::trace;
 
@@ -17,31 +18,16 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Adds ublk target
-    Add(args::AddArgs),
-    /// Deletes ublk target
-    Del(args::DelArgs),
-    /// Lists ublk targets
-    List(args::UblkArgs),
-    /// Recover ublk targets
-    Recover(args::UblkArgs),
-}
-
-fn ublk_daemon_work(opt: args::AddArgs) -> AnyRes<i32> {
-    let tgt_type = opt.r#type.clone();
-
-    match tgt_type.as_str() {
-        "loop" => r#loop::ublk_add_loop(opt),
-        "null" => null::ublk_add_null(opt),
-        _ => panic!("wrong target type"),
+fn ublk_daemon_work(opt: args::AddCommands) -> AnyRes<i32> {
+    match opt {
+        AddCommands::Loop(opt) => r#loop::ublk_add_loop(opt),
+        AddCommands::Null(opt) => null::ublk_add_null(opt),
     }
 
     Ok(0)
 }
 
-fn ublk_add(opt: args::AddArgs) -> AnyRes<i32> {
+fn ublk_add(opt: args::AddCommands) -> AnyRes<i32> {
     let daemonize = daemonize::Daemonize::new()
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());

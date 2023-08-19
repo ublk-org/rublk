@@ -2,9 +2,9 @@ use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::UblkError;
 
-pub fn ublk_add_null(opt: super::args::AddArgs) {
+pub fn ublk_add_null(opt: super::args::DefAddArgs) {
     let sess = libublk::UblkSessionBuilder::default()
-        .name(opt.r#type.clone())
+        .name("null")
         .depth(opt.depth)
         .nr_queues(opt.queue)
         .id(opt.number)

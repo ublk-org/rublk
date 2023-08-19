@@ -7,7 +7,8 @@ edition = "2021"
 
 [dependencies]
 libublk = "0.1"
-clap = { version = "4.3.0", features = ["derive"] }
+clap = { version = "4.3", features = ["derive"] }
+clap_derive = "4.3"
 libc = "0.2"
 anyhow = {version = "1.0.66", features = ["default"]}
 serde = {version = "1.0.99", features = ["derive"]}
