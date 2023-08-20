@@ -3,7 +3,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
-use libublk::UblkError;
+use libublk::{UblkError, UblkSession};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
@@ -199,7 +199,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-pub fn ublk_add_loop(opt: LoopArgs) -> Result<i32, UblkError> {
+pub fn ublk_add_loop(sess: UblkSession, opt: LoopArgs) -> Result<i32, UblkError> {
     let file = match opt.file {
         Some(p) => p.display().to_string(),
         _ => "".to_string(),
@@ -214,7 +214,6 @@ pub fn ublk_add_loop(opt: LoopArgs) -> Result<i32, UblkError> {
         back_file_path: file,
     };
 
-    let sess = opt.gen_arg.new_ublk_session("loop");
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();

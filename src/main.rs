@@ -17,15 +17,25 @@ struct Cli {
     command: Commands,
 }
 
+fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddArgs) {
+    match opt {
+        AddCommands::Loop(_opt) => ("loop", &_opt.gen_arg),
+        AddCommands::Null(_opt) => ("null", &_opt.gen_arg),
+    }
+}
+
 fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
     let daemonize = daemonize::Daemonize::new()
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());
 
+    let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
+    let sess = gen_arg.new_ublk_session(tgt_type);
+
     match daemonize.start() {
         Ok(_) => match opt {
-            AddCommands::Loop(opt) => r#loop::ublk_add_loop(opt),
-            AddCommands::Null(opt) => null::ublk_add_null(opt),
+            AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, opt),
+            AddCommands::Null(opt) => null::ublk_add_null(sess, opt),
         },
         Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
     }
