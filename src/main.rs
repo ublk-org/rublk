@@ -30,7 +30,7 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         .stderr(daemonize::Stdio::keep());
 
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
-    let sess = gen_arg.new_ublk_session(tgt_type);
+    let sess = gen_arg.new_ublk_sesson(tgt_type, false);
 
     match daemonize.start() {
         Ok(_) => match opt {
@@ -41,9 +41,50 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
     }
 }
 
+fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
+    if opt.number < 0 {
+        return Err(UblkError::OtherError(-libc::EINVAL));
+    }
+
+    let mut ctrl = UblkCtrl::new(opt.number, 0, 0, 0, 0, false)?;
+
+    if (ctrl.dev_info.flags & (libublk::sys::UBLK_F_USER_RECOVERY as u64)) == 0 {
+        return Err(UblkError::OtherError(-libc::EOPNOTSUPP));
+    }
+
+    if ctrl.dev_info.state != libublk::sys::UBLK_S_DEV_QUIESCED as u16 {
+        return Err(UblkError::OtherError(-libc::EBUSY));
+    }
+
+    ctrl.start_user_recover()?;
+
+    let tgt_type = ctrl.get_target_type_from_json().unwrap();
+    let sess = libublk::UblkSessionBuilder::default()
+        .name(tgt_type.clone())
+        .depth(ctrl.dev_info.queue_depth)
+        .nr_queues(ctrl.dev_info.nr_hw_queues)
+        .id(ctrl.dev_info.dev_id as i32)
+        .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY)
+        .for_add(false)
+        .build()
+        .unwrap();
+
+    match tgt_type.as_str() {
+        "loop" => r#loop::ublk_add_loop(sess, opt.number, None),
+        "null" => null::ublk_add_null(sess, opt.number, None),
+        &_ => todo!(),
+    }
+}
+
 fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
-    trace!("ublk recover {}", opt.number);
-    Ok(0)
+    let daemonize = daemonize::Daemonize::new()
+        .stdout(daemonize::Stdio::keep())
+        .stderr(daemonize::Stdio::keep());
+
+    match daemonize.start() {
+        Ok(_) => ublk_recover_work(opt),
+        Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
+    }
 }
 
 fn __ublk_del(id: i32) -> Result<i32, UblkError> {

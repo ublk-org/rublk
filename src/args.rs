@@ -13,12 +13,13 @@ pub struct GenAddArgs {
 }
 
 impl GenAddArgs {
-    pub fn new_ublk_session(&self, name: &'static str) -> libublk::UblkSession {
+    pub fn new_ublk_sesson(&self, name: &'static str, for_recovery: bool) -> libublk::UblkSession {
         libublk::UblkSessionBuilder::default()
             .name(name)
             .depth(self.depth)
             .nr_queues(self.queue)
             .id(self.number)
+            .for_add(!for_recovery)
             .build()
             .unwrap()
     }
