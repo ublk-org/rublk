@@ -199,7 +199,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-pub fn ublk_add_loop(opt: LoopArgs) {
+pub fn ublk_add_loop(opt: LoopArgs) -> Result<i32, UblkError> {
     let file = match opt.file {
         Some(p) => p.display().to_string(),
         _ => "".to_string(),
@@ -229,4 +229,5 @@ pub fn ublk_add_loop(opt: LoopArgs) {
         .unwrap()
     };
     wh.join().unwrap();
+    Ok(0)
 }

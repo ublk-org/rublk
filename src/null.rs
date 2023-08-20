@@ -8,7 +8,7 @@ pub struct NullAddArgs {
     pub gen_arg: super::args::GenAddArgs,
 }
 
-pub fn ublk_add_null(opt: NullAddArgs) {
+pub fn ublk_add_null(opt: NullAddArgs) -> Result<i32, UblkError> {
     let sess = opt.gen_arg.new_ublk_session("null");
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(250_u64 << 30);
@@ -29,4 +29,6 @@ pub fn ublk_add_null(opt: NullAddArgs) {
         .unwrap()
     };
     wh.join().unwrap();
+
+    Ok(0)
 }

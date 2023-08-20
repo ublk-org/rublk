@@ -1,7 +1,6 @@
-use anyhow::Result as AnyRes;
 use args::{AddCommands, Commands};
 use clap::Parser;
-use libublk::ctrl::UblkCtrl;
+use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 
 #[macro_use]
@@ -18,32 +17,26 @@ struct Cli {
     command: Commands,
 }
 
-fn ublk_daemon_work(opt: args::AddCommands) -> AnyRes<i32> {
-    match opt {
-        AddCommands::Loop(opt) => r#loop::ublk_add_loop(opt),
-        AddCommands::Null(opt) => null::ublk_add_null(opt),
-    }
-
-    Ok(0)
-}
-
-fn ublk_add(opt: args::AddCommands) -> AnyRes<i32> {
+fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
     let daemonize = daemonize::Daemonize::new()
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());
 
     match daemonize.start() {
-        Ok(_) => ublk_daemon_work(opt),
-        Err(e) => Err(anyhow::anyhow!(e)),
+        Ok(_) => match opt {
+            AddCommands::Loop(opt) => r#loop::ublk_add_loop(opt),
+            AddCommands::Null(opt) => null::ublk_add_null(opt),
+        },
+        Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
     }
 }
 
-fn ublk_recover(opt: args::UblkArgs) -> AnyRes<i32> {
+fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
     trace!("ublk recover {}", opt.number);
     Ok(0)
 }
 
-fn __ublk_del(id: i32) -> AnyRes<i32> {
+fn __ublk_del(id: i32) -> Result<i32, UblkError> {
     let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
 
     ctrl.stop()?;
@@ -52,7 +45,7 @@ fn __ublk_del(id: i32) -> AnyRes<i32> {
     Ok(0)
 }
 
-fn ublk_del(opt: args::DelArgs) -> AnyRes<i32> {
+fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
     trace!("ublk del {} {}", opt.number, opt.all);
 
     if !opt.all {
@@ -87,7 +80,7 @@ fn __ublk_list(id: i32) {
     }
 }
 
-fn ublk_list(opt: args::UblkArgs) -> AnyRes<i32> {
+fn ublk_list(opt: args::UblkArgs) -> Result<i32, UblkError> {
     if opt.number > 0 {
         __ublk_list(opt.number);
         return Ok(0);
@@ -110,7 +103,7 @@ fn ublk_list(opt: args::UblkArgs) -> AnyRes<i32> {
     Ok(0)
 }
 
-fn main() -> AnyRes<()> {
+fn main() {
     let cli = Cli::parse();
 
     env_logger::builder()
@@ -119,10 +112,9 @@ fn main() -> AnyRes<()> {
         .init();
 
     match cli.command {
-        Commands::Add(opt) => ublk_add(opt)?,
-        Commands::Del(opt) => ublk_del(opt)?,
-        Commands::List(opt) => ublk_list(opt)?,
-        Commands::Recover(opt) => ublk_recover(opt)?,
+        Commands::Add(opt) => ublk_add(opt).unwrap(),
+        Commands::Del(opt) => ublk_del(opt).unwrap(),
+        Commands::List(opt) => ublk_list(opt).unwrap(),
+        Commands::Recover(opt) => ublk_recover(opt).unwrap(),
     };
-    Ok(())
 }
