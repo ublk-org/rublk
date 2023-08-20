@@ -5,7 +5,7 @@ use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::{UblkError, UblkSession};
 use log::trace;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -42,7 +42,7 @@ ioctl_read_bad!(
     u32
 );
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LoJson {
     back_file_path: String,
     direct_io: i32,
@@ -199,18 +199,34 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-pub fn ublk_add_loop(sess: UblkSession, opt: LoopArgs) -> Result<i32, UblkError> {
-    let file = match opt.file {
-        Some(p) => p.display().to_string(),
-        _ => "".to_string(),
+pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
+    let (file, dio) = match opt {
+        Some(o) => {
+            let f = match o.file {
+                Some(p) => p.display().to_string(),
+                _ => "".to_string(),
+            };
+            (f, o.direct_io)
+        }
+        None => {
+            let ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
+            let __tgt_data = &ctrl.json["target_data"]["loop"];
+            let tgt_data: Result<LoJson, _> = serde_json::from_value(__tgt_data.clone());
+
+            match tgt_data {
+                Ok(t) => (t.back_file_path, t.direct_io != 0),
+                Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
+            }
+        }
     };
+
     let lo = LoopTgt {
         back_file: std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(file.clone())
             .unwrap(),
-        direct_io: i32::from(opt.direct_io),
+        direct_io: i32::from(dio),
         back_file_path: file,
     };
 

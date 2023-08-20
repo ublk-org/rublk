@@ -34,8 +34,8 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
 
     match daemonize.start() {
         Ok(_) => match opt {
-            AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, opt),
-            AddCommands::Null(opt) => null::ublk_add_null(sess, opt),
+            AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt)),
+            AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
         },
         Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
     }
