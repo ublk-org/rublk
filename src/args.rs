@@ -21,16 +21,22 @@ pub struct GenAddArgs {
 
 impl GenAddArgs {
     pub fn new_ublk_sesson(&self, name: &'static str, for_recovery: bool) -> libublk::UblkSession {
+        let mut ctrl_flags = if self.user_recovery {
+            libublk::sys::UBLK_F_USER_RECOVERY
+        } else {
+            0
+        };
+
+        if name == "zoned" {
+            ctrl_flags |= libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_ZONED;
+        }
+
         libublk::UblkSessionBuilder::default()
             .name(name)
             .depth(self.depth)
             .nr_queues(self.queue)
             .id(self.number)
-            .ctrl_flags(if self.user_recovery {
-                libublk::sys::UBLK_F_USER_RECOVERY
-            } else {
-                0
-            })
+            .ctrl_flags(ctrl_flags)
             .for_add(!for_recovery)
             .build()
             .unwrap()
@@ -61,6 +67,9 @@ pub enum AddCommands {
     Loop(super::r#loop::LoopArgs),
     /// Add null target
     Null(super::null::NullAddArgs),
+
+    /// Add Zoned target
+    Zoned(super::zoned::ZonedAddArgs),
 }
 
 #[derive(Subcommand)]
