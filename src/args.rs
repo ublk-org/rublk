@@ -10,6 +10,9 @@ pub struct GenAddArgs {
 
     #[clap(long, short = 'd', default_value_t = 128)]
     pub depth: u32,
+
+    #[clap(long, short = 'r', default_value_t = false)]
+    pub user_recovery: bool,
 }
 
 impl GenAddArgs {
@@ -19,6 +22,11 @@ impl GenAddArgs {
             .depth(self.depth)
             .nr_queues(self.queue)
             .id(self.number)
+            .ctrl_flags(if self.user_recovery {
+                libublk::sys::UBLK_F_USER_RECOVERY
+            } else {
+                0
+            })
             .for_add(!for_recovery)
             .build()
             .unwrap()
