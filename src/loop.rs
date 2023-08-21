@@ -15,11 +15,11 @@ pub struct LoopArgs {
     #[command(flatten)]
     pub gen_arg: super::args::GenAddArgs,
 
-    ///backing file of ublk target(loop)
+    /// backing file of ublk target
     #[clap(long, short = 'f')]
     pub file: Option<PathBuf>,
 
-    ///if direct io is applied for backing file of ublk target(loop)
+    /// direct io is applied for backing file of ublk target
     #[clap(long, default_value_t = true)]
     pub direct_io: bool,
 }
