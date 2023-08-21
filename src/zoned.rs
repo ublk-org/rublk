@@ -354,7 +354,7 @@ fn handle_report_zones(
         off
     );
     for i in zno..(zno + zones as u64) {
-        let mut zone = unsafe { &mut *(off as *mut libublk::sys::blk_zone) };
+        let zone = unsafe { &mut *(off as *mut libublk::sys::blk_zone) };
         let data = tgt.data.read().unwrap();
         let z = &data.zones[i as usize];
 
