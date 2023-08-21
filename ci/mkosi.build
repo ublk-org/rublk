@@ -1,0 +1,34 @@
+#!/usr/bin/bash
+
+#
+# This is a build script file for OS image generation using mkosi (https://github.com/systemd/mkosi).
+# It is invoked in a build environment, with the following set well-known variables:
+#
+#     $SRCDIR
+#     $DESTDIR
+#     $BUILDDIR
+#
+
+set -eo pipefail
+
+mkdir -p $DESTDIR/root/
+echo "systemctl restart systemd-networkd" >> $DESTDIR/root/.bash_profile
+chmod +x $DESTDIR/root/.bash_profile
+
+# Copy tests into the dest
+mkdir -p $DESTDIR/usr/share
+cp -fr $SRCDIR $DESTDIR/usr/share/rublk
+
+cd $DESTDIR/usr/share/rublk
+cargo install --path . --root $DESTDIR/root/
+cd -
+
+cd $DESTDIR/usr/share/
+git clone https://github.com/osandov/blktests.git
+cd blktests
+make -j4
+rm -f src/miniublk
+ln ../rublk/ci/miniublk.wrapper src/miniublk
+ls -l src/miniublk
+cd -
+cd -

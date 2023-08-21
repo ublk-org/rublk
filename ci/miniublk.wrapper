@@ -1,0 +1,28 @@
+#!/bin/bash
+
+PARA=""
+ACT=$1
+for arg in $@; do
+  if [ "$arg" = "-t" ]; then
+          continue
+  fi
+
+  if [ "$ACT" = "recover" ]; then
+          if [ "$arg" = "loop" ] || [ "$arg" = "null" ]; then
+                  continue;
+          fi
+
+          if [ -f "$arg" ]; then
+                  continue
+          fi
+          if [ "$arg" = "-f" ]; then
+                  continue
+          fi
+        PARA+=" $arg"
+  else
+        PARA+=" $arg"
+  fi
+done
+
+#echo "miniublk" $PARA
+/root/bin/rublk $PARA
