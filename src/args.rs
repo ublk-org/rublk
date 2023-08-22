@@ -61,6 +61,9 @@ pub struct UblkArgs {
     pub number: i32,
 }
 
+#[derive(Args)]
+pub struct UblkFeaturesArgs {}
+
 #[derive(Subcommand)]
 pub enum AddCommands {
     /// Add loop target
@@ -83,4 +86,6 @@ pub enum Commands {
     List(UblkArgs),
     /// Recover ublk targets
     Recover(UblkArgs),
+    /// Get supported features from ublk driver
+    Features(UblkFeaturesArgs),
 }

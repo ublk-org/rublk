@@ -91,6 +91,43 @@ fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
     }
 }
 
+const NR_FEATURES: usize = 9;
+const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
+    "ZERO_COPY",
+    "COMP_IN_TASK",
+    "NEED_GET_DATA",
+    "USER_RECOVERY",
+    "USER_RECOVERY_REISSUE",
+    "UNPRIVILEGED_DEV",
+    "CMD_IOCTL_ENCODE",
+    "USER_COPY",
+    "ZONED",
+];
+
+fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
+    let mut ctrl = UblkCtrl::new(-1, 0, 0, 0, 0, false)?;
+
+    match ctrl.get_features() {
+        Ok(f) => {
+            println!("\t{:<22} {:#12x}", "UBLK FEATURES", f);
+            for i in 0..64 {
+                if ((1_u64 << i) & f) == 0 {
+                    continue;
+                }
+
+                let feat = if i < NR_FEATURES {
+                    FEATURES_TABLE[i]
+                } else {
+                    "unknown"
+                };
+                println!("\t{:<22} {:#12x}", feat, 1_u64 << i);
+            }
+        }
+        Err(_) => eprintln!("not support GET_FEATURES, require linux v6.5"),
+    }
+    Ok(0)
+}
+
 fn __ublk_del(id: i32) -> Result<i32, UblkError> {
     let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
 
@@ -171,5 +208,6 @@ fn main() {
         Commands::Del(opt) => ublk_del(opt).unwrap(),
         Commands::List(opt) => ublk_list(opt).unwrap(),
         Commands::Recover(opt) => ublk_recover(opt).unwrap(),
+        Commands::Features(opt) => ublk_features(opt).unwrap(),
     };
 }
