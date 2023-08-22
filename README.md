@@ -21,6 +21,8 @@ introduction](https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf)
 
 cargo install rublk
 
+modprobe ublk_drv
+
 rublk help
 
 rublk add help
