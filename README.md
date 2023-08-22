@@ -21,6 +21,10 @@ introduction](https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf)
 
 cargo install rublk
 
+rublk help
+
+rublk add help
+
 ## License
 
 This project is licensed under GPL-2.0.
