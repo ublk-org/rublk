@@ -1,6 +1,6 @@
 use args::{AddCommands, Commands};
 use clap::Parser;
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::{ctrl::UblkCtrl, UblkError, UBLK_DEV_F_ADD_DEV, UBLK_DEV_F_RECOVER_DEV};
 use log::trace;
 
 #[macro_use]
@@ -32,7 +32,7 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         .stderr(daemonize::Stdio::keep());
 
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
-    let sess = gen_arg.new_ublk_sesson(tgt_type, false);
+    let sess = gen_arg.new_ublk_sesson(tgt_type, UBLK_DEV_F_ADD_DEV);
 
     match daemonize.start() {
         Ok(_) => match opt {
@@ -49,7 +49,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
-    let mut ctrl = UblkCtrl::new(opt.number, 0, 0, 0, 0, false)?;
+    let mut ctrl = UblkCtrl::new_simple(opt.number, 0)?;
 
     if (ctrl.dev_info.flags & (libublk::sys::UBLK_F_USER_RECOVERY as u64)) == 0 {
         return Err(UblkError::OtherError(-libc::EOPNOTSUPP));
@@ -68,7 +68,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .nr_queues(ctrl.dev_info.nr_hw_queues)
         .id(ctrl.dev_info.dev_id as i32)
         .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY)
-        .for_add(false)
+        .dev_flags(UBLK_DEV_F_RECOVER_DEV)
         .build()
         .unwrap();
 
@@ -105,7 +105,7 @@ const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
 ];
 
 fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
-    let mut ctrl = UblkCtrl::new(-1, 0, 0, 0, 0, false)?;
+    let mut ctrl = UblkCtrl::new_simple(-1, 0)?;
 
     match ctrl.get_features() {
         Ok(f) => {
@@ -129,7 +129,7 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
 }
 
 fn __ublk_del(id: i32) -> Result<i32, UblkError> {
-    let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
+    let mut ctrl = UblkCtrl::new_simple(id, 0)?;
 
     ctrl.stop()?;
     ctrl.del_dev()?;
@@ -165,7 +165,7 @@ fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
 }
 
 fn __ublk_list(id: i32) {
-    let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
+    let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
 
     if ctrl.get_info().is_ok() {
         ctrl.dump();

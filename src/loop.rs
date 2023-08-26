@@ -209,7 +209,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
             (f, o.direct_io)
         }
         None => {
-            let ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
+            let ctrl = UblkCtrl::new_simple(id, 0)?;
             let __tgt_data = &ctrl.json["target_data"]["loop"];
             let tgt_data: Result<LoJson, _> = serde_json::from_value(__tgt_data.clone());
 
@@ -238,7 +238,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
               -> Result<i32, UblkError> { _lo_handle_io(ctx, io) };
 
         sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })
         .unwrap()

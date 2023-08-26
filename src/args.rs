@@ -20,7 +20,7 @@ pub struct GenAddArgs {
 }
 
 impl GenAddArgs {
-    pub fn new_ublk_sesson(&self, name: &'static str, for_recovery: bool) -> libublk::UblkSession {
+    pub fn new_ublk_sesson(&self, name: &'static str, dev_flags: u32) -> libublk::UblkSession {
         let mut ctrl_flags = if self.user_recovery {
             libublk::sys::UBLK_F_USER_RECOVERY
         } else {
@@ -37,7 +37,7 @@ impl GenAddArgs {
             .nr_queues(self.queue)
             .id(self.number)
             .ctrl_flags(ctrl_flags)
-            .for_add(!for_recovery)
+            .dev_flags(dev_flags)
             .build()
             .unwrap()
     }

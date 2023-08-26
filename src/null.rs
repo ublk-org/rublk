@@ -16,7 +16,7 @@ pub fn ublk_add_null(
     let size = match _opt {
         Some(_) => 250_u64 << 30,
         None => {
-            let ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false)?;
+            let ctrl = UblkCtrl::new_simple(id, 0)?;
             match ctrl.get_target_from_json() {
                 Ok(tgt) => tgt.dev_size,
                 _ => return Err(UblkError::OtherError(-libc::EINVAL)),
@@ -37,7 +37,7 @@ pub fn ublk_add_null(
         };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })
         .unwrap()
