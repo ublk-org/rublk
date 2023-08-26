@@ -14,6 +14,10 @@ pub struct GenAddArgs {
     #[clap(long, short = 'd', default_value_t = 128)]
     pub depth: u32,
 
+    /// io buffer size, has to be aligned with PAGE_SIZE
+    #[clap(long, short = 'b', default_value_t = 524288)]
+    pub io_buf_size: u32,
+
     /// enable user recovery
     #[clap(long, short = 'r', default_value_t = false)]
     pub user_recovery: bool,
@@ -38,6 +42,7 @@ impl GenAddArgs {
             .id(self.number)
             .ctrl_flags(ctrl_flags)
             .dev_flags(dev_flags)
+            .io_buf_bytes(self.io_buf_size)
             .build()
             .unwrap()
     }
