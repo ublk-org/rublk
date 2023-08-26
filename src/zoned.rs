@@ -645,7 +645,7 @@ pub struct ZonedAddArgs {
     #[clap(long, default_value_t = 1024)]
     size: u32,
 
-    ///zone size
+    ///zone size, unit is megabytes(MB)
     #[clap(long, default_value_t = 256)]
     zone_size: u32,
 }

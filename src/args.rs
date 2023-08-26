@@ -71,7 +71,7 @@ pub enum AddCommands {
     /// Add null target
     Null(super::null::NullAddArgs),
 
-    /// Add Zoned target
+    /// Add Zoned target, supported since v6.5
     Zoned(super::zoned::ZonedAddArgs),
 }
 
