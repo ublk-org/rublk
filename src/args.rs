@@ -76,7 +76,7 @@ pub enum AddCommands {
     /// Add null target
     Null(super::null::NullAddArgs),
 
-    /// Add Zoned target, supported since v6.5
+    /// Add Zoned target, supported since v6.6
     Zoned(super::zoned::ZonedAddArgs),
 }
 
@@ -91,6 +91,6 @@ pub enum Commands {
     List(UblkArgs),
     /// Recover ublk targets
     Recover(UblkArgs),
-    /// Get supported features from ublk driver
+    /// Get supported features from ublk driver, supported since v6.5
     Features(UblkFeaturesArgs),
 }
