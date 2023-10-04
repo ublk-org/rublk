@@ -3,7 +3,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
-use libublk::{UblkError, UblkSession};
+use libublk::{UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
@@ -87,7 +87,7 @@ fn loop_queue_tgt_io(
     io: &mut UblkIOCtx,
     tag: u32,
     iod: &libublk::sys::ublksrv_io_desc,
-) -> Result<i32, UblkError> {
+) -> Result<UblkIORes, UblkError> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
@@ -133,10 +133,10 @@ fn loop_queue_tgt_io(
         _ => return Err(UblkError::OtherError(-libc::EINVAL)),
     }
 
-    Ok(1)
+    Err(UblkError::IoQueued(0))
 }
 
-fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<i32, UblkError> {
+fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<UblkIORes, UblkError> {
     let tag = i.get_tag();
 
     // our IO on backing file is done
@@ -148,9 +148,7 @@ fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<i32, UblkError
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
-            i.complete_io(res);
-
-            return Ok(0);
+            return Ok(UblkIORes::Result(res));
         }
     }
 
@@ -235,7 +233,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let lo_handle_io = move |ctx: &UblkQueueCtx,
                                  io: &mut UblkIOCtx|
-              -> Result<i32, UblkError> { _lo_handle_io(ctx, io) };
+              -> Result<UblkIORes, UblkError> { _lo_handle_io(ctx, io) };
 
         sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();

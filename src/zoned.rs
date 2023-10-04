@@ -12,7 +12,8 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_RESET_ALL,
 };
 use libublk::{
-    ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueueCtx, UblkError, UblkSession,
+    ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueueCtx, UblkError, UblkFatRes, UblkIORes,
+    UblkSession,
 };
 
 use log::trace;
@@ -579,7 +580,8 @@ fn zoned_handle_io(
     ctx: &UblkQueueCtx,
     io: &mut UblkIOCtx,
     iod: &libublk::sys::ublksrv_io_desc,
-) -> Result<i32, UblkError> {
+) -> Result<UblkIORes, UblkError> {
+    let mut sector: u64 = 0;
     let bytes;
     let op = iod.op_flags & 0xff;
 
@@ -592,7 +594,6 @@ fn zoned_handle_io(
         tgt.get_zone_no(iod.start_sector)
     );
 
-    io.set_zone_append_lab(0);
     match op {
         UBLK_IO_OP_READ => {
             bytes = handle_read(tgt, ctx, io, iod);
@@ -601,11 +602,7 @@ fn zoned_handle_io(
             (_, bytes) = handle_write(tgt, ctx, io, iod, false);
         }
         UBLK_IO_OP_ZONE_APPEND => {
-            let sector;
             (sector, bytes) = handle_write(tgt, ctx, io, iod, true);
-            if bytes > 0 {
-                io.set_zone_append_lab(sector);
-            }
         }
         UBLK_IO_OP_REPORT_ZONES => {
             bytes = handle_report_zones(tgt, ctx, io, iod) as i32;
@@ -627,8 +624,14 @@ fn zoned_handle_io(
         tgt.get_zone_no(iod.start_sector),
         bytes >> 9
     );
-    io.complete_io(bytes);
-    Ok(0)
+
+    if op == UBLK_IO_OP_ZONE_APPEND {
+        Ok(UblkIORes::FatRes(UblkFatRes::ZonedAppendRes((
+            bytes, sector,
+        ))))
+    } else {
+        Ok(UblkIORes::Result(bytes))
+    }
 }
 
 #[derive(clap::Args, Debug)]

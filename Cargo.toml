@@ -14,12 +14,12 @@ publish = true
 maintenance = { status = "actively-developed" }
 
 [features]
-zoned = []
+zoned = ["libublk/fat_complete"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libublk = "0.1.2"
+libublk = { git = "https://github.com/ming1/libublk-rs", branch = "dev_v0.1.3", default-features = false }
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
 libc = "0.2"
