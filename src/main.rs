@@ -9,6 +9,7 @@ extern crate nix;
 mod args;
 mod r#loop;
 mod null;
+#[cfg(feature = "zoned")]
 mod zoned;
 
 #[derive(Parser)]
@@ -22,6 +23,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
     match opt {
         AddCommands::Loop(_opt) => ("loop", &_opt.gen_arg),
         AddCommands::Null(_opt) => ("null", &_opt.gen_arg),
+        #[cfg(feature = "zoned")]
         AddCommands::Zoned(_opt) => ("zoned", &_opt.gen_arg),
     }
 }
@@ -38,6 +40,7 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         Ok(_) => match opt {
             AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt)),
             AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
+            #[cfg(feature = "zoned")]
             AddCommands::Zoned(opt) => zoned::ublk_add_zoned(sess, -1, Some(opt)),
         },
         Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
@@ -75,6 +78,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
     match tgt_type.as_str() {
         "loop" => r#loop::ublk_add_loop(sess, opt.number, None),
         "null" => null::ublk_add_null(sess, opt.number, None),
+        #[cfg(feature = "zoned")]
         "zoned" => zoned::ublk_add_zoned(sess, opt.number, None),
         &_ => todo!(),
     }
