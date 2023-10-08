@@ -1,5 +1,5 @@
 use libublk::ctrl::UblkCtrl;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{UblkError, UblkIORes, UblkSession};
 
 #[derive(clap::Args, Debug)]
@@ -30,11 +30,11 @@ pub fn ublk_add_null(
     };
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let handle_io =
-            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
-                let iod = ctx.get_iod(io.get_tag());
-                Ok(UblkIORes::Result(unsafe { (*iod).nr_sectors << 9 } as i32))
-            };
+        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let res = Ok(UblkIORes::Result(unsafe { (*iod).nr_sectors << 9 } as i32));
+            q.complete_io_cmd(tag, res);
+        };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
