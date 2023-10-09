@@ -740,6 +740,12 @@ pub fn ublk_add_zoned(
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
     let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, dev.tgt.fds[0]));
 
+    let f = ctrl.get_features()?;
+    if (f & (libublk::sys::UBLK_F_ZONED as u64)) == 0 {
+        eprintln!("ublk zoned feature isn't supported, needs v6.6 kernel");
+        return Err(UblkError::OtherError(-libc::EINVAL));
+    }
+
     let threads = zoned_create_queues(&mut ctrl, &dev, &zoned_tgt);
     ctrl.start_dev(&dev)?;
     ctrl.dump();
