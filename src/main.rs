@@ -1,6 +1,7 @@
 use args::{AddCommands, Commands};
 use clap::Parser;
-use libublk::{ctrl::UblkCtrl, UblkError, UBLK_DEV_F_ADD_DEV, UBLK_DEV_F_RECOVER_DEV};
+use libublk::dev_flags::*;
+use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 
 #[macro_use]
