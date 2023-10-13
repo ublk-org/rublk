@@ -21,6 +21,10 @@ pub struct GenAddArgs {
     /// enable user recovery
     #[clap(long, short = 'r', default_value_t = false)]
     pub user_recovery: bool,
+
+    /// enable user copy
+    #[clap(long, short = 'u', default_value_t = false)]
+    pub user_copy: bool,
 }
 
 impl GenAddArgs {
@@ -33,6 +37,10 @@ impl GenAddArgs {
 
         if name == "zoned" {
             ctrl_flags |= libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_ZONED;
+        }
+
+        if self.user_copy {
+            ctrl_flags |= libublk::sys::UBLK_F_USER_COPY;
         }
 
         libublk::UblkSessionBuilder::default()

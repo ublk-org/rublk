@@ -235,6 +235,12 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+
+        //todo: USER_COPY should be the default option
+        if (ctrl.dev_info.flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
         let lo_handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
 
         sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
