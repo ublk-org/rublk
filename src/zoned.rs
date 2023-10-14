@@ -652,55 +652,6 @@ pub struct ZonedAddArgs {
     zone_size: u32,
 }
 
-fn zoned_create_queues(
-    ctrl: &mut UblkCtrl,
-    dev: &Arc<UblkDev>,
-    zoned_tgt: &Arc<ZonedTgt>,
-) -> Vec<std::thread::JoinHandle<()>> {
-    let mut q_threads = Vec::new();
-    let nr_queues = dev.dev_info.nr_hw_queues;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let ublk_dev = Arc::clone(&dev);
-
-    for q in 0..nr_queues {
-        let _dev = std::sync::Arc::clone(&dev);
-        let _tx = tx.clone();
-        let _ztgt = std::sync::Arc::clone(&zoned_tgt);
-
-        let mut affinity = libublk::ctrl::UblkQueueAffinity::new();
-        ctrl.get_queue_affinity(q as u32, &mut affinity).unwrap();
-
-        q_threads.push(std::thread::spawn(move || {
-            //setup pthread affinity first, so that any allocation may
-            //be affine to cpu/memory
-            unsafe {
-                libc::pthread_setaffinity_np(
-                    libc::pthread_self(),
-                    affinity.buf_len(),
-                    affinity.addr() as *const libc::cpu_set_t,
-                );
-            }
-            _tx.send((q, unsafe { libc::gettid() })).unwrap();
-
-            let queue = libublk::io::UblkQueue::new(q, &_dev).unwrap();
-            let qc =
-                move |q: &UblkQueue, tag: u16, i: &UblkIOCtx| zoned_handle_io(&_ztgt, q, tag, i);
-            queue.wait_and_handle_io(qc);
-        }));
-    }
-
-    for _q in 0..nr_queues {
-        let (qid, tid) = rx.recv().unwrap();
-        if ctrl.configure_queue(&ublk_dev, qid, tid).is_err() {
-            println!(
-                "create_queue_handler: configure queue failed for {}-{}",
-                dev.dev_info.dev_id, qid
-            );
-        }
-    }
-    q_threads
-}
-
 pub fn ublk_add_zoned(
     sess: UblkSession,
     _id: i32,
@@ -746,14 +697,24 @@ pub fn ublk_add_zoned(
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
-    let threads = zoned_create_queues(&mut ctrl, &dev, &zoned_tgt);
-    ctrl.start_dev(&dev)?;
-    ctrl.dump();
-    for qh in threads {
-        qh.join()
-            .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", dev.dev_info.dev_id));
-    }
-    ctrl.stop_dev(&dev)?;
+    let _ztgt = std::sync::Arc::clone(&zoned_tgt);
+    let wh = {
+        let q_fn = move |qid: u16, _dev: &UblkDev| {
+            let zoned_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                zoned_handle_io(&_ztgt, q, tag, io);
+            };
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(zoned_io_handler);
+        };
+
+        sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            d_ctrl.dump();
+        })
+        .unwrap()
+    };
+    wh.join().unwrap();
 
     Ok(0)
 }
