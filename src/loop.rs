@@ -233,17 +233,24 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
     };
 
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+    let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+
+    //todo: USER_COPY should be the default option
+    if (ctrl.dev_info.flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
+        return Err(UblkError::OtherError(-libc::EINVAL));
+    }
+
     let wh = {
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let q_handler = move |qid: u16, _dev: &UblkDev| {
+            let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                _lo_handle_io(q, tag, io);
+            };
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(lo_io_handler);
+        };
 
-        //todo: USER_COPY should be the default option
-        if (ctrl.dev_info.flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        let lo_handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
-
-        sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
+        sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })
