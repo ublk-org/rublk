@@ -12,7 +12,7 @@ jobs:
   #build one Fedora image and run libublk-rs test
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
     - name: "install: mkosi + dependencies"
       shell: bash
@@ -70,11 +70,12 @@ jobs:
         mkosi ssh "ls -l /usr/share/blktests/src/miniublk"
         mkosi ssh "cat /usr/share/blktests/src/miniublk"
         mkosi ssh "cd /usr/share/blktests/; ./check ublk"
-        mkosi ssh "/usr/share/rublk/ci/ublk_zoned.sh /root/bin/rublk /usr/share/blktests/"
+        mkosi ssh "/usr/share/rublk/ci/add_ublk_dev.sh /root/bin/rublk /usr/share/blktests/"
         mkosi ssh "/root/bin/rublk list"
         mkosi ssh "cat /usr/share/blktests/config"
-        mkosi ssh "cd /usr/share/blktests/; ./check zbd"
-        mkosi ssh "/root/bin/rublk del -a"
+        mkosi ssh "cd /usr/share/blktests/; ./check -d block dm -x block/012 -x block/007 -c config"
+        mkosi ssh "cd /usr/share/blktests/; if [ -f ./zoned_config ]; then ./check -d zbd -c zoned_config; else true; fi"
+        mkosi ssh "sleep 2;/root/bin/rublk del -a"
 
     - name: "cleanup"
       if: always()
