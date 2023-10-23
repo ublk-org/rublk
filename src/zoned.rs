@@ -329,12 +329,7 @@ impl Drop for ZonedTgt {
     }
 }
 
-fn handle_report_zones(
-    tgt: &ZonedTgt,
-    q: &UblkQueue,
-    io: &UblkIOCtx,
-    iod: &ublksrv_io_desc,
-) -> isize {
+fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -> isize {
     let zsects = (tgt.zone_size >> 9) as u32;
     let zones = iod.nr_sectors; //union
     let zno = iod.start_sector / (zsects as u64);
@@ -371,7 +366,7 @@ fn handle_report_zones(
 
     let dsize = off - buf_addr as u64;
     let ret = unsafe {
-        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), io.get_tag() as u16, 0);
+        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
         libc::pwrite(
             tgt.fd,
@@ -385,7 +380,7 @@ fn handle_report_zones(
     ret
 }
 
-fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _io: &UblkIOCtx, iod: &ublksrv_io_desc) -> i32 {
+fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc) -> i32 {
     if (iod.op_flags & 0xff) == UBLK_IO_OP_ZONE_RESET_ALL {
         let mut off = 0;
         while off < tgt.size {
@@ -416,7 +411,7 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _io: &UblkIOCtx, iod: &ublksrv_io
     ret
 }
 
-fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, io: &UblkIOCtx, iod: &ublksrv_io_desc) -> i32 {
+fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -> i32 {
     let zno = tgt.get_zone_no(iod.start_sector) as usize;
     let data = tgt.data.read().unwrap();
 
@@ -438,7 +433,7 @@ fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, io: &UblkIOCtx, iod: &ublksrv_io_d
         data.zones[zno].wp,
     );
     unsafe {
-        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), io.get_tag() as u16, 0);
+        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag as u16, 0);
         let mut addr = (tgt.start + off) as *mut libc::c_void;
 
         // make sure data is zeroed for reset zone
@@ -462,13 +457,13 @@ fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, io: &UblkIOCtx, iod: &ublksrv_io_d
 fn handle_plain_write(
     tgt: &ZonedTgt,
     q: &UblkQueue,
-    io: &UblkIOCtx,
+    tag: u16,
     start_sector: u64,
     nr_sectors: u32,
 ) -> i32 {
     let off = (start_sector << 9) as u64;
     let bytes = (nr_sectors << 9) as usize;
-    let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), io.get_tag() as u16, 0);
+    let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
     unsafe {
         //read data from /dev/ublkcN to our ram directly
@@ -484,7 +479,7 @@ fn handle_plain_write(
 fn handle_write(
     tgt: &ZonedTgt,
     q: &UblkQueue,
-    io: &UblkIOCtx,
+    tag: u16,
     iod: &libublk::sys::ublksrv_io_desc,
     append: bool,
 ) -> (u64, i32) {
@@ -499,7 +494,7 @@ fn handle_write(
 
         return (
             u64::MAX as u64,
-            handle_plain_write(tgt, q, io, iod.start_sector, iod.nr_sectors),
+            handle_plain_write(tgt, q, tag, iod.start_sector, iod.nr_sectors),
         );
     }
 
@@ -542,7 +537,7 @@ fn handle_write(
     //    .map
     //    .insert((iod.start_sector, iod.nr_sectors), offset);
 
-    ret = handle_plain_write(tgt, q, io, sector, iod.nr_sectors);
+    ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors);
     data.zones[zno].wp += iod.nr_sectors as u64;
 
     if data.zones[zno].wp == zone_end {
@@ -570,7 +565,7 @@ fn handle_write(
     (sector, ret)
 }
 
-fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, io: &UblkIOCtx) {
+fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16) {
     let _iod = q.get_iod(tag);
     let iod = unsafe { &*_iod };
 
@@ -580,7 +575,7 @@ fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, io: &UblkIOCtx) {
 
     trace!(
         "=>tag {:3} ublk op {:2}, lba {:6x}-{:3} zno {}",
-        io.get_tag(),
+        tag,
         op,
         iod.start_sector,
         iod.nr_sectors,
@@ -589,22 +584,22 @@ fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, io: &UblkIOCtx) {
 
     match op {
         UBLK_IO_OP_READ => {
-            bytes = handle_read(tgt, q, io, iod);
+            bytes = handle_read(tgt, q, tag, iod);
         }
         UBLK_IO_OP_WRITE => {
-            (_, bytes) = handle_write(tgt, q, io, iod, false);
+            (_, bytes) = handle_write(tgt, q, tag, iod, false);
         }
         UBLK_IO_OP_ZONE_APPEND => {
-            (sector, bytes) = handle_write(tgt, q, io, iod, true);
+            (sector, bytes) = handle_write(tgt, q, tag, iod, true);
         }
         UBLK_IO_OP_REPORT_ZONES => {
-            bytes = handle_report_zones(tgt, q, io, iod) as i32;
+            bytes = handle_report_zones(tgt, q, tag, iod) as i32;
         }
         UBLK_IO_OP_ZONE_RESET
         | UBLK_IO_OP_ZONE_RESET_ALL
         | UBLK_IO_OP_ZONE_OPEN
         | UBLK_IO_OP_ZONE_CLOSE
-        | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, q, io, iod),
+        | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, q, tag, iod),
         _ => {
             q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
             return;
@@ -701,7 +696,7 @@ pub fn ublk_add_zoned(
     let wh = {
         let q_fn = move |qid: u16, _dev: &UblkDev| {
             let zoned_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                zoned_handle_io(&_ztgt, q, tag, io);
+                zoned_handle_io(&_ztgt, q, tag);
             };
             UblkQueue::new(qid, _dev)
                 .unwrap()
