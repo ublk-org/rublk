@@ -25,6 +25,10 @@ pub struct GenAddArgs {
     /// enable user copy
     #[clap(long, short = 'u', default_value_t = false)]
     pub user_copy: bool,
+
+    /// enable unprivileged
+    #[clap(long, short = 'p', default_value_t = false)]
+    pub unprivileged: bool,
 }
 
 impl GenAddArgs {
@@ -41,6 +45,10 @@ impl GenAddArgs {
 
         if self.user_copy {
             ctrl_flags |= libublk::sys::UBLK_F_USER_COPY;
+        }
+
+        if self.unprivileged {
+            ctrl_flags |= libublk::sys::UBLK_F_UNPRIVILEGED_DEV;
         }
 
         libublk::UblkSessionBuilder::default()
