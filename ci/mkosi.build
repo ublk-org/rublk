@@ -20,7 +20,7 @@ mkdir -p $DESTDIR/usr/share
 cp -fr $SRCDIR $DESTDIR/usr/share/rublk
 
 cd $DESTDIR/usr/share/rublk
-cargo install --features=zoned --path . --root $DESTDIR/root/
+cargo install  --path . --root $DESTDIR/root/
 cd -
 
 cd $DESTDIR/usr/share/

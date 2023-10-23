@@ -85,7 +85,6 @@ pub enum AddCommands {
     Null(super::null::NullAddArgs),
 
     /// Add Zoned target, supported since v6.6
-    #[cfg(feature = "zoned")]
     Zoned(super::zoned::ZonedAddArgs),
 }
 
