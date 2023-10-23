@@ -3,12 +3,13 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{UblkError, UblkIORes, UblkSession};
+use libublk::{exe::Executor, exe::UringOpFuture, UblkError, UblkSession};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 #[derive(clap::Args, Debug)]
 pub struct LoopArgs {
@@ -83,20 +84,25 @@ fn lo_file_size(f: &std::fs::File) -> AnyRes<(u64, u8, u8)> {
     }
 }
 
-fn loop_queue_tgt_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
+#[inline]
+fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
+    let op = iod.op_flags & 0xff;
+
+    match op {
+        libublk::sys::UBLK_IO_OP_FLUSH
+        | libublk::sys::UBLK_IO_OP_READ
+        | libublk::sys::UBLK_IO_OP_WRITE => return 0,
+        _ => return -libc::EINVAL,
+    };
+}
+
+#[inline]
+fn __lo_submit_io_cmd(q: &UblkQueue<'_>, tag: u16, iod: &libublk::sys::ublksrv_io_desc, data: u64) {
+    let op = iod.op_flags & 0xff;
     // either start to handle or retry
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
-    let op = iod.op_flags & 0xff;
-    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
     let buf_addr = q.get_io_buf_addr(tag);
-
-    if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
-        q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
-        return;
-    }
 
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => {
@@ -141,26 +147,29 @@ fn loop_queue_tgt_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
                     .expect("submission fail");
             }
         }
-        _ => q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL))),
-    }
+        _ => {}
+    };
 }
 
-fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
-    // our IO on backing file is done
-    if i.is_tgt_io() {
-        let user_data = i.user_data();
-        let res = i.result();
-        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
+    let _iod = q.get_iod(tag);
+    let iod = unsafe { &*_iod };
+    let op = iod.op_flags & 0xff;
+    let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
+    let res = __lo_prep_submit_io_cmd(iod);
+    if res < 0 {
+        return res;
+    }
 
-        assert!(cqe_tag == tag as u32);
-
+    for _ in 0..4 {
+        __lo_submit_io_cmd(q, tag, iod, user_data);
+        let res = UringOpFuture { user_data }.await;
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-            return;
+            return res;
         }
     }
 
-    loop_queue_tgt_io(q, tag, i);
+    return -libc::EAGAIN;
 }
 
 fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, UblkError> {
@@ -240,14 +249,31 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
+    let depth = dev.dev_info.queue_depth;
     let wh = {
-        let q_handler = move |qid: u16, _dev: &UblkDev| {
-            let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                _lo_handle_io(q, tag, io);
-            };
-            UblkQueue::new(qid, _dev)
-                .unwrap()
-                .wait_and_handle_io(lo_io_handler);
+        let q_handler = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
+
+            for tag in 0..depth as u16 {
+                let q = q_rc.clone();
+
+                exe.spawn(tag as u16, async move {
+                    let buf_addr = q.get_io_buf_addr(tag) as u64;
+                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = lo_handle_io_cmd_async(&q, tag).await;
+                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
+            }
+            q_rc.wait_and_wake_io_tasks(&exe);
         };
 
         sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {

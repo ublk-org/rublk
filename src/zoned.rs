@@ -12,13 +12,14 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_RESET_ALL,
 };
 use libublk::{
-    ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError, UblkFatRes, UblkIORes,
+    ctrl::UblkCtrl, exe::Executor, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError,
     UblkSession,
 };
 
 use log::trace;
 use std::path::PathBuf;
 //use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -565,7 +566,7 @@ fn handle_write(
     (sector, ret)
 }
 
-fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16) {
+async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u64) {
     let _iod = q.get_iod(tag);
     let iod = unsafe { &*_iod };
 
@@ -601,8 +602,7 @@ fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16) {
         | UBLK_IO_OP_ZONE_CLOSE
         | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, q, tag, iod),
         _ => {
-            q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
-            return;
+            return (-libc::EINVAL, 0);
         }
     }
 
@@ -616,16 +616,7 @@ fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16) {
         bytes >> 9
     );
 
-    if op == UBLK_IO_OP_ZONE_APPEND {
-        q.complete_io_cmd(
-            tag,
-            Ok(UblkIORes::FatRes(UblkFatRes::ZonedAppendRes((
-                bytes, sector,
-            )))),
-        );
-    } else {
-        q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
-    }
+    (bytes, sector)
 }
 
 #[derive(clap::Args, Debug)]
@@ -685,6 +676,7 @@ pub fn ublk_add_zoned(
 
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
     let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, dev.tgt.fds[0]));
+    let depth = dev.dev_info.queue_depth;
 
     let f = ctrl.get_features()?;
     if (f & (libublk::sys::UBLK_F_ZONED as u64)) == 0 {
@@ -692,18 +684,37 @@ pub fn ublk_add_zoned(
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
-    let _ztgt = std::sync::Arc::clone(&zoned_tgt);
     let wh = {
-        let q_fn = move |qid: u16, _dev: &UblkDev| {
-            let zoned_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                zoned_handle_io(&_ztgt, q, tag);
-            };
-            UblkQueue::new(qid, _dev)
-                .unwrap()
-                .wait_and_handle_io(zoned_io_handler);
+        let q_handler = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
+
+            //// `q_handler` closure implements Clone()
+            let ztgt_q = Rc::new(&zoned_tgt);
+
+            for tag in 0..depth as u16 {
+                let q = q_rc.clone();
+                let ztgt_io = ztgt_q.clone();
+
+                exe.spawn(tag as u16, async move {
+                    let mut buf_addr = 0;
+                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        (res, buf_addr) = zoned_handle_io(&ztgt_io, &q, tag).await;
+                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
+            }
+            q_rc.wait_and_wake_io_tasks(&exe);
         };
 
-        sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
+        sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })

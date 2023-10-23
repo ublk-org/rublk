@@ -1,6 +1,7 @@
 use libublk::ctrl::UblkCtrl;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{UblkError, UblkIORes, UblkSession};
+use libublk::io::{UblkDev, UblkQueue};
+use libublk::{exe::Executor, UblkError, UblkSession};
+use std::rc::Rc;
 
 #[derive(clap::Args, Debug)]
 pub struct NullAddArgs {
@@ -30,18 +31,36 @@ pub fn ublk_add_null(
     };
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let q_handler = move |qid: u16, _dev: &UblkDev| {
-            // logic for io handling
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+        let depth = dev.dev_info.queue_depth;
+        let q_handler = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
+
+            async fn handle_io(q: &UblkQueue<'_>, tag: u16) -> i32 {
                 let iod = q.get_iod(tag);
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
-            };
+                bytes
+            }
+            for tag in 0..depth as u16 {
+                let q = q_rc.clone();
 
-            UblkQueue::new(qid, _dev)
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                exe.spawn(tag as u16, async move {
+                    let buf_addr = q.get_io_buf_addr(tag);
+                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = handle_io(&q, tag).await;
+                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
+            }
+            q_rc.wait_and_wake_io_tasks(&exe);
         };
 
         sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
