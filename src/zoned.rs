@@ -684,43 +684,40 @@ pub fn ublk_add_zoned(
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
-    let wh = {
-        let q_handler = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
-            let exe = Executor::new(dev.get_nr_ios());
+    let q_handler = move |qid: u16, dev: &UblkDev| {
+        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+        let exe = Executor::new(dev.get_nr_ios());
 
-            //// `q_handler` closure implements Clone()
-            let ztgt_q = Rc::new(&zoned_tgt);
+        //// `q_handler` closure implements Clone()
+        let ztgt_q = Rc::new(&zoned_tgt);
 
-            for tag in 0..depth as u16 {
-                let q = q_rc.clone();
-                let ztgt_io = ztgt_q.clone();
+        for tag in 0..depth as u16 {
+            let q = q_rc.clone();
+            let ztgt_io = ztgt_q.clone();
 
-                exe.spawn(tag as u16, async move {
-                    let mut buf_addr = 0;
-                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
-                    let mut res = 0;
-                    loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
-                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                            break;
-                        }
-
-                        (res, buf_addr) = zoned_handle_io(&ztgt_io, &q, tag).await;
-                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+            exe.spawn(tag as u16, async move {
+                let mut buf_addr = 0;
+                let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                let mut res = 0;
+                loop {
+                    let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                        break;
                     }
-                });
-            }
-            q_rc.wait_and_wake_io_tasks(&exe);
-        };
 
-        sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-            d_ctrl.dump();
-        })
-        .unwrap()
+                    (res, buf_addr) = zoned_handle_io(&ztgt_io, &q, tag).await;
+                    cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                }
+            });
+        }
+        q_rc.wait_and_wake_io_tasks(&exe);
     };
-    wh.join().unwrap();
+
+    sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
+        let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        d_ctrl.dump();
+    })
+    .unwrap();
 
     Ok(0)
 }

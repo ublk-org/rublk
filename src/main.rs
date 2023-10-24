@@ -136,7 +136,7 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
 fn __ublk_del(id: i32) -> Result<i32, UblkError> {
     let mut ctrl = UblkCtrl::new_simple(id, 0)?;
 
-    ctrl.stop()?;
+    ctrl.kill_dev()?;
     ctrl.del_dev()?;
 
     Ok(0)
