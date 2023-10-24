@@ -18,7 +18,7 @@ pub struct LoopArgs {
 
     /// backing file of ublk target
     #[clap(long, short = 'f')]
-    pub file: Option<PathBuf>,
+    pub file: PathBuf,
 
     /// direct io is applied for backing file of ublk target
     #[clap(long, default_value_t = true)]
@@ -212,33 +212,28 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
 
 pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
     let (file, dio) = match opt {
-        Some(o) => {
-            let f = match o.file {
-                Some(p) => p.display().to_string(),
-                _ => "".to_string(),
-            };
-            (f, o.direct_io)
-        }
+        Some(o) => (o.file, o.direct_io),
         None => {
             let ctrl = UblkCtrl::new_simple(id, 0)?;
             let __tgt_data = &ctrl.json["target_data"]["loop"];
             let tgt_data: Result<LoJson, _> = serde_json::from_value(__tgt_data.clone());
 
             match tgt_data {
-                Ok(t) => (t.back_file_path, t.direct_io != 0),
+                Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
                 Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
             }
         }
     };
 
+    let file_path = format!("{}", file.as_path().display());
     let lo = LoopTgt {
         back_file: std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(file.clone())
+            .open(&file)
             .unwrap(),
         direct_io: i32::from(dio),
-        back_file_path: file,
+        back_file_path: file_path,
     };
 
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
