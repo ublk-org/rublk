@@ -110,10 +110,8 @@ const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
 ];
 
 fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
-    let mut ctrl = UblkCtrl::new_simple(-1, 0)?;
-
-    match ctrl.get_features() {
-        Ok(f) => {
+    match UblkCtrl::get_features() {
+        Some(f) => {
             println!("\t{:<22} {:#12x}", "UBLK FEATURES", f);
             for i in 0..64 {
                 if ((1_u64 << i) & f) == 0 {
@@ -128,7 +126,7 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
                 println!("\t{:<22} {:#12x}", feat, 1_u64 << i);
             }
         }
-        Err(_) => eprintln!("not support GET_FEATURES, require linux v6.5"),
+        None => eprintln!("not support GET_FEATURES, require linux v6.5"),
     }
     Ok(0)
 }

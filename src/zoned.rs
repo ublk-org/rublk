@@ -678,10 +678,17 @@ pub fn ublk_add_zoned(
     let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, dev.tgt.fds[0]));
     let depth = dev.dev_info.queue_depth;
 
-    let f = ctrl.get_features()?;
-    if (f & (libublk::sys::UBLK_F_ZONED as u64)) == 0 {
-        eprintln!("ublk zoned feature isn't supported, needs v6.6 kernel");
-        return Err(UblkError::OtherError(-libc::EINVAL));
+    match ctrl.get_driver_features() {
+        Some(f) => {
+            if (f & (libublk::sys::UBLK_F_ZONED as u64)) == 0 {
+                eprintln!("ublk zoned feature isn't supported, needs v6.6 kernel");
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+        }
+        _ => {
+            eprintln!("ublk zoned feature isn't supported, needs v6.6 kernel");
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
     }
 
     let q_handler = move |qid: u16, dev: &UblkDev| {
