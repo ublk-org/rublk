@@ -210,9 +210,25 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
+fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
+    if p.is_absolute() {
+        p
+    } else {
+        match parent {
+            None => p,
+            Some(n) => n.join(p),
+        }
+    }
+}
+
+pub fn ublk_add_loop(
+    sess: UblkSession,
+    id: i32,
+    opt: Option<LoopArgs>,
+    parent: Option<PathBuf>,
+) -> Result<i32, UblkError> {
     let (file, dio) = match opt {
-        Some(o) => (o.file, o.direct_io),
+        Some(o) => (to_absolute_path(o.file, parent), o.direct_io),
         None => {
             let ctrl = UblkCtrl::new_simple(id, 0)?;
             let __tgt_data = &ctrl.json["target_data"]["loop"];
