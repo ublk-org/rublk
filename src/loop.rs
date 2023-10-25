@@ -152,8 +152,7 @@ fn __lo_submit_io_cmd(q: &UblkQueue<'_>, tag: u16, iod: &libublk::sys::ublksrv_i
 }
 
 async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
+    let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
     let res = __lo_prep_submit_io_cmd(iod);
@@ -172,7 +171,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
     return -libc::EAGAIN;
 }
 
-fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, UblkError> {
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     let info = dev.dev_info;
 
@@ -205,9 +204,10 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
         ..Default::default()
     };
 
-    Ok(
-        serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } }),
-    )
+    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } });
+    dev.set_target_json(val);
+
+    Ok(0)
 }
 
 fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
@@ -231,12 +231,17 @@ pub fn ublk_add_loop(
         Some(o) => (to_absolute_path(o.file, parent), o.direct_io),
         None => {
             let ctrl = UblkCtrl::new_simple(id, 0)?;
-            let __tgt_data = &ctrl.json["target_data"]["loop"];
-            let tgt_data: Result<LoJson, _> = serde_json::from_value(__tgt_data.clone());
+            match ctrl.get_target_data_from_json() {
+                Some(val) => {
+                    let lo = &val["loop"];
+                    let tgt_data: Result<LoJson, _> = serde_json::from_value(lo.clone());
 
-            match tgt_data {
-                Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
-                Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
+                    match tgt_data {
+                        Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
+                        Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
+                    }
+                }
+                None => return Err(UblkError::OtherError(-libc::EINVAL)),
             }
         }
     };

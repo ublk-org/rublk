@@ -567,9 +567,7 @@ fn handle_write(
 }
 
 async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u64) {
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
-
+    let iod = q.get_iod(tag);
     let mut sector: u64 = 0;
     let bytes;
     let op = iod.op_flags & 0xff;
@@ -671,7 +669,7 @@ pub fn ublk_add_zoned(
             max_zone_append_sectors: (zone_size >> 9) as u32,
             ..Default::default()
         };
-        Ok(serde_json::json!({}))
+        Ok(0)
     };
 
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();

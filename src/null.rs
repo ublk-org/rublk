@@ -27,7 +27,7 @@ pub fn ublk_add_null(
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
-        Ok(serde_json::json!({}))
+        Ok(0)
     };
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
     let depth = dev.dev_info.queue_depth;
@@ -37,9 +37,8 @@ pub fn ublk_add_null(
 
         async fn handle_io(q: &UblkQueue<'_>, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            bytes
+            (iod.nr_sectors << 9) as i32
         }
         for tag in 0..depth as u16 {
             let q = q_rc.clone();
