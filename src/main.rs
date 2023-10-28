@@ -134,8 +134,12 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
 fn __ublk_del(id: i32) -> Result<i32, UblkError> {
     let mut ctrl = UblkCtrl::new_simple(id, 0)?;
 
-    ctrl.kill_dev()?;
-    ctrl.del_dev()?;
+    let _ = ctrl.kill_dev();
+    let _ = ctrl.del_dev();
+
+    let run_path = ctrl.run_path();
+    let json_path = std::path::Path::new(&run_path);
+    assert!(json_path.exists() == false);
 
     Ok(0)
 }
