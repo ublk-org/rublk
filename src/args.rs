@@ -51,13 +51,18 @@ impl GenAddArgs {
             ctrl_flags |= libublk::sys::UBLK_F_UNPRIVILEGED_DEV;
         }
 
+        let mut dflags = dev_flags;
+        if (ctrl_flags & libublk::sys::UBLK_F_USER_COPY) != 0 {
+            dflags |= libublk::dev_flags::UBLK_DEV_F_DONT_ALLOC_BUF;
+        }
+
         libublk::UblkSessionBuilder::default()
             .name(name)
             .depth(self.depth)
             .nr_queues(self.queue)
             .id(self.number)
             .ctrl_flags(ctrl_flags)
-            .dev_flags(dev_flags)
+            .dev_flags(dflags)
             .io_buf_bytes(self.io_buf_size)
             .build()
             .unwrap()

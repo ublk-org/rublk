@@ -690,7 +690,7 @@ pub fn ublk_add_zoned(
     }
 
     let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
         let exe = Executor::new(dev.get_nr_ios());
 
         //// `q_handler` closure implements Clone()
@@ -701,16 +701,16 @@ pub fn ublk_add_zoned(
             let ztgt_io = ztgt_q.clone();
 
             exe.spawn(tag as u16, async move {
-                let mut buf_addr = 0;
+                let mut lba = 0_u64;
                 let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                 let mut res = 0;
                 loop {
-                    let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                    let cmd_res = q.submit_io_cmd(tag, cmd_op, lba as *mut u8, res).await;
                     if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                         break;
                     }
 
-                    (res, buf_addr) = zoned_handle_io(&ztgt_io, &q, tag).await;
+                    (res, lba) = zoned_handle_io(&ztgt_io, &q, tag).await;
                     cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                 }
             });

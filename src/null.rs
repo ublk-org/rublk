@@ -32,7 +32,7 @@ pub fn ublk_add_null(
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
     let depth = dev.dev_info.queue_depth;
     let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
         let exe = Executor::new(dev.get_nr_ios());
 
         async fn handle_io(q: &UblkQueue<'_>, tag: u16) -> i32 {
@@ -48,7 +48,7 @@ pub fn ublk_add_null(
                 let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                 let mut res = 0;
                 loop {
-                    let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                    let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                     if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                         break;
                     }

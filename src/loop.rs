@@ -267,14 +267,14 @@ pub fn ublk_add_loop(
 
     let depth = dev.dev_info.queue_depth;
     let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
         let exe = Executor::new(dev.get_nr_ios());
 
         for tag in 0..depth as u16 {
             let q = q_rc.clone();
 
             exe.spawn(tag as u16, async move {
-                let buf_addr = q.get_io_buf_addr(tag) as u64;
+                let buf_addr = q.get_io_buf_addr(tag);
                 let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                 let mut res = 0;
                 loop {

@@ -33,7 +33,7 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         .stderr(daemonize::Stdio::keep());
 
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
-    let sess = gen_arg.new_ublk_sesson(tgt_type, UBLK_DEV_F_ADD_DEV);
+    let sess = gen_arg.new_ublk_sesson(tgt_type, UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC);
     let parent_dir = match std::env::current_dir() {
         Ok(p) => Some(p),
         Err(_) => None,
@@ -73,7 +73,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .nr_queues(ctrl.dev_info.nr_hw_queues)
         .id(ctrl.dev_info.dev_id as i32)
         .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY)
-        .dev_flags(UBLK_DEV_F_RECOVER_DEV)
+        .dev_flags(UBLK_DEV_F_RECOVER_DEV | UBLK_DEV_F_ASYNC)
         .build()
         .unwrap();
 
