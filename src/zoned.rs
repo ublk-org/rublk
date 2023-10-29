@@ -645,6 +645,11 @@ pub fn ublk_add_zoned(
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (size, zone_size) = match opt {
         Some(o) => {
+            if o.gen_arg.user_recovery {
+                eprintln!("zoned(ramdisk) can't support recovery\n");
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+
             if o.path != None {
                 eprintln!("only support ramdisk now with 'None' path\n");
                 return Err(UblkError::OtherError(-libc::EINVAL));
