@@ -77,7 +77,15 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .nr_queues(ctrl.dev_info.nr_hw_queues)
         .id(ctrl.dev_info.dev_id as i32)
         .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY)
-        .dev_flags(UBLK_DEV_F_RECOVER_DEV | UBLK_DEV_F_ASYNC)
+        .dev_flags(
+            UBLK_DEV_F_RECOVER_DEV
+                | UBLK_DEV_F_ASYNC
+                | if (ctrl.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0 {
+                    UBLK_DEV_F_DONT_ALLOC_BUF
+                } else {
+                    0
+                },
+        )
         .build()
         .unwrap();
 
