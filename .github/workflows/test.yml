@@ -65,6 +65,9 @@ jobs:
     - name: "test: run rublk test"
       working-directory: ci
       run: |
+        mkosi ssh ls -l /usr/share/rublk/target/debug/deps/basic*
+        mkosi ssh ls -l /usr/share/rublk/target/debug/
+        mkosi ssh /usr/share/rublk/target/debug/test-basic --nocapture
         mkosi ssh "/root/bin/rublk help"
         mkosi ssh "/root/bin/rublk add help"
         mkosi ssh "ls -l /usr/share/blktests/src/miniublk"

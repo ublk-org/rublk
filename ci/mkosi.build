@@ -9,7 +9,21 @@
 #     $BUILDDIR
 #
 
+create_rublk_test()
+{
+    local rs_dir=$1
+
+    cd $rs_dir
+    cargo test -v --no-run
+    cd -
+
+    TB=`find $rs_dir/target/debug/deps/ -type f -executable -name "basic*"`
+    ln $TB $rs_dir/target/debug/test-basic
+    ls -l $rs_dir/ci/
+}
+
 set -eo pipefail
+
 
 mkdir -p $DESTDIR/root/
 echo "systemctl restart systemd-networkd" >> $DESTDIR/root/.bash_profile
@@ -18,6 +32,8 @@ chmod +x $DESTDIR/root/.bash_profile
 # Copy tests into the dest
 mkdir -p $DESTDIR/usr/share
 cp -fr $SRCDIR $DESTDIR/usr/share/rublk
+
+create_rublk_test $DESTDIR/usr/share/rublk
 
 cd $DESTDIR/usr/share/rublk
 cargo install  --path . --root $DESTDIR/root/
