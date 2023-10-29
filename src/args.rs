@@ -1,3 +1,4 @@
+use crate::target_flags::*;
 use clap::{Args, Subcommand};
 
 #[derive(Args, Debug)]
@@ -29,6 +30,10 @@ pub struct GenAddArgs {
     /// enable unprivileged
     #[clap(long, short = 'p', default_value_t = false)]
     pub unprivileged: bool,
+
+    /// quiet, don't dump device info
+    #[clap(long, default_value_t = false)]
+    pub quiet: bool,
 }
 
 impl GenAddArgs {
@@ -51,6 +56,11 @@ impl GenAddArgs {
             ctrl_flags |= libublk::sys::UBLK_F_UNPRIVILEGED_DEV;
         }
 
+        let mut gen_flags: u64 = 0;
+        if self.quiet {
+            gen_flags |= TGT_QUIET;
+        }
+
         let mut dflags = dev_flags;
         if (ctrl_flags & libublk::sys::UBLK_F_USER_COPY) != 0 {
             dflags |= libublk::dev_flags::UBLK_DEV_F_DONT_ALLOC_BUF;
@@ -62,6 +72,7 @@ impl GenAddArgs {
             .nr_queues(self.queue)
             .id(self.number)
             .ctrl_flags(ctrl_flags)
+            .ctrl_target_flags(gen_flags)
             .dev_flags(dflags)
             .io_buf_bytes(self.io_buf_size)
             .build()

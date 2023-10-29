@@ -1,3 +1,4 @@
+use crate::target_flags::*;
 use anyhow::Result as AnyRes;
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
@@ -293,7 +294,10 @@ pub fn ublk_add_loop(
 
     sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
         let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        d_ctrl.dump();
+
+        if (d_ctrl.dev_info.ublksrv_flags & TGT_QUIET) == 0 {
+            d_ctrl.dump();
+        }
     })
     .unwrap();
     Ok(0)

@@ -4,6 +4,10 @@ use libublk::dev_flags::*;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 
+pub mod target_flags {
+    pub const TGT_QUIET: u64 = 0b00000001;
+}
+
 #[macro_use]
 extern crate nix;
 

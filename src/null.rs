@@ -1,3 +1,4 @@
+use crate::target_flags::*;
 use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::{exe::Executor, UblkError, UblkSession};
@@ -63,7 +64,9 @@ pub fn ublk_add_null(
 
     sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
         let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        d_ctrl.dump();
+        if (d_ctrl.dev_info.ublksrv_flags & TGT_QUIET) == 0 {
+            d_ctrl.dump();
+        }
     })
     .unwrap();
 

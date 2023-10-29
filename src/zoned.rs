@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use crate::target_flags::*;
 use libublk::sys::ublksrv_io_desc;
 use libublk::sys::{
     BLK_ZONE_COND_CLOSED, BLK_ZONE_COND_EMPTY, BLK_ZONE_COND_EXP_OPEN, BLK_ZONE_COND_FULL,
@@ -720,7 +721,9 @@ pub fn ublk_add_zoned(
 
     sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
         let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        d_ctrl.dump();
+        if (d_ctrl.dev_info.ublksrv_flags & TGT_QUIET) == 0 {
+            d_ctrl.dump();
+        }
     })
     .unwrap();
 
