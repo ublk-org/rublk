@@ -6,6 +6,14 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    fn check_block_size(ctrl: &mut UblkCtrl, exp_bs: u32) {
+        let mut params: sys::ublk_params = { Default::default() };
+        ctrl.get_params(&mut params).unwrap();
+
+        let bs = 1_u32 << params.basic.logical_bs_shift;
+        assert!(bs == exp_bs);
+    }
+
     fn read_ublk_disk(ctrl: &UblkCtrl) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
@@ -115,33 +123,54 @@ mod integration {
         let _ = run_rublk_cmd(para, 0);
     }
 
-    #[test]
-    fn test_ublk_add_del_null() {
-        let id = run_rublk_add_dev(["add", "null"].to_vec());
-        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+    fn __test_ublk_add_del_null(bs: u32) {
+        let id =
+            run_rublk_add_dev(["add", "null", "--logical-block-size", &bs.to_string()].to_vec());
+        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
 
         read_ublk_disk(&ctrl);
+        check_block_size(&mut ctrl, bs);
         run_rublk_del_dev(id);
     }
-
     #[test]
-    fn test_ublk_add_del_zoned() {
+    fn test_ublk_add_del_null() {
+        __test_ublk_add_del_null(512);
+        __test_ublk_add_del_null(1024);
+        __test_ublk_add_del_null(4096);
+    }
+
+    fn __test_ublk_add_del_zoned(bs: u32) {
         match UblkCtrl::get_features() {
             Some(f) => {
                 if (f & sys::UBLK_F_ZONED as u64) != 0 {
-                    let id = run_rublk_add_dev(["add", "zoned", "--zone-size", "4"].to_vec());
-                    let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+                    let id = run_rublk_add_dev(
+                        [
+                            "add",
+                            "zoned",
+                            "--zone-size",
+                            "4",
+                            "--logical-block-size",
+                            &bs.to_string(),
+                        ]
+                        .to_vec(),
+                    );
+                    let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
 
                     read_ublk_disk(&ctrl);
+                    check_block_size(&mut ctrl, bs);
                     run_rublk_del_dev(id);
                 }
             }
             _ => {}
         }
     }
-
     #[test]
-    fn test_ublk_add_del_loop() {
+    fn test_ublk_add_del_zoned() {
+        __test_ublk_add_del_zoned(512);
+        __test_ublk_add_del_zoned(4096);
+    }
+
+    fn __test_ublk_add_del_loop(bs: u32) {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024; // 1 MB
         let p = tmp_file.path();
@@ -152,10 +181,26 @@ mod integration {
             _ => panic!(),
         };
 
-        let id = run_rublk_add_dev(["add", "loop", "-f", &pstr].to_vec());
-        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+        let id = run_rublk_add_dev(
+            [
+                "add",
+                "loop",
+                "-f",
+                &pstr,
+                "--logical-block-size",
+                &bs.to_string(),
+            ]
+            .to_vec(),
+        );
+
+        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
 
         read_ublk_disk(&ctrl);
+        check_block_size(&mut ctrl, bs);
         run_rublk_del_dev(id);
+    }
+    #[test]
+    fn test_ublk_add_del_loop() {
+        __test_ublk_add_del_loop(4096);
     }
 }
