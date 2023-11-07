@@ -19,6 +19,9 @@ pub fn ublk_add_null(
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
+        if let Some(opt) = _opt {
+            opt.gen_arg.apply_block_size(dev);
+        }
         Ok(0)
     };
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();

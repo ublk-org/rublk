@@ -644,7 +644,7 @@ pub fn ublk_add_zoned(
 ) -> Result<i32, UblkError> {
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (size, zone_size) = match opt {
-        Some(o) => {
+        Some(ref o) => {
             if o.gen_arg.user_recovery {
                 eprintln!("zoned(ramdisk) can't support recovery\n");
                 return Err(UblkError::OtherError(-libc::EINVAL));
@@ -675,6 +675,11 @@ pub fn ublk_add_zoned(
             max_zone_append_sectors: (zone_size >> 9) as u32,
             ..Default::default()
         };
+
+        if let Some(o) = opt {
+            o.gen_arg.apply_block_size(dev);
+        }
+
         Ok(0)
     };
 

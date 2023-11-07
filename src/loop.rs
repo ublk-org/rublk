@@ -178,7 +178,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
     return -libc::EAGAIN;
 }
 
-fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     let info = dev.dev_info;
 
@@ -211,6 +211,24 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
         ..Default::default()
     };
 
+    if let Some(o) = opt {
+        if o.gen_arg.logical_block_size < (1_u32 << sz.1) {
+            if o.gen_arg.logical_block_size != 512 {
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+        } else {
+            tgt.params.basic.logical_bs_shift = o.gen_arg.logical_block_size.log2() as u8;
+        }
+
+        if o.gen_arg.physical_block_size < (1_u32 << sz.2) {
+            if o.gen_arg.logical_block_size != 4096 {
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+        } else {
+            tgt.params.basic.physical_bs_shift = o.gen_arg.physical_block_size.log2() as u8;
+        }
+    }
+
     let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io } });
     dev.set_target_json(val);
 
@@ -235,7 +253,7 @@ pub fn ublk_add_loop(
     parent: Option<PathBuf>,
 ) -> Result<i32, UblkError> {
     let (file, dio) = match opt {
-        Some(o) => (to_absolute_path(o.file, parent), !o.buffered_io),
+        Some(ref o) => (to_absolute_path(o.file.clone(), parent), !o.buffered_io),
         None => {
             let ctrl = UblkCtrl::new_simple(id, 0)?;
             match ctrl.get_target_data_from_json() {
@@ -264,7 +282,7 @@ pub fn ublk_add_loop(
         back_file_path: file_path,
     };
 
-    let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+    let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt);
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
     //todo: USER_COPY should be the default option
