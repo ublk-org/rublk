@@ -1,5 +1,8 @@
 use crate::target_flags::*;
 use clap::{Args, Subcommand};
+use ilog::IntLog;
+use libublk::io::UblkDev;
+use std::io::{Error, ErrorKind};
 
 #[derive(Args, Debug)]
 pub struct GenAddArgs {
@@ -34,10 +37,35 @@ pub struct GenAddArgs {
     /// quiet, don't dump device info
     #[clap(long, default_value_t = false)]
     pub quiet: bool,
+
+    /// logical block size
+    #[clap(long, default_value_t = 512)]
+    pub logical_block_size: u32,
+
+    /// physical block size
+    #[clap(long, default_value_t = 4096)]
+    pub physical_block_size: u32,
 }
 
 impl GenAddArgs {
-    pub fn new_ublk_sesson(&self, name: &'static str, dev_flags: u32) -> libublk::UblkSession {
+    #[allow(dead_code)]
+    pub fn apply_block_size(&self, dev: &mut UblkDev) {
+        dev.tgt.params.basic.logical_bs_shift = self.logical_block_size.log2() as u8;
+        dev.tgt.params.basic.physical_bs_shift = self.physical_block_size.log2() as u8;
+    }
+}
+
+fn is_multiple_of_512(input: u32) -> bool {
+    let quotient = input / 512;
+    quotient > 0 && (quotient & (quotient - 1)) == 0
+}
+
+impl GenAddArgs {
+    pub fn new_ublk_sesson(
+        &self,
+        name: &'static str,
+        dev_flags: u32,
+    ) -> Result<libublk::UblkSession, std::io::Error> {
         let mut ctrl_flags = if self.user_recovery {
             libublk::sys::UBLK_F_USER_RECOVERY
         } else {
@@ -66,7 +94,28 @@ impl GenAddArgs {
             dflags |= libublk::dev_flags::UBLK_DEV_F_DONT_ALLOC_BUF;
         }
 
-        libublk::UblkSessionBuilder::default()
+        if self.logical_block_size > self.physical_block_size {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid block size"));
+        }
+
+        match self.logical_block_size {
+            512 | 1024 | 2048 | 4096 => {}
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid logical block size",
+                ))
+            }
+        }
+
+        if !is_multiple_of_512(self.physical_block_size) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid physical block size",
+            ));
+        }
+
+        Ok(libublk::UblkSessionBuilder::default()
             .name(name)
             .depth(self.depth)
             .nr_queues(self.queue)
@@ -76,7 +125,7 @@ impl GenAddArgs {
             .dev_flags(dflags)
             .io_buf_bytes(self.io_buf_size)
             .build()
-            .unwrap()
+            .unwrap())
     }
 }
 
