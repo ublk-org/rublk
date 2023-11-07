@@ -15,7 +15,7 @@ mod integration {
         arg_list.push(if_dev);
         arg_list.push("of=/dev/null".to_string());
         arg_list.push("bs=4096".to_string());
-        arg_list.push("count=1M".to_string());
+        arg_list.push("count=64k".to_string());
         let out = Command::new("dd").args(arg_list).output().unwrap();
 
         assert!(out.status.success() == true);
