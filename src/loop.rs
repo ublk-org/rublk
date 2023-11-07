@@ -21,9 +21,9 @@ pub struct LoopArgs {
     #[clap(long, short = 'f')]
     pub file: PathBuf,
 
-    /// direct io is applied for backing file of ublk target
-    #[clap(long, default_value_t = true)]
-    pub direct_io: bool,
+    /// buffered io is applied for backing file of ublk target, default is direct IO
+    #[clap(long, default_value_t = false)]
+    pub buffered_io: bool,
 }
 
 // Generate ioctl function
@@ -229,7 +229,7 @@ pub fn ublk_add_loop(
     parent: Option<PathBuf>,
 ) -> Result<i32, UblkError> {
     let (file, dio) = match opt {
-        Some(o) => (to_absolute_path(o.file, parent), o.direct_io),
+        Some(o) => (to_absolute_path(o.file, parent), !o.buffered_io),
         None => {
             let ctrl = UblkCtrl::new_simple(id, 0)?;
             match ctrl.get_target_data_from_json() {
