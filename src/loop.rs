@@ -7,6 +7,7 @@ use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{exe::Executor, exe::UringOpFuture, UblkError, UblkSession};
 use log::trace;
 use serde::{Deserialize, Serialize};
+use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -76,7 +77,12 @@ fn lo_file_size(f: &std::fs::File) -> AnyRes<(u64, u8, u8)> {
 
             Ok((cap, ssz.log2() as u8, pbsz.log2() as u8))
         } else if meta.file_type().is_file() {
-            Ok((f.metadata().unwrap().len(), 9, 12))
+            let m = f.metadata().unwrap();
+            Ok((
+                m.len(),
+                m.st_blksize().log2() as u8,
+                m.st_blksize().log2() as u8,
+            ))
         } else {
             Err(anyhow::anyhow!("unsupported file"))
         }
@@ -196,8 +202,8 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
         basic: libublk::sys::ublk_param_basic {
             logical_bs_shift: sz.1,
             physical_bs_shift: sz.2,
-            io_opt_shift: 12,
-            io_min_shift: 9,
+            io_opt_shift: sz.2,
+            io_min_shift: sz.1,
             max_sectors: info.max_io_buf_bytes >> 9,
             dev_sectors: tgt.dev_size >> 9,
             ..Default::default()
@@ -205,7 +211,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
         ..Default::default()
     };
 
-    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } });
+    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io } });
     dev.set_target_json(val);
 
     Ok(0)
