@@ -12,19 +12,10 @@ pub struct NullAddArgs {
 
 pub fn ublk_add_null(
     sess: UblkSession,
-    id: i32,
+    _id: i32,
     _opt: Option<NullAddArgs>,
 ) -> Result<i32, UblkError> {
-    let size = match _opt {
-        Some(_) => 250_u64 << 30,
-        None => {
-            let ctrl = UblkCtrl::new_simple(id, 0)?;
-            match ctrl.get_target_from_json() {
-                Ok(tgt) => tgt.dev_size,
-                _ => return Err(UblkError::OtherError(-libc::EINVAL)),
-            }
-        }
-    };
+    let size = 250_u64 << 30;
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
