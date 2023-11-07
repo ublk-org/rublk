@@ -6,8 +6,7 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn read_ublk_disk(dev_id: i32) {
-        let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+    fn read_ublk_disk(ctrl: &UblkCtrl) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
         let if_dev = format!("if={}", &dev_path);
@@ -119,7 +118,9 @@ mod integration {
     #[test]
     fn test_ublk_add_del_null() {
         let id = run_rublk_add_dev(["add", "null"].to_vec());
-        read_ublk_disk(id);
+        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+
+        read_ublk_disk(&ctrl);
         run_rublk_del_dev(id);
     }
 
@@ -129,7 +130,9 @@ mod integration {
             Some(f) => {
                 if (f & sys::UBLK_F_ZONED as u64) != 0 {
                     let id = run_rublk_add_dev(["add", "zoned", "--zone-size", "4"].to_vec());
-                    read_ublk_disk(id);
+                    let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+
+                    read_ublk_disk(&ctrl);
                     run_rublk_del_dev(id);
                 }
             }
@@ -150,7 +153,9 @@ mod integration {
         };
 
         let id = run_rublk_add_dev(["add", "loop", "-f", &pstr].to_vec());
-        read_ublk_disk(id);
+        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+
+        read_ublk_disk(&ctrl);
         run_rublk_del_dev(id);
     }
 }
