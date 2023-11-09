@@ -31,11 +31,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
     }
 }
 
-fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
-    let daemonize = daemonize::Daemonize::new()
-        .stdout(daemonize::Stdio::keep())
-        .stderr(daemonize::Stdio::keep());
-
+fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
     let sess = gen_arg
         .new_ublk_sesson(tgt_type, UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
@@ -45,12 +41,20 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         Err(_) => None,
     };
 
+    match opt {
+        AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt), parent_dir),
+        AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
+        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(sess, -1, Some(opt)),
+    }
+}
+
+fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
+    let daemonize = daemonize::Daemonize::new()
+        .stdout(daemonize::Stdio::keep())
+        .stderr(daemonize::Stdio::keep());
+
     match daemonize.start() {
-        Ok(_) => match opt {
-            AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt), parent_dir),
-            AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
-            AddCommands::Zoned(opt) => zoned::ublk_add_zoned(sess, -1, Some(opt)),
-        },
+        Ok(_) => ublk_add_worker(opt),
         Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
     }
 }
