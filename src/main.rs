@@ -312,17 +312,21 @@ fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
     Ok(0)
 }
 
-fn __ublk_list(id: i32) {
-    let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
-
-    if ctrl.get_info().is_ok() {
-        ctrl.dump();
+fn __ublk_list(id: i32) -> Result<i32, UblkError> {
+    match UblkCtrl::new_simple(id, 0) {
+        Ok(mut ctrl) => {
+            if ctrl.get_info().is_ok() {
+                ctrl.dump();
+            }
+            Ok(0)
+        }
+        _ => Err(UblkError::OtherError(-libc::ENODEV)),
     }
 }
 
 fn ublk_list(opt: args::UblkArgs) -> Result<i32, UblkError> {
     if opt.number > 0 {
-        __ublk_list(opt.number);
+        let _ = __ublk_list(opt.number);
         return Ok(0);
     }
 
@@ -333,7 +337,7 @@ fn ublk_list(opt: args::UblkArgs) -> Result<i32, UblkError> {
                 if let Some(file_stem) = f.file_stem() {
                     if let Some(stem) = file_stem.to_str() {
                         if let Ok(num) = stem.parse::<i32>() {
-                            __ublk_list(num);
+                            let _ = __ublk_list(num);
                         }
                     }
                 }
