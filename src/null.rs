@@ -1,5 +1,3 @@
-use crate::target_flags::*;
-use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::{exe::Executor, UblkError, UblkSession};
 use std::rc::Rc;
@@ -13,14 +11,14 @@ pub struct NullAddArgs {
 pub fn ublk_add_null(
     sess: UblkSession,
     _id: i32,
-    _opt: Option<NullAddArgs>,
+    opt: Option<NullAddArgs>,
 ) -> Result<i32, UblkError> {
     let size = 250_u64 << 30;
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
-        if let Some(opt) = _opt {
-            opt.gen_arg.apply_block_size(dev);
+        if let Some(ref o) = opt {
+            o.gen_arg.apply_block_size(dev);
         }
         Ok(0)
     };
@@ -56,10 +54,16 @@ pub fn ublk_add_null(
         q_rc.wait_and_wake_io_tasks(&exe);
     };
 
+    let _shm = {
+        if let Some(o) = opt {
+            Some(o.gen_arg.get_shm_id())
+        } else {
+            None
+        }
+    };
     sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
-        let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        if (d_ctrl.dev_info.ublksrv_flags & TGT_QUIET) == 0 {
-            d_ctrl.dump();
+        if let Some(shm) = _shm {
+            crate::rublk_write_id_into_shm(&shm, dev_id);
         }
     })
     .unwrap();

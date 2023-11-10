@@ -2,6 +2,8 @@ use crate::target_flags::*;
 use clap::{Args, Subcommand};
 use ilog::IntLog;
 use libublk::io::UblkDev;
+use rand::Rng;
+use std::cell::RefCell;
 use std::io::{Error, ErrorKind};
 
 #[derive(Args, Debug)]
@@ -45,6 +47,9 @@ pub struct GenAddArgs {
     /// physical block size
     #[clap(long, default_value_t = 4096)]
     pub physical_block_size: u32,
+
+    #[clap(skip)]
+    shm_id: RefCell<String>,
 }
 
 impl GenAddArgs {
@@ -61,6 +66,24 @@ fn is_multiple_of_512(input: u32) -> bool {
 }
 
 impl GenAddArgs {
+    /// Return shared memory os id
+    pub fn get_shm_id(&self) -> String {
+        let shm_id = self.shm_id.borrow();
+
+        (*shm_id).clone()
+    }
+
+    /// Generate shared memory os id
+    ///
+    /// The 1st 4 hex is from process id, and the other 4 hex
+    /// is from random generator
+    pub fn generate_shm_id(&self) {
+        let mut rng = rand::thread_rng();
+        let mut shm = self.shm_id.borrow_mut();
+
+        *shm = format!("{:04x}{:04x}", std::process::id(), rng.gen::<i32>());
+    }
+
     pub fn new_ublk_sesson(
         &self,
         name: &'static str,

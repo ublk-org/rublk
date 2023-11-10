@@ -3,6 +3,8 @@ use clap::Parser;
 use libublk::dev_flags::*;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
+use shared_memory::*;
+use std::sync::atomic::{fence, Ordering};
 
 pub mod target_flags {
     pub const TGT_QUIET: u64 = 0b00000001;
@@ -21,6 +23,105 @@ mod zoned;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Wait until control device state is updated to `state`
+fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Result<i32, UblkError> {
+    let mut count = 0;
+    let unit = 100_u32;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+
+        ctrl.get_info()?;
+        if ctrl.dev_info.state == state as u16 {
+            return Ok(0);
+        }
+        count += unit;
+        if count >= timeout {
+            return Err(UblkError::OtherError(-libc::ETIME));
+        }
+    }
+}
+
+/// Write device ID into shared memory, so that parent process can
+/// know this ID info
+///
+/// The 1st 4 char is : 'U' 'B' 'L' 'K', then follows the 4
+/// ID chars which is encoded by hex.
+pub fn rublk_write_id_into_shm(shm_id: &String, id: i32) {
+    match ShmemConf::new().os_id(shm_id).size(4096).open() {
+        Ok(mut shmem) => {
+            let s: &mut [u8] = unsafe { shmem.as_slice_mut() };
+
+            let id_str = format!("{:04x}", id);
+            let mut i = 4;
+            for c in id_str.as_bytes() {
+                s[i] = *c;
+                i += 1;
+            }
+
+            // order the two WRITEs
+            fence(Ordering::Release);
+
+            s[0] = b'U';
+            s[1] = b'B';
+            s[2] = b'L';
+            s[3] = b'K';
+        }
+        Err(e) => println!("write id open failed {} {}", shm_id, e),
+    }
+}
+
+fn rublk_read_id_from_shm(shm_id: &String) -> Result<i32, UblkError> {
+    if let Ok(shmem) = ShmemConf::new().os_id(shm_id).size(4096).open() {
+        let s: &[u8] = unsafe { shmem.as_slice() };
+
+        if s[0] != b'U' || s[1] != b'B' || s[2] != b'L' || s[3] != b'K' {
+            return Err(UblkError::OtherError(-libc::EAGAIN));
+        }
+
+        // order the two READs
+        fence(Ordering::Acquire);
+
+        let ss = String::from_utf8(s[4..8].to_vec()).unwrap();
+        if let Ok(i) = i32::from_str_radix(&ss, 16) {
+            return Ok(i);
+        } else {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+    } else {
+        return Err(UblkError::OtherError(-libc::EAGAIN));
+    }
+}
+
+fn rublk_wait_and_dump(shm_id: &String) -> Result<i32, UblkError> {
+    let mut count = 0;
+    loop {
+        if count >= 500 {
+            eprintln!("create ublk device failed");
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+        match rublk_read_id_from_shm(shm_id) {
+            Ok(id) => {
+                let mut ctrl = UblkCtrl::new_simple(id, 0)?;
+
+                if (ctrl.dev_info.ublksrv_flags & target_flags::TGT_QUIET) == 0 {
+                    ctrl.dump();
+                }
+
+                return Ok(0);
+            }
+            Err(UblkError::OtherError(code)) => {
+                if code == -libc::EAGAIN {
+                    count += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                } else {
+                    return Err(UblkError::OtherError(code));
+                }
+            }
+            _ => return Err(UblkError::OtherError(-libc::EINVAL)),
+        };
+    }
 }
 
 fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddArgs) {
@@ -49,12 +150,20 @@ fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
 }
 
 fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
+    let (_, gen_arg) = ublk_parse_add_args(&opt);
     let daemonize = daemonize::Daemonize::new()
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());
 
-    match daemonize.start() {
-        Ok(_) => ublk_add_worker(opt),
+    gen_arg.generate_shm_id();
+
+    let shm_id = gen_arg.get_shm_id();
+    match ShmemConf::new().os_id(&shm_id).size(4096).create() {
+        Ok(_shm) => match daemonize.execute() {
+            daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt),
+            daemonize::Outcome::Parent(Ok(_)) => rublk_wait_and_dump(&shm_id),
+            _ => Err(UblkError::OtherError(-libc::EINVAL)),
+        },
         Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
     }
 }
@@ -108,9 +217,23 @@ fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());
 
-    match daemonize.start() {
-        Ok(_) => ublk_recover_work(opt),
-        Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
+    let id = opt.number;
+    if id < 0 {
+        return Err(UblkError::OtherError(-libc::EINVAL));
+    }
+
+    match daemonize.execute() {
+        daemonize::Outcome::Child(Ok(_)) => ublk_recover_work(opt),
+        daemonize::Outcome::Parent(Ok(_)) => {
+            let mut ctrl = UblkCtrl::new_simple(id, 0)?;
+            ublk_state_wait_until(&mut ctrl, libublk::sys::UBLK_S_DEV_LIVE, 5000)?;
+
+            if (ctrl.dev_info.ublksrv_flags & target_flags::TGT_QUIET) == 0 {
+                ctrl.dump();
+            }
+            Ok(0)
+        }
+        _ => Err(UblkError::OtherError(-libc::EINVAL)),
     }
 }
 

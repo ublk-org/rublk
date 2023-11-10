@@ -1,6 +1,5 @@
 #![allow(non_snake_case)]
 
-use crate::target_flags::*;
 use libublk::sys::ublksrv_io_desc;
 use libublk::sys::{
     BLK_ZONE_COND_CLOSED, BLK_ZONE_COND_EMPTY, BLK_ZONE_COND_EXP_OPEN, BLK_ZONE_COND_FULL,
@@ -12,10 +11,7 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_CLOSE, UBLK_IO_OP_ZONE_FINISH, UBLK_IO_OP_ZONE_OPEN, UBLK_IO_OP_ZONE_RESET,
     UBLK_IO_OP_ZONE_RESET_ALL,
 };
-use libublk::{
-    ctrl::UblkCtrl, exe::Executor, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError,
-    UblkSession,
-};
+use libublk::{exe::Executor, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError, UblkSession};
 
 use log::trace;
 use std::path::PathBuf;
@@ -676,7 +672,7 @@ pub fn ublk_add_zoned(
             ..Default::default()
         };
 
-        if let Some(o) = opt {
+        if let Some(ref o) = opt {
             o.gen_arg.apply_block_size(dev);
         }
 
@@ -729,10 +725,16 @@ pub fn ublk_add_zoned(
         q_rc.wait_and_wake_io_tasks(&exe);
     };
 
+    let _shm = {
+        if let Some(o) = opt {
+            Some(o.gen_arg.get_shm_id())
+        } else {
+            None
+        }
+    };
     sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
-        let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        if (d_ctrl.dev_info.ublksrv_flags & TGT_QUIET) == 0 {
-            d_ctrl.dump();
+        if let Some(shm) = _shm {
+            crate::rublk_write_id_into_shm(&shm, dev_id);
         }
     })
     .unwrap();

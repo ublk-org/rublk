@@ -30,6 +30,8 @@ daemonize = "0.5"
 nix = "0.26.2"
 io-uring = "0.6.0"
 ilog = "1.0.1"
+shared_memory = "0.12.4"
+rand = "0.8.4"
 
 [dev-dependencies]
 tempfile = "3.6.0"

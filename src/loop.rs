@@ -1,4 +1,3 @@
-use crate::target_flags::*;
 use anyhow::Result as AnyRes;
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
@@ -282,6 +281,14 @@ pub fn ublk_add_loop(
         back_file_path: file_path,
     };
 
+    let _shm = {
+        if let Some(ref o) = opt {
+            Some(o.gen_arg.get_shm_id())
+        } else {
+            None
+        }
+    };
+
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt);
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
@@ -317,10 +324,8 @@ pub fn ublk_add_loop(
     };
 
     sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
-        let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
-        if (d_ctrl.dev_info.ublksrv_flags & TGT_QUIET) == 0 {
-            d_ctrl.dump();
+        if let Some(shm) = _shm {
+            crate::rublk_write_id_into_shm(&shm, dev_id);
         }
     })
     .unwrap();
