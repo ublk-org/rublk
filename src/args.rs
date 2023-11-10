@@ -60,8 +60,10 @@ impl GenAddArgs {
     }
 }
 
-fn is_multiple_of_512(input: u32) -> bool {
-    let quotient = input / 512;
+fn is_power2_of(input: u32, base: u32) -> bool {
+    assert!((base & (base - 1)) == 0);
+
+    let quotient = input / base;
     quotient > 0 && (quotient & (quotient - 1)) == 0
 }
 
@@ -131,11 +133,15 @@ impl GenAddArgs {
             }
         }
 
-        if !is_multiple_of_512(self.physical_block_size) {
+        if !is_power2_of(self.physical_block_size, 512) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "invalid physical block size",
             ));
+        }
+
+        if !is_power2_of(self.io_buf_size, 4096) {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid io buf size"));
         }
 
         Ok(libublk::UblkSessionBuilder::default()
