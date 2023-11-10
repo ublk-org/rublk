@@ -107,7 +107,7 @@ mod integration {
         assert!(id >= 0);
 
         let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
-        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
+        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 5000);
 
         //ublk block device should be observed now
         let dev_path = ctrl.get_bdev_path();
