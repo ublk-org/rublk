@@ -4,6 +4,7 @@ use libublk::dev_flags::*;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use shared_memory::*;
+use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
 
 pub mod target_flags {
@@ -354,6 +355,11 @@ fn main() {
         .format_target(false)
         .format_timestamp(None)
         .init();
+
+    if !Path::new("/dev/ublk-control").exists() {
+        eprintln!("Please run `modprobe ublk_drv` first");
+        std::process::exit(1);
+    }
 
     match cli.command {
         Commands::Add(opt) => ublk_add(opt).unwrap(),
