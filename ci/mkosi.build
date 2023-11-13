@@ -44,7 +44,5 @@ git clone https://github.com/osandov/blktests.git
 cd blktests
 make -j4
 rm -f src/miniublk
-ln ../rublk/ci/miniublk.wrapper src/miniublk
-ls -l src/miniublk
 cd -
 cd -

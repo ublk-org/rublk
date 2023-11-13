@@ -70,9 +70,7 @@ jobs:
         mkosi ssh /usr/share/rublk/target/debug/test-basic --nocapture
         mkosi ssh "/root/bin/rublk help"
         mkosi ssh "/root/bin/rublk add help"
-        mkosi ssh "ls -l /usr/share/blktests/src/miniublk"
-        mkosi ssh "cat /usr/share/blktests/src/miniublk"
-        mkosi ssh "cd /usr/share/blktests/; ./check ublk"
+        mkosi ssh "cd /usr/share/blktests/; export PATH=/root/bin:$PATH; ./check ublk"
         mkosi ssh "/usr/share/rublk/ci/add_ublk_dev.sh /root/bin/rublk /usr/share/blktests/"
         mkosi ssh "/root/bin/rublk list"
         mkosi ssh "cat /usr/share/blktests/config"
