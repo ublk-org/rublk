@@ -50,6 +50,9 @@ pub struct GenAddArgs {
 
     #[clap(skip)]
     shm_id: RefCell<String>,
+
+    #[clap(skip)]
+    start_dir: RefCell<Option<std::path::PathBuf>>,
 }
 
 impl GenAddArgs {
@@ -69,6 +72,12 @@ fn is_power2_of(input: u32, base: u32) -> bool {
 
 impl GenAddArgs {
     /// Return shared memory os id
+    pub fn get_start_dir(&self) -> Option<std::path::PathBuf> {
+        let dir = self.start_dir.borrow();
+
+        (*dir).clone()
+    }
+    /// Return shared memory os id
     pub fn get_shm_id(&self) -> String {
         let shm_id = self.shm_id.borrow();
 
@@ -84,6 +93,16 @@ impl GenAddArgs {
         let mut shm = self.shm_id.borrow_mut();
 
         *shm = format!("{:04x}{:04x}", std::process::id(), rng.gen::<i32>());
+    }
+
+    pub fn save_start_dir(&self) {
+        let start_dir = match std::env::current_dir() {
+            Ok(p) => Some(p),
+            Err(_) => None,
+        };
+
+        let mut dir = self.start_dir.borrow_mut();
+        *dir = start_dir;
     }
 
     pub fn new_ublk_sesson(

@@ -138,13 +138,9 @@ fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
     let sess = gen_arg
         .new_ublk_sesson(tgt_type, UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
         .unwrap();
-    let parent_dir = match std::env::current_dir() {
-        Ok(p) => Some(p),
-        Err(_) => None,
-    };
 
     match opt {
-        AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt), parent_dir),
+        AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt)),
         AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
         AddCommands::Zoned(opt) => zoned::ublk_add_zoned(sess, -1, Some(opt)),
     }
@@ -157,6 +153,7 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         .stderr(daemonize::Stdio::keep());
 
     gen_arg.generate_shm_id();
+    gen_arg.save_start_dir();
 
     let shm_id = gen_arg.get_shm_id();
     match ShmemConf::new().os_id(&shm_id).size(4096).create() {
@@ -206,7 +203,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .unwrap();
 
     match tgt_type.as_str() {
-        "loop" => r#loop::ublk_add_loop(sess, opt.number, None, None),
+        "loop" => r#loop::ublk_add_loop(sess, opt.number, None),
         "null" => null::ublk_add_null(sess, opt.number, None),
         "zoned" => zoned::ublk_add_zoned(sess, opt.number, None),
         &_ => todo!(),

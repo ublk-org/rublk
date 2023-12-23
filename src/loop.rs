@@ -245,14 +245,13 @@ fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
     }
 }
 
-pub fn ublk_add_loop(
-    sess: UblkSession,
-    id: i32,
-    opt: Option<LoopArgs>,
-    parent: Option<PathBuf>,
-) -> Result<i32, UblkError> {
+pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
     let (file, dio) = match opt {
-        Some(ref o) => (to_absolute_path(o.file.clone(), parent), !o.buffered_io),
+        Some(ref o) => {
+            let parent = o.gen_arg.get_start_dir();
+
+            (to_absolute_path(o.file.clone(), parent), !o.buffered_io)
+        }
         None => {
             let ctrl = UblkCtrl::new_simple(id, 0)?;
             match ctrl.get_target_data_from_json() {
