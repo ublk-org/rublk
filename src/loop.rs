@@ -1,4 +1,3 @@
-use anyhow::Result as AnyRes;
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::ctrl::UblkCtrl;
@@ -6,8 +5,6 @@ use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{exe::Executor, exe::UringOpFuture, UblkError, UblkSession};
 use log::trace;
 use serde::{Deserialize, Serialize};
-use std::os::linux::fs::MetadataExt;
-use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -26,24 +23,6 @@ pub struct LoopArgs {
     pub buffered_io: bool,
 }
 
-// Generate ioctl function
-const BLK_IOCTL_TYPE: u8 = 0x12; // Defined in linux/fs.h
-const BLKGETSIZE64_NR: u8 = 114;
-const BLKSSZGET_NR: u8 = 104;
-const BLKPBSZGET_NR: u8 = 123;
-
-ioctl_read!(ioctl_blkgetsize64, BLK_IOCTL_TYPE, BLKGETSIZE64_NR, u64);
-ioctl_read_bad!(
-    ioctl_blksszget,
-    request_code_none!(BLK_IOCTL_TYPE, BLKSSZGET_NR),
-    i32
-);
-ioctl_read_bad!(
-    ioctl_blkpbszget,
-    request_code_none!(BLK_IOCTL_TYPE, BLKPBSZGET_NR),
-    u32
-);
-
 #[derive(Debug, Serialize, Deserialize)]
 struct LoJson {
     back_file_path: String,
@@ -54,40 +33,6 @@ pub struct LoopTgt {
     pub back_file_path: String,
     pub back_file: std::fs::File,
     pub direct_io: i32,
-}
-
-fn lo_file_size(f: &std::fs::File) -> AnyRes<(u64, u8, u8)> {
-    if let Ok(meta) = f.metadata() {
-        if meta.file_type().is_block_device() {
-            let fd = f.as_raw_fd();
-            let mut cap = 0_u64;
-            let mut ssz = 0_i32;
-            let mut pbsz = 0_u32;
-
-            unsafe {
-                let cap_ptr = &mut cap as *mut u64;
-                let ssz_ptr = &mut ssz as *mut i32;
-                let pbsz_ptr = &mut pbsz as *mut u32;
-
-                ioctl_blkgetsize64(fd, cap_ptr).unwrap();
-                ioctl_blksszget(fd, ssz_ptr).unwrap();
-                ioctl_blkpbszget(fd, pbsz_ptr).unwrap();
-            }
-
-            Ok((cap, ssz.log2() as u8, pbsz.log2() as u8))
-        } else if meta.file_type().is_file() {
-            let m = f.metadata().unwrap();
-            Ok((
-                m.len(),
-                m.st_blksize().log2() as u8,
-                m.st_blksize().log2() as u8,
-            ))
-        } else {
-            Err(anyhow::anyhow!("unsupported file"))
-        }
-    } else {
-        Err(anyhow::anyhow!("no file meta got"))
-    }
 }
 
 #[inline]
@@ -192,7 +137,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
     tgt.nr_fds = nr_fds + 1;
 
-    let sz = lo_file_size(&lo.back_file).unwrap();
+    let sz = crate::ublk_file_size(&lo.back_file).unwrap();
 
     tgt.dev_size = sz.0;
     //todo: figure out correct block size
