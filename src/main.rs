@@ -11,7 +11,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
 
-pub mod target_flags {
+pub(crate) mod target_flags {
     pub const TGT_QUIET: u64 = 0b00000001;
 }
 
@@ -105,7 +105,7 @@ fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Resul
 ///
 /// The 1st 4 char is : 'U' 'B' 'L' 'K', then follows the 4
 /// ID chars which is encoded by hex.
-pub fn rublk_write_id_into_shm(shm_id: &String, id: i32) {
+pub(crate) fn rublk_write_id_into_shm(shm_id: &String, id: i32) {
     match ShmemConf::new().os_id(shm_id).size(4096).open() {
         Ok(mut shmem) => {
             let s: &mut [u8] = unsafe { shmem.as_slice_mut() };

@@ -178,7 +178,7 @@ impl GenAddArgs {
 }
 
 #[derive(Args)]
-pub struct DelArgs {
+pub(crate) struct DelArgs {
     /// device id, -1 means ublk driver assigns ID for us
     #[clap(long, short = 'n', default_value_t = -1)]
     pub number: i32,
@@ -189,17 +189,17 @@ pub struct DelArgs {
 }
 
 #[derive(Args)]
-pub struct UblkArgs {
+pub(crate) struct UblkArgs {
     /// device id, -1 means ublk driver assigns ID for us
     #[clap(long, short = 'n', default_value_t = -1)]
     pub number: i32,
 }
 
 #[derive(Args)]
-pub struct UblkFeaturesArgs {}
+pub(crate) struct UblkFeaturesArgs {}
 
 #[derive(Subcommand)]
-pub enum AddCommands {
+pub(crate) enum AddCommands {
     /// Add loop target
     Loop(super::r#loop::LoopArgs),
     /// Add null target
@@ -210,7 +210,7 @@ pub enum AddCommands {
 }
 
 #[derive(Subcommand)]
-pub enum Commands {
+pub(crate) enum Commands {
     /// Adds ublk target
     #[clap(subcommand)]
     Add(AddCommands),
