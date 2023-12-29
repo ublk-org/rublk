@@ -41,12 +41,12 @@ pub struct GenAddArgs {
     pub quiet: bool,
 
     /// logical block size
-    #[clap(long, default_value_t = 512)]
-    pub logical_block_size: u32,
+    #[clap(long)]
+    pub logical_block_size: Option<u32>,
 
     /// physical block size
-    #[clap(long, default_value_t = 4096)]
-    pub physical_block_size: u32,
+    #[clap(long)]
+    pub physical_block_size: Option<u32>,
 
     /// read only
     #[clap(long, short = 'o', default_value_t = false)]
@@ -61,9 +61,16 @@ pub struct GenAddArgs {
 
 impl GenAddArgs {
     pub fn apply_block_size(&self, dev: &mut UblkDev) {
-        dev.tgt.params.basic.logical_bs_shift = self.logical_block_size.log2() as u8;
-        dev.tgt.params.basic.physical_bs_shift = self.physical_block_size.log2() as u8;
+        match self.logical_block_size {
+            Some(bs) => dev.tgt.params.basic.logical_bs_shift = bs.log2() as u8,
+            None => {}
+        }
+        match self.physical_block_size {
+            Some(bs) => dev.tgt.params.basic.physical_bs_shift = bs.log2() as u8,
+            None => {}
+        }
     }
+
     pub fn apply_read_only(&self, dev: &mut UblkDev) {
         if self.read_only {
             dev.tgt.params.basic.attrs |= libublk::sys::UBLK_ATTR_READ_ONLY;
@@ -148,12 +155,8 @@ impl GenAddArgs {
             dflags |= libublk::dev_flags::UBLK_DEV_F_DONT_ALLOC_BUF;
         }
 
-        if self.logical_block_size > self.physical_block_size {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid block size"));
-        }
-
         match self.logical_block_size {
-            512 | 1024 | 2048 | 4096 => {}
+            None | Some(512) | Some(1024) | Some(2048) | Some(4096) => {}
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
@@ -162,11 +165,24 @@ impl GenAddArgs {
             }
         }
 
-        if !is_power2_of(self.physical_block_size, 512) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "invalid physical block size",
-            ));
+        match self.physical_block_size {
+            Some(pbs) => {
+                if !is_power2_of(pbs, 512) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "invalid physical block size",
+                    ));
+                }
+                match self.logical_block_size {
+                    Some(lbs) => {
+                        if lbs > pbs {
+                            return Err(Error::new(ErrorKind::InvalidInput, "invalid block size"));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
         }
 
         if !is_power2_of(self.io_buf_size, 4096) {

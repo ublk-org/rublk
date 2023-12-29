@@ -1,4 +1,3 @@
-use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
@@ -156,22 +155,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     };
 
     if let Some(o) = opt {
-        if o.gen_arg.logical_block_size < (1_u32 << sz.1) {
-            if o.gen_arg.logical_block_size != 512 {
-                return Err(UblkError::OtherError(-libc::EINVAL));
-            }
-        } else {
-            tgt.params.basic.logical_bs_shift = o.gen_arg.logical_block_size.log2() as u8;
-        }
-
-        if o.gen_arg.physical_block_size < (1_u32 << sz.2) {
-            if o.gen_arg.logical_block_size != 4096 {
-                return Err(UblkError::OtherError(-libc::EINVAL));
-            }
-        } else {
-            tgt.params.basic.physical_bs_shift = o.gen_arg.physical_block_size.log2() as u8;
-        }
-
+        o.gen_arg.apply_block_size(dev);
         o.gen_arg.apply_read_only(dev);
     }
 
