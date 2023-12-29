@@ -17,6 +17,7 @@ maintenance = { status = "actively-developed" }
 
 [dependencies]
 libublk = { git = "https://github.com/ming1/libublk-rs", branch = "main", default-features = false }
+qcow2-rs = { git = "https://github.com/ming1/qcow2-rs.git", branch = "main" }
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
 libc = "0.2"
@@ -32,6 +33,9 @@ io-uring = "0.6.0"
 ilog = "1.0.1"
 shared_memory = "0.12.4"
 rand = "0.8.4"
+async-trait = "0.1"
+smol = "1.3.0"
+futures = "0.3.29"
 
 [dev-dependencies]
 tempfile = "3.6.0"

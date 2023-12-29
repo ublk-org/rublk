@@ -228,11 +228,15 @@ pub(crate) struct UblkFeaturesArgs {}
 pub(crate) enum AddCommands {
     /// Add loop target
     Loop(super::r#loop::LoopArgs),
+
     /// Add null target
     Null(super::null::NullAddArgs),
 
     /// Add Zoned target, supported since v6.6
     Zoned(super::zoned::ZonedAddArgs),
+
+    /// Add qcow2 target
+    Qcow2(super::qcow2::Qcow2Args),
 }
 
 #[derive(Subcommand)]
