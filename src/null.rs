@@ -19,6 +19,7 @@ pub fn ublk_add_null(
         dev.set_default_params(size);
         if let Some(ref o) = opt {
             o.gen_arg.apply_block_size(dev);
+            o.gen_arg.apply_read_only(dev);
         }
         Ok(0)
     };

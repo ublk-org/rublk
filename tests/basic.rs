@@ -6,6 +6,14 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    fn check_ro(ctrl: &mut UblkCtrl, exp_ro: bool) {
+        let mut params: sys::ublk_params = { Default::default() };
+        ctrl.get_params(&mut params).unwrap();
+
+        let ro = (params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0;
+        assert!(ro == exp_ro);
+    }
+
     fn check_block_size(ctrl: &mut UblkCtrl, exp_bs: u32) {
         let mut params: sys::ublk_params = { Default::default() };
         ctrl.get_params(&mut params).unwrap();
@@ -202,5 +210,17 @@ mod integration {
     #[test]
     fn test_ublk_add_del_loop() {
         __test_ublk_add_del_loop(4096);
+    }
+
+    fn __test_ublk_null_read_only(cmds: &[&str], exp_ro: bool) {
+        let id = run_rublk_add_dev(cmds.to_vec());
+        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+        check_ro(&mut ctrl, exp_ro);
+        run_rublk_del_dev(id);
+    }
+    #[test]
+    fn test_ublk_null_read_only() {
+        __test_ublk_null_read_only(&["add", "null"], false);
+        __test_ublk_null_read_only(&["add", "null", "--read-only"], true);
     }
 }

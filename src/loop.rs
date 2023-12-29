@@ -171,6 +171,8 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
         } else {
             tgt.params.basic.physical_bs_shift = o.gen_arg.physical_block_size.log2() as u8;
         }
+
+        o.gen_arg.apply_read_only(dev);
     }
 
     let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io } });
@@ -191,21 +193,32 @@ fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
-    let (file, dio) = match opt {
+    let (file, dio, ro) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
 
-            (to_absolute_path(o.file.clone(), parent), !o.buffered_io)
+            (
+                to_absolute_path(o.file.clone(), parent),
+                !o.buffered_io,
+                o.gen_arg.read_only,
+            )
         }
         None => {
-            let ctrl = UblkCtrl::new_simple(id, 0)?;
+            let mut ctrl = UblkCtrl::new_simple(id, 0)?;
+            let mut p: libublk::sys::ublk_params = Default::default();
+            ctrl.get_params(&mut p)?;
+
             match ctrl.get_target_data_from_json() {
                 Some(val) => {
                     let lo = &val["loop"];
                     let tgt_data: Result<LoJson, _> = serde_json::from_value(lo.clone());
 
                     match tgt_data {
-                        Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
+                        Ok(t) => (
+                            PathBuf::from(t.back_file_path.as_str()),
+                            t.direct_io != 0,
+                            (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
+                        ),
                         Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
                     }
                 }
@@ -218,7 +231,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
     let lo = LoopTgt {
         back_file: std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!ro)
             .open(&file)
             .unwrap(),
         direct_io: i32::from(dio),

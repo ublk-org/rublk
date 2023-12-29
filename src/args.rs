@@ -48,6 +48,10 @@ pub struct GenAddArgs {
     #[clap(long, default_value_t = 4096)]
     pub physical_block_size: u32,
 
+    /// read only
+    #[clap(long, short = 'o', default_value_t = false)]
+    pub read_only: bool,
+
     #[clap(skip)]
     shm_id: RefCell<String>,
 
@@ -56,10 +60,16 @@ pub struct GenAddArgs {
 }
 
 impl GenAddArgs {
-    #[allow(dead_code)]
     pub fn apply_block_size(&self, dev: &mut UblkDev) {
         dev.tgt.params.basic.logical_bs_shift = self.logical_block_size.log2() as u8;
         dev.tgt.params.basic.physical_bs_shift = self.physical_block_size.log2() as u8;
+    }
+    pub fn apply_read_only(&self, dev: &mut UblkDev) {
+        if self.read_only {
+            dev.tgt.params.basic.attrs |= libublk::sys::UBLK_ATTR_READ_ONLY;
+        } else {
+            dev.tgt.params.basic.attrs &= !libublk::sys::UBLK_ATTR_READ_ONLY;
+        }
     }
 }
 

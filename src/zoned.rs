@@ -674,6 +674,7 @@ pub fn ublk_add_zoned(
 
         if let Some(ref o) = opt {
             o.gen_arg.apply_block_size(dev);
+            o.gen_arg.apply_read_only(dev);
         }
 
         Ok(0)
