@@ -3,7 +3,6 @@ use clap::Parser;
 use ilog::IntLog;
 use libublk::dev_flags::*;
 use libublk::{ctrl::UblkCtrl, UblkError};
-use log::trace;
 use shared_memory::*;
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
@@ -21,6 +20,7 @@ extern crate nix;
 mod args;
 mod r#loop;
 mod null;
+mod qcow2;
 mod uring;
 mod zoned;
 
@@ -187,6 +187,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
         AddCommands::Loop(_opt) => ("loop", &_opt.gen_arg),
         AddCommands::Null(_opt) => ("null", &_opt.gen_arg),
         AddCommands::Zoned(_opt) => ("zoned", &_opt.gen_arg),
+        AddCommands::Qcow2(_opt) => ("qcow2", &_opt.gen_arg),
     }
 }
 
@@ -200,6 +201,7 @@ fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
         AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt)),
         AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
         AddCommands::Zoned(opt) => zoned::ublk_add_zoned(sess, -1, Some(opt)),
+        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(sess, -1, Some(opt)),
     }
 }
 
@@ -341,7 +343,7 @@ fn __ublk_del(id: i32) -> Result<i32, UblkError> {
 }
 
 fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
-    trace!("ublk del {} {}", opt.number, opt.all);
+    log::trace!("ublk del {} {}", opt.number, opt.all);
 
     if !opt.all {
         __ublk_del(opt.number)?;

@@ -36,6 +36,19 @@ mod integration {
         assert!(out.status.success() == true);
     }
 
+    fn write_ublk_disk(ctrl: &UblkCtrl, bs: u32, size: usize) {
+        let dev_path = ctrl.get_bdev_path();
+        let mut arg_list: Vec<String> = Vec::new();
+
+        arg_list.push("if=/dev/zero".to_string());
+        arg_list.push(format!("of={}", dev_path));
+        arg_list.push(format!("bs={}", bs));
+        arg_list.push(format!("count={}", size / (bs as usize)));
+        let out = Command::new("dd").args(arg_list).output().unwrap();
+
+        assert!(out.status.success() == true);
+    }
+
     fn create_file_with_size(p: &Path, size: u64) -> std::io::Result<()> {
         // Open the file for writing. This will create the file if it doesn't exist.
         let file = File::create(p)?;
@@ -45,6 +58,22 @@ mod integration {
 
         Ok(())
     }
+
+    // qemu-img package is needed
+    fn create_qcow2_image(p: &Path, size: usize) {
+        let mut arg_list: Vec<String> = Vec::new();
+        let name = format!("{}", p.to_str().unwrap());
+        let size = format!("{}", size);
+
+        arg_list.push("create".to_string());
+        arg_list.push("-f".to_string());
+        arg_list.push("qcow2".to_string());
+        arg_list.push(name);
+        arg_list.push(size);
+        let out = Command::new("qemu-img").args(arg_list).output().unwrap();
+        assert!(out.status.success() == true);
+    }
+
     fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u16, timeout: u32) {
         let mut count = 0;
         let unit = 100_u32;
@@ -222,5 +251,40 @@ mod integration {
     fn test_ublk_null_read_only() {
         __test_ublk_null_read_only(&["add", "null"], false);
         __test_ublk_null_read_only(&["add", "null", "--read-only"], true);
+    }
+
+    fn __test_ublk_add_del_qcow2(bs: u32) {
+        let tmp_file = tempfile::NamedTempFile::new().unwrap();
+        let file_size = 32 * 1024 * 1024;
+        let p = tmp_file.path();
+
+        create_qcow2_image(&p, file_size);
+        let pstr = match p.to_str() {
+            Some(p) => p,
+            _ => panic!(),
+        };
+
+        let id = run_rublk_add_dev(
+            [
+                "add",
+                "qcow2",
+                "-f",
+                &pstr,
+                "--logical-block-size",
+                &bs.to_string(),
+            ]
+            .to_vec(),
+        );
+
+        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+
+        read_ublk_disk(&ctrl);
+        write_ublk_disk(&ctrl, bs, file_size);
+        check_block_size(&mut ctrl, bs);
+        run_rublk_del_dev(id);
+    }
+    #[test]
+    fn test_ublk_add_del_qcow2() {
+        __test_ublk_add_del_qcow2(4096);
     }
 }
