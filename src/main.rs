@@ -21,6 +21,7 @@ extern crate nix;
 mod args;
 mod r#loop;
 mod null;
+mod uring;
 mod zoned;
 
 #[derive(Parser)]

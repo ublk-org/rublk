@@ -1,3 +1,4 @@
+use crate::uring::{ublk_submit_io_cmd, ublk_wake_task, UblkUringOpFuture};
 use io_uring::{opcode, squeue, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
@@ -20,18 +21,24 @@ pub struct LoopArgs {
     /// buffered io is applied for backing file of ublk target, default is direct IO
     #[clap(long, default_value_t = false)]
     pub buffered_io: bool,
+
+    /// use smol executor
+    #[clap(long, default_value_t = false)]
+    pub smol: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LoJson {
     back_file_path: String,
     direct_io: i32,
+    smol: bool,
 }
 
 pub struct LoopTgt {
     pub back_file_path: String,
     pub back_file: std::fs::File,
     pub direct_io: i32,
+    pub smol: bool,
 }
 
 #[inline]
@@ -101,7 +108,8 @@ fn __lo_submit_io_cmd(q: &UblkQueue<'_>, tag: u16, iod: &libublk::sys::ublksrv_i
     };
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
+#[inline]
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, smol: bool) -> i32 {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
@@ -112,7 +120,11 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
 
     for _ in 0..4 {
         __lo_submit_io_cmd(q, tag, iod, user_data);
-        let res = UringOpFuture { user_data }.await;
+        let res = if !smol {
+            UringOpFuture { user_data }.await
+        } else {
+            UblkUringOpFuture { user_data }.await
+        };
         if res != -(libc::EAGAIN) {
             return res;
         }
@@ -159,7 +171,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
         o.gen_arg.apply_read_only(dev);
     }
 
-    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io } });
+    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io, smol:lo.smol, } });
     dev.set_target_json(val);
 
     Ok(0)
@@ -177,7 +189,7 @@ fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
-    let (file, dio, ro) = match opt {
+    let (file, dio, ro, smol) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
 
@@ -185,6 +197,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
                 to_absolute_path(o.file.clone(), parent),
                 !o.buffered_io,
                 o.gen_arg.read_only,
+                o.smol,
             )
         }
         None => {
@@ -202,6 +215,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
                             PathBuf::from(t.back_file_path.as_str()),
                             t.direct_io != 0,
                             (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
+                            t.smol,
                         ),
                         Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
                     }
@@ -220,6 +234,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
             .unwrap(),
         direct_io: i32::from(dio),
         back_file_path: file_path,
+        smol,
     };
 
     let _shm = {
@@ -256,7 +271,7 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
                         break;
                     }
 
-                    res = lo_handle_io_cmd_async(&q, tag).await;
+                    res = lo_handle_io_cmd_async(&q, tag, false).await;
                     cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                 }
             });
@@ -264,11 +279,58 @@ pub fn ublk_add_loop(sess: UblkSession, id: i32, opt: Option<LoopArgs>) -> Resul
         q_rc.wait_and_wake_io_tasks(&exe);
     };
 
-    sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
-        if let Some(shm) = _shm {
-            crate::rublk_write_id_into_shm(&shm, dev_id);
+    let q_handler2 = move |qid: u16, dev: &UblkDev| {
+        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
+
+        let mut f_vec = Vec::new();
+        for tag in 0..depth as u16 {
+            let q = q_rc.clone();
+
+            f_vec.push(exe.spawn(async move {
+                let buf_addr = q.get_io_buf_addr(tag);
+                let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                let mut res = 0;
+                loop {
+                    let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, buf_addr, res).await;
+                    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                        break;
+                    }
+
+                    res = lo_handle_io_cmd_async(&q, tag, true).await;
+                    cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                }
+            }));
+            exe.try_tick();
         }
-    })
+
+        loop {
+            log::debug!("submit sqes & waiting for cqe completion");
+            match q_rc.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
+                Err(_) => break,
+                _ => {}
+            }
+
+            // run io tasks
+            while exe_rc.try_tick() {}
+        }
+        smol::block_on(async { futures::future::join_all(f_vec).await });
+    };
+
+    if !smol {
+        sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
+            if let Some(shm) = _shm {
+                crate::rublk_write_id_into_shm(&shm, dev_id);
+            }
+        })
+    } else {
+        sess.run_target(&mut ctrl, &dev, q_handler2, |dev_id| {
+            if let Some(shm) = _shm {
+                crate::rublk_write_id_into_shm(&shm, dev_id);
+            }
+        })
+    }
     .unwrap();
     Ok(0)
 }
