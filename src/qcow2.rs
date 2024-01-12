@@ -471,8 +471,6 @@ pub fn ublk_add_qcow2(
         let tgt = tgt_rc.clone();
         let task = exe.spawn(async move {
             tgt.qdev.flush_meta().await.unwrap();
-            // check if everything is fine
-            tgt_rc.qdev.check().await.unwrap();
         });
         ublk_run_task(&q_rc, &exe, &task, 1);
 
