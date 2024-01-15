@@ -7,8 +7,9 @@ use io_uring::{opcode, types};
 use libublk::ctrl::{UblkCtrl, UblkQueueAffinity};
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::{UblkError, UblkSession};
-use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams, Qcow2IoOps};
+use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams};
 use qcow2_rs::error::Qcow2Result;
+use qcow2_rs::ops::*;
 use qcow2_rs::utils::qcow2_alloc_dev_sync;
 use serde::{Deserialize, Serialize};
 use std::cell::{RefCell, UnsafeCell};
@@ -162,12 +163,17 @@ impl Qcow2IoOps for UblkQcow2Io {
         }
     }
 
-    async fn discard_range(&self, offset: u64, len: usize, _flags: i32) -> Qcow2Result<()> {
+    async fn fallocate(&self, offset: u64, len: usize, flags: u32) -> Qcow2Result<()> {
         let seq = ublk_get_uring_io_seq();
         let qp = get_thread_local_queue();
         let q = unsafe { &*qp };
         let fd = types::Fd(self.fd);
         let user_data = seq | (1 << 63);
+        let mode = if (flags & Qcow2OpsFlags::FALLOCATE_ZERO_RAGE) != 0 {
+            0x10 //ZERO_RANGE include/uapi/linux/falloc.h
+        } else {
+            0
+        };
 
         log::debug!(
             "qcow2 discard: {} offset {:x} len {} key {:x}",
@@ -179,6 +185,7 @@ impl Qcow2IoOps for UblkQcow2Io {
         loop {
             let sqe = &opcode::Fallocate::new(fd, len as u64)
                 .offset(offset)
+                .mode(mode)
                 .build()
                 .user_data(user_data);
             let res = ublk_submit_sqe(q, sqe, user_data).await;
@@ -193,7 +200,7 @@ impl Qcow2IoOps for UblkQcow2Io {
         }
     }
 
-    async fn fsync(&self, offset: u64, len: usize, _flags: i32) -> Qcow2Result<()> {
+    async fn fsync(&self, offset: u64, len: usize, _flags: u32) -> Qcow2Result<()> {
         let seq = ublk_get_uring_io_seq();
         let qp = get_thread_local_queue();
         let q = unsafe { &*qp };
