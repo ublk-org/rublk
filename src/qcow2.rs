@@ -14,7 +14,7 @@ use qcow2_rs::utils::qcow2_alloc_dev_sync;
 use serde::{Deserialize, Serialize};
 use std::cell::{RefCell, UnsafeCell};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -74,7 +74,7 @@ qcow2_rs::qcow2_setup_dev_fn_sync!(UblkQcow2Io, ulbk_qcow2_setup_dev);
 
 #[allow(dead_code)]
 impl UblkQcow2Io {
-    pub fn new(path: &PathBuf, ro: bool, dio: bool) -> UblkQcow2Io {
+    pub fn new(path: &Path, ro: bool, dio: bool) -> UblkQcow2Io {
         log::trace!(
             "qcow2: setup ublk qcow2 IO path {:?} readonly {} direct io {}",
             path,
@@ -84,7 +84,7 @@ impl UblkQcow2Io {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(!ro)
-            .open(path.clone())
+            .open(path)
             .unwrap();
         let fd = file.as_raw_fd();
 
@@ -378,7 +378,7 @@ pub fn ublk_add_qcow2(
     let file_path = format!("{}", file.as_path().display());
     log::info!("qcow2: add: path {}", &file_path);
     let p = qcow2_rs::qcow2_default_params!(false, dio);
-    let qdev = ulbk_qcow2_setup_dev(&file, &p).unwrap();
+    let qdev = ulbk_qcow2_setup_dev(file.as_path(), &p).unwrap();
     let dev_size = qdev.info.virtual_size();
     let lo = Qcow2Tgt {
         direct_io: i32::from(dio),
