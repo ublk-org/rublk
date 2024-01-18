@@ -16,7 +16,7 @@ maintenance = { status = "actively-developed" }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-qcow2-rs = "0.1"
+qcow2-rs = "0.1.1"
 libublk = "0.2.2"
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
