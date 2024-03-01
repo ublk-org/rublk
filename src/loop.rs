@@ -151,6 +151,37 @@ fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
     }
 }
 
+fn q_a_fn(qid: u16, dev: &UblkDev) {
+    let depth = dev.dev_info.queue_depth;
+    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+    let exe = smol::LocalExecutor::new();
+    let mut f_vec = Vec::new();
+
+    for tag in 0..depth {
+        let q = q_rc.clone();
+
+        f_vec.push(exe.spawn(async move {
+            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let buf_addr = buf.as_mut_ptr();
+            let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
+            let mut res = 0;
+
+            q.register_io_buf(tag, &buf);
+            loop {
+                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                    break;
+                }
+
+                res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
+                cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            }
+        }));
+    }
+    ublk_wait_and_handle_ios(&exe, &q_rc);
+    smol::block_on(async { futures::future::join_all(f_vec).await });
+}
+
 pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
     let (file, dio, ro, smol) = match opt {
         Some(ref o) => {
@@ -207,49 +238,20 @@ pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<
         }
     };
 
-    let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt);
-
     //todo: USER_COPY should be the default option
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
-    let depth = ctrl.dev_info().queue_depth;
-    let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-        let exe = smol::LocalExecutor::new();
-        let mut f_vec = Vec::new();
-
-        for tag in 0..depth as u16 {
-            let q = q_rc.clone();
-
-            f_vec.push(exe.spawn(async move {
-                let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-                let buf_addr = buf.as_mut_ptr();
-                let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
-                let mut res = 0;
-
-                q.register_io_buf(tag, &buf);
-                loop {
-                    let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
-                    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                        break;
-                    }
-
-                    res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
-                    cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
-                }
-            }));
-        }
-        ublk_wait_and_handle_ios(&exe, &q_rc);
-        smol::block_on(async { futures::future::join_all(f_vec).await });
-    };
-
-    ctrl.run_target(tgt_init, q_handler, |ctrl: &UblkCtrl| {
-        if let Some(shm) = _shm {
-            crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);
-        }
-    })
+    ctrl.run_target(
+        |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
+        move |qid, dev: &_| q_a_fn(qid, dev),
+        |ctrl: &UblkCtrl| {
+            if let Some(shm) = _shm {
+                crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);
+            }
+        },
+    )
     .unwrap();
     Ok(0)
 }
