@@ -52,13 +52,12 @@ struct ZonedTgt {
     zone_max_open: u32,
     zone_max_active: u32,
     nr_zones: u32,
-    fd: i32,
 
     data: RwLock<TgtData>,
 }
 
 impl ZonedTgt {
-    fn new(size: u64, zone_size: u64, fd: i32) -> ZonedTgt {
+    fn new(size: u64, zone_size: u64) -> ZonedTgt {
         let buf_addr = libublk::ublk_alloc_buf(size as usize, 4096) as u64;
         let zone_cap = zone_size >> 9;
         let nr_zones = size / zone_size;
@@ -88,7 +87,6 @@ impl ZonedTgt {
             zone_max_open: 0,
             zone_max_active: 0,
             nr_zones: nr_zones as u32,
-            fd,
             data: RwLock::new(TgtData {
                 zones,
                 ..Default::default()
@@ -367,7 +365,7 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
         libc::pwrite(
-            tgt.fd,
+            q.dev.tgt.fds[0],
             buf_addr as *const libc::c_void,
             dsize.try_into().unwrap(),
             offset.try_into().unwrap(),
@@ -442,7 +440,12 @@ fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -
         }
 
         //write data to /dev/ublkcN from our ram directly
-        let ret = libc::pwrite(tgt.fd as i32, addr, bytes, offset.try_into().unwrap()) as i32;
+        let ret = libc::pwrite(
+            q.dev.tgt.fds[0] as i32,
+            addr,
+            bytes,
+            offset.try_into().unwrap(),
+        ) as i32;
 
         if cond == BLK_ZONE_COND_EMPTY {
             libublk::ublk_dealloc_buf(addr as *mut u8, bytes as usize, 4096);
@@ -466,7 +469,7 @@ fn handle_plain_write(
     unsafe {
         //read data from /dev/ublkcN to our ram directly
         libc::pread(
-            tgt.fd as i32,
+            q.dev.tgt.fds[0] as i32,
             (tgt.start + off) as *mut libc::c_void,
             bytes,
             offset.try_into().unwrap(),
@@ -681,7 +684,7 @@ pub fn ublk_add_zoned(
     };
 
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, dev.tgt.fds[0]));
+    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size));
     let depth = dev.dev_info.queue_depth;
 
     match ctrl.get_driver_features() {
