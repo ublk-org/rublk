@@ -1,10 +1,10 @@
 #[rustversion::before(1.75)]
 use async_trait::async_trait;
 use io_uring::{opcode, types};
-use libublk::ctrl::{UblkCtrl, UblkQueueAffinity};
+use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::{ublk_run_io_task, ublk_wait_and_handle_ios};
+use libublk::uring_async::{ublk_run_ctrl_task, ublk_run_io_task, ublk_wait_and_handle_ios};
 use libublk::UblkError;
 use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams};
 use qcow2_rs::error::Qcow2Result;
@@ -15,7 +15,6 @@ use std::cell::{RefCell, UnsafeCell};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{mpsc, Arc};
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Qcow2Args {
@@ -309,11 +308,70 @@ async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, t
     }
 }
 
+/// Start device in async IO task, in which both control and io rings
+/// are driven in current context
+fn start_dev_fn(
+    exe: &smol::LocalExecutor,
+    ctrl_rc: &Rc<UblkCtrl>,
+    dev_arc: &Rc<UblkDev>,
+    q: &UblkQueue,
+) -> Result<i32, UblkError> {
+    let ctrl_clone = ctrl_rc.clone();
+    let dev_clone = dev_arc.clone();
+
+    // Start device in one dedicated io task
+    let task = exe.spawn(async move {
+        let r = ctrl_clone.configure_queue(&dev_clone, 0, unsafe { libc::gettid() });
+        if r.is_err() {
+            r
+        } else {
+            ctrl_clone.start_dev_async(&dev_clone).await
+        }
+    });
+    ublk_run_ctrl_task(exe, q, &task)?;
+    smol::block_on(task)
+}
+
+fn ublk_qcow2_shutdown<'a, T: Qcow2IoOps + 'a>(
+    exe: &smol::LocalExecutor<'a>,
+    tgt_rc: &Rc<Qcow2Tgt<T>>,
+    q: &UblkQueue,
+) -> Result<(), UblkError> {
+    let tgt = tgt_rc.clone();
+    let flush_task = exe.spawn(async move {
+        let t = &tgt;
+        while *(t.queue_is_down.borrow()) == false {
+            if tgt.qdev.need_flush_meta() {
+                tgt.qdev.flush_meta().await.unwrap();
+            }
+            smol::Timer::after(std::time::Duration::from_millis(50)).await;
+        }
+    });
+    *(tgt_rc.queue_is_down.borrow_mut()) = true;
+    ublk_run_io_task(&exe, &flush_task, q, 0)?;
+
+    // flushing meta final time
+    let tgt = tgt_rc.clone();
+    let task = exe.spawn(async move {
+        tgt.qdev.flush_meta().await.unwrap();
+    });
+    ublk_run_io_task(&exe, &task, q, 1)?;
+
+    Ok(())
+}
+
 pub(crate) fn ublk_add_qcow2(
-    ctrl: UblkCtrl,
+    ctrl_in: UblkCtrl,
     _id: i32,
     opt: Option<Qcow2Args>,
 ) -> Result<i32, UblkError> {
+    let ctrl = Rc::new(ctrl_in);
+
+    if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
+        eprintln!("qcow2 doesn't support USER_COPY yet");
+        return Err(UblkError::OtherError(-libc::EINVAL));
+    }
+
     let (file, dio) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
@@ -336,15 +394,16 @@ pub(crate) fn ublk_add_qcow2(
 
     let file_path = format!("{}", file.as_path().display());
     log::info!("qcow2: add: path {}", &file_path);
+
     let p = qcow2_rs::qcow2_default_params!(false, dio);
     let qdev = ulbk_qcow2_setup_dev(file.as_path(), &p).unwrap();
     let dev_size = qdev.info.virtual_size();
-    let lo = Qcow2Tgt {
+    let tgt_rc = Rc::new(Qcow2Tgt {
         direct_io: i32::from(dio),
         back_file_path: file_path,
         qdev,
         queue_is_down: RefCell::new(false),
-    };
+    });
 
     let _shm = {
         if let Some(ref o) = opt {
@@ -354,99 +413,52 @@ pub(crate) fn ublk_add_qcow2(
         }
     };
 
-    let tgt_init = |dev: &mut UblkDev| qcow2_init_tgt(dev, &lo, opt, dev_size);
-    let dev = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
+    let tgt_clone = tgt_rc.clone();
+    let tgt_init = move |dev: &mut UblkDev| qcow2_init_tgt(dev, &tgt_clone, opt, dev_size);
+    let dev_rc = Rc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
 
-    //todo: USER_COPY should be the default option
-    if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
-        return Err(UblkError::OtherError(-libc::EINVAL));
-    }
+    let this_dev = dev_rc.clone();
+    let q_rc = Rc::new(UblkQueue::new(0, &this_dev).unwrap());
+    let q = q_rc.clone();
+    let qp = &*q as *const UblkQueue;
+    set_thread_local_queue(qp as *const ());
 
-    let mut affinity = UblkQueueAffinity::new();
-    ctrl.get_queue_affinity(0, &mut affinity).unwrap();
+    // Executor has to be created finally
+    let exe = smol::LocalExecutor::new();
 
-    let (tx, rx) = mpsc::channel();
-    let this_dev = dev.clone();
-    let _tx = tx.clone();
-    let depth = dev.dev_info.queue_depth;
-    let qh = std::thread::spawn(move || {
-        let q_rc = Rc::new(UblkQueue::new(0, &this_dev).unwrap());
-        let tgt_rc = Rc::new(&lo);
-        let q = q_rc.clone();
-        let qp = &*q as *const UblkQueue;
-        set_thread_local_queue(qp as *const ());
+    // Prepare qcow2 for handling IO
+    let tgt = tgt_rc.clone();
+    let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
+    ublk_run_io_task(&exe, &task, &q_rc, 1)?;
 
-        unsafe {
-            libc::pthread_setaffinity_np(
-                libc::pthread_self(),
-                affinity.buf_len(),
-                affinity.addr() as *const libc::cpu_set_t,
-            );
-        }
-        _tx.send(unsafe { libc::gettid() }).unwrap();
-
-        let mut f_vec = Vec::new();
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-
-        //prepare for handling IO
-        let tgt = tgt_rc.clone();
-        let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
-        ublk_run_io_task(&exe, &task, &q_rc, 1).unwrap();
-
-        for tag in 0..depth as u16 {
-            let q = q_rc.clone();
-            let tgt = tgt_rc.clone();
-
-            f_vec.push(exe.spawn(async move {
-                let t = &tgt;
-                let qp = &q;
-                ublk_qcow2_io_fn(t, qp, tag).await;
-            }));
-        }
-
+    // Spawn io tasks
+    let mut f_vec = Vec::new();
+    for tag in 0..ctrl.dev_info().queue_depth as u16 {
         let q = q_rc.clone();
         let tgt = tgt_rc.clone();
-        let flush_task = exe.spawn(async move {
+
+        f_vec.push(exe.spawn(async move {
             let t = &tgt;
-            while *(t.queue_is_down.borrow()) == false {
-                if tgt.qdev.need_flush_meta() {
-                    tgt.qdev.flush_meta().await.unwrap();
-                }
-                smol::Timer::after(std::time::Duration::from_millis(50)).await;
-            }
-        });
-        //start all io tasks
-        ublk_wait_and_handle_ios(&exe_rc, &q);
-
-        *(tgt_rc.queue_is_down.borrow_mut()) = true;
-        let _ = ublk_run_io_task(&exe, &flush_task, &q_rc, 0);
-
-        // flushing meta final time
-        let tgt = tgt_rc.clone();
-        let task = exe.spawn(async move {
-            tgt.qdev.flush_meta().await.unwrap();
-        });
-        ublk_run_io_task(&exe, &task, &q_rc, 1).unwrap();
-
-        log::info!("qcow2: wait on io tasks");
-        smol::block_on(async { futures::future::join_all(f_vec).await });
-    });
-
-    let dev_id = dev.dev_info.dev_id;
-    let tid = rx.recv().unwrap();
-    if ctrl.configure_queue(&dev, 0, tid).is_err() {
-        println!("qcow2: configure queue failed for {}-{}", dev_id, 0);
+            let qp = &q;
+            ublk_qcow2_io_fn(t, qp, tag).await;
+        }));
     }
 
-    ctrl.start_dev(&dev)?;
+    // Start device
+    start_dev_fn(&exe, &ctrl, &dev_rc, &q)?;
+    log::info!("qcow2: device started");
     if let Some(shm) = _shm {
+        let dev_id = ctrl.dev_info().dev_id;
         crate::rublk_write_id_into_shm(&shm, dev_id);
     }
 
-    qh.join()
-        .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", dev_id));
-    log::info!("queue thread is done");
+    // Drive IO tasks for moving on
+    ublk_wait_and_handle_ios(&exe, &q);
+    smol::block_on(async { futures::future::join_all(f_vec).await });
+    log::info!("qcow2: queue is down");
+
+    // Shutdown qcow2 device
+    ublk_qcow2_shutdown(&exe, &tgt_rc, &q_rc)?;
 
     Ok(0)
 }
