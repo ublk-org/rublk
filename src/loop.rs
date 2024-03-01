@@ -1,8 +1,7 @@
 use io_uring::{opcode, squeue, types};
-use libublk::ctrl::UblkCtrl;
-use libublk::io::{UblkDev, UblkQueue};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{helpers::IoBuf, UblkError};
+use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError, UblkIORes};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
@@ -22,23 +21,23 @@ pub struct LoopArgs {
     #[clap(long, default_value_t = false)]
     pub buffered_io: bool,
 
-    /// use smol executor
-    #[clap(long, default_value_t = false)]
-    pub smol: bool,
+    /// use async_await
+    #[clap(long, short = 'a', default_value_t = false)]
+    pub async_await: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LoJson {
     back_file_path: String,
     direct_io: i32,
-    smol: bool,
+    async_await: bool,
 }
 
 pub struct LoopTgt {
     pub back_file_path: String,
     pub back_file: std::fs::File,
     pub direct_io: i32,
-    pub smol: bool,
+    pub async_await: bool,
 }
 
 #[inline]
@@ -134,7 +133,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
         o.gen_arg.apply_read_only(dev);
     }
 
-    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io, smol:lo.smol, } });
+    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io, async_await:lo.async_await, } });
     dev.set_target_json(val);
 
     Ok(())
@@ -149,6 +148,52 @@ fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
             Some(n) => n.join(p),
         }
     }
+}
+
+fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
+    let iod = q.get_iod(tag);
+    let op = iod.op_flags & 0xff;
+    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
+    if i.is_tgt_io() {
+        let user_data = i.user_data();
+        let res = i.result();
+        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+
+        assert!(cqe_tag == tag as u32);
+
+        if res != -(libc::EAGAIN) {
+            q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
+            return;
+        }
+    }
+
+    let res = __lo_prep_submit_io_cmd(iod);
+    if res < 0 {
+        q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
+    } else {
+        let op = iod.op_flags & 0xff;
+        // either start to handle or retry
+        let off = (iod.start_sector << 9) as u64;
+        let bytes = (iod.nr_sectors << 9) as u32;
+        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
+        q.ublk_submit_sqe_sync(sqe).unwrap();
+    }
+}
+
+fn q_fn(qid: u16, dev: &UblkDev) {
+    let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+    let bufs = bufs_rc.clone();
+    let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+        let bufs = bufs_rc.clone();
+
+        lo_handle_io_cmd_sync(q, tag, io, bufs[tag as usize].as_mut_ptr());
+    };
+
+    UblkQueue::new(qid, dev)
+        .unwrap()
+        .regiser_io_bufs(Some(&bufs))
+        .submit_fetch_commands(Some(&bufs))
+        .wait_and_handle_io(lo_io_handler);
 }
 
 fn q_a_fn(qid: u16, dev: &UblkDev) {
@@ -183,7 +228,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
 }
 
 pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
-    let (file, dio, ro, smol) = match opt {
+    let (file, dio, ro, aa) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
 
@@ -191,7 +236,7 @@ pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<
                 to_absolute_path(o.file.clone(), parent),
                 !o.buffered_io,
                 o.gen_arg.read_only,
-                o.smol,
+                o.async_await,
             )
         }
         None => {
@@ -208,7 +253,7 @@ pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<
                             PathBuf::from(t.back_file_path.as_str()),
                             t.direct_io != 0,
                             (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
-                            t.smol,
+                            t.async_await,
                         ),
                         Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
                     }
@@ -227,7 +272,7 @@ pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<
             .unwrap(),
         direct_io: i32::from(dio),
         back_file_path: file_path,
-        smol,
+        async_await: aa,
     };
 
     let _shm = {
@@ -245,7 +290,7 @@ pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<
 
     ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
-        move |qid, dev: &_| q_a_fn(qid, dev),
+        move |qid, dev: &_| if aa { q_a_fn(qid, dev) } else { q_fn(qid, dev) },
         |ctrl: &UblkCtrl| {
             if let Some(shm) = _shm {
                 crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);

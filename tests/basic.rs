@@ -212,7 +212,7 @@ mod integration {
         __test_ublk_add_del_zoned(4096);
     }
 
-    fn __test_ublk_add_del_loop(bs: u32) {
+    fn __test_ublk_add_del_loop(bs: u32, aa: bool) {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024; // 1 MB
         let p = tmp_file.path();
@@ -223,27 +223,22 @@ mod integration {
             _ => panic!(),
         };
 
-        let id = run_rublk_add_dev(
-            [
-                "add",
-                "loop",
-                "-f",
-                &pstr,
-                "--logical-block-size",
-                &bs.to_string(),
-            ]
-            .to_vec(),
-        );
+        let binding = bs.to_string();
+        let mut cmd_line = ["add", "loop", "-f", &pstr, "--logical-block-size", &binding].to_vec();
+        if aa {
+            cmd_line.push("-a");
+        }
+        let id = run_rublk_add_dev(cmd_line);
 
         let ctrl = UblkCtrl::new_simple(id).unwrap();
-
         read_ublk_disk(&ctrl);
         check_block_size(&ctrl, bs);
         run_rublk_del_dev(id);
     }
     #[test]
     fn test_ublk_add_del_loop() {
-        __test_ublk_add_del_loop(4096);
+        __test_ublk_add_del_loop(4096, false);
+        __test_ublk_add_del_loop(4096, true);
     }
 
     fn __test_ublk_null_read_only(cmds: &[&str], exp_ro: bool) {
