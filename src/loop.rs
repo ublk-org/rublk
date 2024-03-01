@@ -33,7 +33,7 @@ struct LoJson {
     async_await: bool,
 }
 
-pub struct LoopTgt {
+pub(crate) struct LoopTgt {
     pub back_file_path: String,
     pub back_file: std::fs::File,
     pub direct_io: i32,
@@ -227,7 +227,11 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub fn ublk_add_loop(ctrl: UblkCtrl, _id: i32, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_loop(
+    ctrl: UblkCtrl,
+    _id: i32,
+    opt: Option<LoopArgs>,
+) -> Result<i32, UblkError> {
     let (file, dio, ro, aa) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();

@@ -609,7 +609,7 @@ async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u
 }
 
 #[derive(clap::Args, Debug)]
-pub struct ZonedAddArgs {
+pub(crate) struct ZonedAddArgs {
     #[command(flatten)]
     pub gen_arg: super::args::GenAddArgs,
 
@@ -627,7 +627,7 @@ pub struct ZonedAddArgs {
     zone_size: u32,
 }
 
-pub fn ublk_add_zoned(
+pub(crate) fn ublk_add_zoned(
     ctrl: UblkCtrl,
     _id: i32,
     opt: Option<ZonedAddArgs>,

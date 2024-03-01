@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 
 #[derive(clap::Args, Debug)]
-pub struct Qcow2Args {
+pub(crate) struct Qcow2Args {
     #[command(flatten)]
     pub gen_arg: super::args::GenAddArgs,
 
@@ -37,9 +37,9 @@ struct Qcow2Json {
     direct_io: i32,
 }
 
-pub struct Qcow2Tgt<T> {
-    pub back_file_path: String,
-    pub direct_io: i32,
+struct Qcow2Tgt<T> {
+    back_file_path: String,
+    direct_io: i32,
 
     queue_is_down: RefCell<bool>,
     qdev: Qcow2Dev<T>,
@@ -64,7 +64,7 @@ fn get_thread_local_queue() -> *const UblkQueue<'static> {
 }
 
 #[derive(Debug)]
-pub struct UblkQcow2Io {
+struct UblkQcow2Io {
     _file: std::fs::File,
     fd: i32,
 }
@@ -73,7 +73,7 @@ qcow2_rs::qcow2_setup_dev_fn_sync!(UblkQcow2Io, ulbk_qcow2_setup_dev);
 
 #[allow(dead_code)]
 impl UblkQcow2Io {
-    pub fn new(path: &Path, ro: bool, dio: bool) -> UblkQcow2Io {
+    fn new(path: &Path, ro: bool, dio: bool) -> UblkQcow2Io {
         log::trace!(
             "qcow2: setup ublk qcow2 IO path {:?} readonly {} direct io {}",
             path,
@@ -309,7 +309,11 @@ async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, t
     }
 }
 
-pub fn ublk_add_qcow2(ctrl: UblkCtrl, _id: i32, opt: Option<Qcow2Args>) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_qcow2(
+    ctrl: UblkCtrl,
+    _id: i32,
+    opt: Option<Qcow2Args>,
+) -> Result<i32, UblkError> {
     let (file, dio) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();

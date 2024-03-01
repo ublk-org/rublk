@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::io::{Error, ErrorKind};
 
 #[derive(Args, Debug)]
-pub struct GenAddArgs {
+pub(crate) struct GenAddArgs {
     /// device id, -1 means ublk driver assigns ID for us
     #[clap(long, short = 'n', default_value_t=-1)]
     pub number: i32,
