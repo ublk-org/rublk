@@ -160,9 +160,13 @@ mod integration {
         let _ = run_rublk_cmd(para, 0);
     }
 
-    fn __test_ublk_add_del_null(bs: u32) {
-        let id =
-            run_rublk_add_dev(["add", "null", "--logical-block-size", &bs.to_string()].to_vec());
+    fn __test_ublk_add_del_null(bs: u32, aa: bool) {
+        let binding = bs.to_string();
+        let mut cmd_line = ["add", "null", "--logical-block-size", &binding].to_vec();
+        if aa {
+            cmd_line.push("-a");
+        }
+        let id = run_rublk_add_dev(cmd_line);
         let ctrl = UblkCtrl::new_simple(id).unwrap();
 
         read_ublk_disk(&ctrl);
@@ -171,9 +175,10 @@ mod integration {
     }
     #[test]
     fn test_ublk_add_del_null() {
-        __test_ublk_add_del_null(512);
-        __test_ublk_add_del_null(1024);
-        __test_ublk_add_del_null(4096);
+        __test_ublk_add_del_null(512, false);
+        __test_ublk_add_del_null(1024, false);
+        __test_ublk_add_del_null(4096, false);
+        __test_ublk_add_del_null(4096, true);
     }
 
     fn __test_ublk_add_del_zoned(bs: u32) {
