@@ -1,7 +1,7 @@
 use crate::target_flags::*;
 use clap::{Args, Subcommand};
 use ilog::IntLog;
-use libublk::io::UblkDev;
+use libublk::{ctrl::UblkCtrl, io::UblkDev, UblkFlags};
 use rand::Rng;
 use std::cell::RefCell;
 use std::io::{Error, ErrorKind};
@@ -122,11 +122,11 @@ impl GenAddArgs {
         *dir = start_dir;
     }
 
-    pub fn new_ublk_sesson(
+    pub fn new_ublk_ctrl(
         &self,
         name: &'static str,
-        dev_flags: u32,
-    ) -> Result<libublk::UblkSession, std::io::Error> {
+        dev_flags: UblkFlags,
+    ) -> Result<UblkCtrl, std::io::Error> {
         let mut ctrl_flags = if self.user_recovery {
             libublk::sys::UBLK_F_USER_RECOVERY
         } else {
@@ -148,11 +148,6 @@ impl GenAddArgs {
         let mut gen_flags: u64 = 0;
         if self.quiet {
             gen_flags |= TGT_QUIET;
-        }
-
-        let mut dflags = dev_flags;
-        if (ctrl_flags & libublk::sys::UBLK_F_USER_COPY) != 0 {
-            dflags |= libublk::dev_flags::UBLK_DEV_F_DONT_ALLOC_BUF;
         }
 
         match self.logical_block_size {
@@ -189,14 +184,14 @@ impl GenAddArgs {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid io buf size"));
         }
 
-        Ok(libublk::UblkSessionBuilder::default()
+        Ok(libublk::ctrl::UblkCtrlBuilder::default()
             .name(name)
-            .depth(self.depth)
-            .nr_queues(self.queue)
+            .depth(self.depth.try_into().unwrap())
+            .nr_queues(self.queue.try_into().unwrap())
             .id(self.number)
-            .ctrl_flags(ctrl_flags)
+            .ctrl_flags(ctrl_flags.into())
             .ctrl_target_flags(gen_flags)
-            .dev_flags(dflags)
+            .dev_flags(dev_flags)
             .io_buf_bytes(self.io_buf_size)
             .build()
             .unwrap())
