@@ -369,7 +369,12 @@ pub(crate) fn ublk_add_qcow2(
 
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
         eprintln!("qcow2 doesn't support USER_COPY yet");
-        return Err(UblkError::OtherError(-libc::EINVAL));
+        return Err(UblkError::InvalidVal);
+    }
+
+    if ctrl.dev_info().nr_hw_queues != 1 {
+        eprintln!("qcow2 doesn't support MQ yet");
+        return Err(UblkError::InvalidVal);
     }
 
     let (file, dio) = match opt {
@@ -385,10 +390,10 @@ pub(crate) fn ublk_add_qcow2(
 
                 match tgt_data {
                     Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
-                    Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
+                    Err(_) => return Err(UblkError::InvalidVal),
                 }
             }
-            None => return Err(UblkError::OtherError(-libc::EINVAL)),
+            None => return Err(UblkError::InvalidVal),
         },
     };
 
