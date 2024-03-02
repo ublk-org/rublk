@@ -310,14 +310,20 @@ async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, t
 
 /// Start device in async IO task, in which both control and io rings
 /// are driven in current context
-fn start_dev_fn(
-    exe: &smol::LocalExecutor,
+fn ublk_qcow2_start<'a, T: Qcow2IoOps + 'a>(
+    exe: &smol::LocalExecutor<'a>,
     ctrl_rc: &Rc<UblkCtrl>,
     dev_arc: &Rc<UblkDev>,
+    tgt_rc: &Rc<Qcow2Tgt<T>>,
     q: &UblkQueue,
 ) -> Result<i32, UblkError> {
     let ctrl_clone = ctrl_rc.clone();
     let dev_clone = dev_arc.clone();
+
+    // Prepare qcow2 for handling IO
+    let tgt = tgt_rc.clone();
+    let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
+    ublk_run_io_task(&exe, &task, q, 1)?;
 
     // Start device in one dedicated io task
     let task = exe.spawn(async move {
@@ -431,11 +437,6 @@ pub(crate) fn ublk_add_qcow2(
     // Executor has to be created finally
     let exe = smol::LocalExecutor::new();
 
-    // Prepare qcow2 for handling IO
-    let tgt = tgt_rc.clone();
-    let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
-    ublk_run_io_task(&exe, &task, &q_rc, 1)?;
-
     // Spawn io tasks
     let mut f_vec = Vec::new();
     for tag in 0..ctrl.dev_info().queue_depth as u16 {
@@ -449,9 +450,11 @@ pub(crate) fn ublk_add_qcow2(
         }));
     }
 
-    // Start device
-    start_dev_fn(&exe, &ctrl, &dev_rc, &q)?;
+    // Start ublk-qcow2 device
+    ublk_qcow2_start(&exe, &ctrl, &dev_rc, &tgt_rc, &q)?;
     log::info!("qcow2: device started");
+
+    // Tell parent we are up
     if let Some(shm) = _shm {
         let dev_id = ctrl.dev_info().dev_id;
         crate::rublk_write_id_into_shm(&shm, dev_id);
@@ -462,7 +465,7 @@ pub(crate) fn ublk_add_qcow2(
     smol::block_on(async { futures::future::join_all(f_vec).await });
     log::info!("qcow2: queue is down");
 
-    // Shutdown qcow2 device
+    // Shutdown ublk-qcow2 device
     ublk_qcow2_shutdown(&exe, &tgt_rc, &q_rc)?;
 
     Ok(0)
