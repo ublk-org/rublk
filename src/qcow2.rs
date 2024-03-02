@@ -4,14 +4,14 @@ use io_uring::{opcode, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::{ublk_run_ctrl_task, ublk_run_io_task, ublk_wait_and_handle_ios};
+use libublk::uring_async::{ublk_run_ctrl_task, ublk_run_io_task, ublk_wake_task};
 use libublk::UblkError;
 use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams};
 use qcow2_rs::error::Qcow2Result;
 use qcow2_rs::ops::*;
 use qcow2_rs::utils::qcow2_alloc_dev_sync;
 use serde::{Deserialize, Serialize};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -40,7 +40,6 @@ struct Qcow2Tgt<T> {
     back_file_path: String,
     direct_io: i32,
 
-    queue_is_down: RefCell<bool>,
     qdev: Qcow2Dev<T>,
 }
 
@@ -306,6 +305,7 @@ async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, t
         res = qcow2_handle_io_cmd_async(&q, &qdev_q, tag, &mut buf).await;
         cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
+    q.unregister_io_buf(tag);
 }
 
 /// Start device in async IO task, in which both control and io rings
@@ -343,27 +343,59 @@ fn ublk_qcow2_shutdown<'a, T: Qcow2IoOps + 'a>(
     tgt_rc: &Rc<Qcow2Tgt<T>>,
     q: &UblkQueue,
 ) -> Result<(), UblkError> {
-    let tgt = tgt_rc.clone();
-    let flush_task = exe.spawn(async move {
-        let t = &tgt;
-        while *(t.queue_is_down.borrow()) == false {
-            if tgt.qdev.need_flush_meta() {
-                tgt.qdev.flush_meta().await.unwrap();
-            }
-            smol::Timer::after(std::time::Duration::from_millis(50)).await;
-        }
-    });
-    *(tgt_rc.queue_is_down.borrow_mut()) = true;
-    ublk_run_io_task(&exe, &flush_task, q, 0)?;
-
     // flushing meta final time
     let tgt = tgt_rc.clone();
     let task = exe.spawn(async move {
         tgt.qdev.flush_meta().await.unwrap();
     });
-    ublk_run_io_task(&exe, &task, q, 1)?;
 
+    ublk_run_io_task(&exe, &task, q, 0)?;
     Ok(())
+}
+
+async fn ublk_qcow2_flush_meta<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>) {
+    // delay 50ms to flush meta
+    let ts = types::Timespec::new().nsec(50000000);
+    let timeout_e = opcode::Timeout::new(&ts).build();
+
+    log::debug!("ublk_qcow2_flush_meta: wait for flushing meta");
+    q.ublk_submit_sqe(timeout_e).await;
+    tgt.qdev.flush_meta().await.unwrap();
+}
+
+fn ublk_qcow2_drive_exec<'a, T: Qcow2IoOps + 'a>(
+    exe: &smol::LocalExecutor<'a>,
+    tgt_rc: &Rc<Qcow2Tgt<T>>,
+    q_rc: &Rc<UblkQueue<'a>>,
+) {
+    let tgt = tgt_rc.clone();
+    let q = q_rc.clone();
+    let mut flush_task = exe.spawn(async move {
+        ublk_qcow2_flush_meta(&tgt, &q).await;
+    });
+
+    while exe.try_tick() {}
+    let q = q_rc.clone();
+    loop {
+        match q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
+            Err(_) => break,
+            _ => {}
+        }
+        while exe.try_tick() {}
+        if tgt_rc.qdev.need_flush_meta() {
+            if flush_task.is_finished() {
+                let tgt = tgt_rc.clone();
+                let q = q_rc.clone();
+                flush_task = exe.spawn(async move {
+                    ublk_qcow2_flush_meta(&tgt, &q).await;
+                });
+                exe.try_tick();
+            }
+        }
+    }
+
+    ublk_run_io_task(&exe, &flush_task, &q_rc, 0).unwrap();
+    smol::block_on(flush_task);
 }
 
 pub(crate) fn ublk_add_qcow2(
@@ -413,7 +445,6 @@ pub(crate) fn ublk_add_qcow2(
         direct_io: i32::from(dio),
         back_file_path: file_path,
         qdev,
-        queue_is_down: RefCell::new(false),
     });
 
     let _shm = {
@@ -451,7 +482,7 @@ pub(crate) fn ublk_add_qcow2(
     }
 
     // Start ublk-qcow2 device
-    ublk_qcow2_start(&exe, &ctrl, &dev_rc, &tgt_rc, &q)?;
+    ublk_qcow2_start(&exe, &ctrl, &dev_rc, &tgt_rc, &q_rc)?;
     log::info!("qcow2: device started");
 
     // Tell parent we are up
@@ -461,7 +492,7 @@ pub(crate) fn ublk_add_qcow2(
     }
 
     // Drive IO tasks for moving on
-    ublk_wait_and_handle_ios(&exe, &q);
+    ublk_qcow2_drive_exec(&exe, &tgt_rc, &q_rc);
     smol::block_on(async { futures::future::join_all(f_vec).await });
     log::info!("qcow2: queue is down");
 
