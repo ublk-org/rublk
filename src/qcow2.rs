@@ -72,7 +72,7 @@ qcow2_rs::qcow2_setup_dev_fn_sync!(UblkQcow2Io, ulbk_qcow2_setup_dev);
 #[allow(dead_code)]
 impl UblkQcow2Io {
     fn new(path: &Path, ro: bool, dio: bool) -> UblkQcow2Io {
-        log::trace!(
+        log::info!(
             "qcow2: setup ublk qcow2 IO path {:?} readonly {} direct io {}",
             path,
             ro,
@@ -102,7 +102,7 @@ impl Qcow2IoOps for UblkQcow2Io {
         let fd = types::Fd(self.fd);
         //let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, seq);
 
-        log::debug!("qcow2_read: offset {:x} len {}", offset, buf.len(),);
+        log::trace!("qcow2_read: offset {:x} len {}", offset, buf.len(),);
         loop {
             let sqe = opcode::Read::new(fd, buf.as_mut_ptr(), buf.len() as u32)
                 .offset(offset)
@@ -125,7 +125,7 @@ impl Qcow2IoOps for UblkQcow2Io {
         let fd = types::Fd(self.fd);
         //let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, seq);
 
-        log::debug!("qcow2_write: offset {:x} len {}", offset, buf.len(),);
+        log::trace!("qcow2_write: offset {:x} len {}", offset, buf.len(),);
         loop {
             let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
                 .offset(offset)
@@ -152,7 +152,7 @@ impl Qcow2IoOps for UblkQcow2Io {
             0
         };
 
-        log::debug!("qcow2 discard: offset {:x} len {}", offset, len);
+        log::trace!("qcow2 discard: offset {:x} len {}", offset, len);
         loop {
             let sqe = opcode::Fallocate::new(fd, len as u64)
                 .offset(offset)
@@ -175,7 +175,7 @@ impl Qcow2IoOps for UblkQcow2Io {
         let q = unsafe { &*qp };
         let fd = types::Fd(self.fd);
 
-        log::debug!("qcow2 fsync: offset {:x} len {}", offset, len,);
+        log::trace!("qcow2 fsync: offset {:x} len {}", offset, len,);
         loop {
             let sqe = opcode::SyncFileRange::new(fd, len as u32)
                 .offset(offset)
@@ -204,7 +204,7 @@ async fn qcow2_handle_io_cmd_async<T: Qcow2IoOps>(
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as usize;
 
-    log::debug!("ublk_io: {} op {} offset {:x} len {}", tag, op, off, bytes);
+    log::trace!("ublk_io: {} op {} offset {:x} len {}", tag, op, off, bytes);
     let res = match op {
         libublk::sys::UBLK_IO_OP_FLUSH => {
             qdev.fsync_range(0, qdev.info.virtual_size() as usize)
