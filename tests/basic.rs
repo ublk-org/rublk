@@ -156,6 +156,7 @@ mod integration {
     fn run_rublk_del_dev(id: i32) {
         let id_str = id.to_string();
 
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let para = ["del", "-n", &id_str].to_vec();
         let _ = run_rublk_cmd(para, 0);
     }
@@ -206,10 +207,18 @@ mod integration {
             _ => {}
         }
     }
+
     #[test]
     fn test_ublk_add_del_zoned() {
-        __test_ublk_add_del_zoned(512);
-        __test_ublk_add_del_zoned(4096);
+        match UblkCtrl::get_features() {
+            Some(f) => {
+                if f & (libublk::sys::UBLK_F_ZONED as u64) != 0 {
+                    __test_ublk_add_del_zoned(512);
+                    __test_ublk_add_del_zoned(4096);
+                }
+            }
+            None => {}
+        }
     }
 
     fn __test_ublk_add_del_loop(bs: u32, aa: bool) {
