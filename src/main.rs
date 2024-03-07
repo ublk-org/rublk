@@ -197,10 +197,10 @@ fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
         .unwrap();
 
     match opt {
-        AddCommands::Loop(opt) => r#loop::ublk_add_loop(ctrl, -1, Some(opt)),
-        AddCommands::Null(opt) => null::ublk_add_null(ctrl, -1, Some(opt)),
-        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(ctrl, -1, Some(opt)),
-        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, -1, Some(opt)),
+        AddCommands::Loop(opt) => r#loop::ublk_add_loop(ctrl, Some(opt)),
+        AddCommands::Null(opt) => null::ublk_add_null(ctrl, Some(opt)),
+        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(ctrl, Some(opt)),
+        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt)),
     }
 }
 
@@ -253,9 +253,9 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .unwrap();
 
     match tgt_type.as_str() {
-        "loop" => r#loop::ublk_add_loop(ctrl, opt.number, None),
-        "null" => null::ublk_add_null(ctrl, opt.number, None),
-        "zoned" => zoned::ublk_add_zoned(ctrl, opt.number, None),
+        "loop" => r#loop::ublk_add_loop(ctrl, None),
+        "null" => null::ublk_add_null(ctrl, None),
+        "zoned" => zoned::ublk_add_zoned(ctrl, None),
         &_ => todo!(),
     }
 }

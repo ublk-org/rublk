@@ -238,11 +238,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub(crate) fn ublk_add_loop(
-    ctrl: UblkCtrl,
-    _id: i32,
-    opt: Option<LoopArgs>,
-) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
     let (file, dio, ro, aa) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();

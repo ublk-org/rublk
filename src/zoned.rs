@@ -627,11 +627,7 @@ pub(crate) struct ZonedAddArgs {
     zone_size: u32,
 }
 
-pub(crate) fn ublk_add_zoned(
-    ctrl: UblkCtrl,
-    _id: i32,
-    opt: Option<ZonedAddArgs>,
-) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Result<i32, UblkError> {
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (size, zone_size) = match opt {
         Some(ref o) => {
