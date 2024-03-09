@@ -25,7 +25,41 @@ modprobe ublk_drv
 
 rublk help
 
+```console
+$ rublk help
+Usage: rublk <COMMAND>
+
+Commands:
+  add       Adds ublk target
+  del       Deletes ublk target
+  list      Lists ublk targets
+  recover   Recover ublk targets
+  features  Get supported features from ublk driver, supported since v6.5
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
 rublk add help
+
+```console
+$ rublk add help
+Adds ublk target
+
+Usage: rublk add <COMMAND>
+
+Commands:
+  loop   Add loop target
+  null   Add null target
+  zoned  Add zoned target, supported since v6.6
+  qcow2  Add qcow2 target
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
 
 ## License
 

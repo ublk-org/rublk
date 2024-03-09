@@ -1,8 +1,7 @@
 use args::{AddCommands, Commands};
 use clap::Parser;
 use ilog::IntLog;
-use libublk::dev_flags::*;
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::{ctrl::UblkCtrl, UblkError, UblkFlags};
 use shared_memory::*;
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
@@ -21,7 +20,6 @@ mod args;
 mod r#loop;
 mod null;
 mod qcow2;
-mod uring;
 mod zoned;
 
 #[derive(Parser)]
@@ -90,8 +88,8 @@ fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Resul
     loop {
         std::thread::sleep(std::time::Duration::from_millis(unit as u64));
 
-        ctrl.get_info()?;
-        if ctrl.dev_info.state == state as u16 {
+        ctrl.read_dev_info()?;
+        if ctrl.dev_info().state == state as u16 {
             return Ok(0);
         }
         count += unit;
@@ -106,7 +104,8 @@ fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Resul
 ///
 /// The 1st 4 char is : 'U' 'B' 'L' 'K', then follows the 4
 /// ID chars which is encoded by hex.
-pub(crate) fn rublk_write_id_into_shm(shm_id: &String, id: i32) {
+pub(crate) fn rublk_write_id_into_shm(shm_id: &String, id: u32) {
+    log::info!("shm_id {} id {}", shm_id, id);
     match ShmemConf::new().os_id(shm_id).size(4096).open() {
         Ok(mut shmem) => {
             let s: &mut [u8] = unsafe { shmem.as_slice_mut() };
@@ -143,12 +142,12 @@ fn rublk_read_id_from_shm(shm_id: &String) -> Result<i32, UblkError> {
 
         let ss = String::from_utf8(s[4..8].to_vec()).unwrap();
         if let Ok(i) = i32::from_str_radix(&ss, 16) {
-            return Ok(i);
+            Ok(i)
         } else {
-            return Err(UblkError::OtherError(-libc::EINVAL));
+            Err(UblkError::OtherError(-libc::EINVAL))
         }
     } else {
-        return Err(UblkError::OtherError(-libc::EAGAIN));
+        Err(UblkError::OtherError(-libc::EAGAIN))
     }
 }
 
@@ -161,9 +160,9 @@ fn rublk_wait_and_dump(shm_id: &String) -> Result<i32, UblkError> {
         }
         match rublk_read_id_from_shm(shm_id) {
             Ok(id) => {
-                let mut ctrl = UblkCtrl::new_simple(id, 0)?;
+                let ctrl = UblkCtrl::new_simple(id)?;
 
-                if (ctrl.dev_info.ublksrv_flags & target_flags::TGT_QUIET) == 0 {
+                if (ctrl.dev_info().ublksrv_flags & target_flags::TGT_QUIET) == 0 {
                     ctrl.dump();
                 }
 
@@ -193,15 +192,15 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
 
 fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
-    let sess = gen_arg
-        .new_ublk_sesson(tgt_type, UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
+    let ctrl = gen_arg
+        .new_ublk_ctrl(tgt_type, UblkFlags::UBLK_DEV_F_ADD_DEV)
         .unwrap();
 
     match opt {
-        AddCommands::Loop(opt) => r#loop::ublk_add_loop(sess, -1, Some(opt)),
-        AddCommands::Null(opt) => null::ublk_add_null(sess, -1, Some(opt)),
-        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(sess, -1, Some(opt)),
-        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(sess, -1, Some(opt)),
+        AddCommands::Loop(opt) => r#loop::ublk_add_loop(ctrl, Some(opt)),
+        AddCommands::Null(opt) => null::ublk_add_null(ctrl, Some(opt)),
+        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(ctrl, Some(opt)),
+        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt)),
     }
 }
 
@@ -230,41 +229,33 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
-    let mut ctrl = UblkCtrl::new_simple(opt.number, 0)?;
+    let ctrl = UblkCtrl::new_simple(opt.number)?;
 
-    if (ctrl.dev_info.flags & (libublk::sys::UBLK_F_USER_RECOVERY as u64)) == 0 {
+    if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_RECOVERY as u64)) == 0 {
         return Err(UblkError::OtherError(-libc::EOPNOTSUPP));
     }
 
-    if ctrl.dev_info.state != libublk::sys::UBLK_S_DEV_QUIESCED as u16 {
+    if ctrl.dev_info().state != libublk::sys::UBLK_S_DEV_QUIESCED as u16 {
         return Err(UblkError::OtherError(-libc::EBUSY));
     }
 
     ctrl.start_user_recover()?;
 
     let tgt_type = ctrl.get_target_type_from_json().unwrap();
-    let sess = libublk::UblkSessionBuilder::default()
-        .name(tgt_type.clone())
-        .depth(ctrl.dev_info.queue_depth)
-        .nr_queues(ctrl.dev_info.nr_hw_queues)
-        .id(ctrl.dev_info.dev_id as i32)
-        .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY)
-        .dev_flags(
-            UBLK_DEV_F_RECOVER_DEV
-                | UBLK_DEV_F_ASYNC
-                | if (ctrl.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0 {
-                    UBLK_DEV_F_DONT_ALLOC_BUF
-                } else {
-                    0
-                },
-        )
+    let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
+        .name(&tgt_type.clone())
+        .depth(ctrl.dev_info().queue_depth)
+        .nr_queues(ctrl.dev_info().nr_hw_queues)
+        .id(ctrl.dev_info().dev_id as i32)
+        .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY.into())
+        .dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
         .build()
         .unwrap();
 
     match tgt_type.as_str() {
-        "loop" => r#loop::ublk_add_loop(sess, opt.number, None),
-        "null" => null::ublk_add_null(sess, opt.number, None),
-        "zoned" => zoned::ublk_add_zoned(sess, opt.number, None),
+        "loop" => r#loop::ublk_add_loop(ctrl, None),
+        "null" => null::ublk_add_null(ctrl, None),
+        "zoned" => zoned::ublk_add_zoned(ctrl, None),
         &_ => todo!(),
     }
 }
@@ -282,10 +273,10 @@ fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
     match daemonize.execute() {
         daemonize::Outcome::Child(Ok(_)) => ublk_recover_work(opt),
         daemonize::Outcome::Parent(Ok(_)) => {
-            let mut ctrl = UblkCtrl::new_simple(id, 0)?;
+            let mut ctrl = UblkCtrl::new_simple(id)?;
             ublk_state_wait_until(&mut ctrl, libublk::sys::UBLK_S_DEV_LIVE, 5000)?;
 
-            if (ctrl.dev_info.ublksrv_flags & target_flags::TGT_QUIET) == 0 {
+            if (ctrl.dev_info().ublksrv_flags & target_flags::TGT_QUIET) == 0 {
                 ctrl.dump();
             }
             Ok(0)
@@ -295,7 +286,7 @@ fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
 }
 
 const NR_FEATURES: usize = 9;
-const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
+const FEATURES_TABLE: [&str; NR_FEATURES] = [
     "ZERO_COPY",
     "COMP_IN_TASK",
     "NEED_GET_DATA",
@@ -307,6 +298,7 @@ const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
     "ZONED",
 ];
 
+#[allow(clippy::needless_range_loop)]
 fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
     match UblkCtrl::get_features() {
         Some(f) => {
@@ -330,14 +322,14 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
 }
 
 fn __ublk_del(id: i32) -> Result<i32, UblkError> {
-    let mut ctrl = UblkCtrl::new_simple(id, 0)?;
+    let ctrl = UblkCtrl::new_simple(id)?;
 
     let _ = ctrl.kill_dev();
     let _ = ctrl.del_dev();
 
     let run_path = ctrl.run_path();
     let json_path = std::path::Path::new(&run_path);
-    assert!(json_path.exists() == false);
+    assert!(!json_path.exists());
 
     Ok(0)
 }
@@ -370,9 +362,9 @@ fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
 }
 
 fn __ublk_list(id: i32) -> Result<i32, UblkError> {
-    match UblkCtrl::new_simple(id, 0) {
-        Ok(mut ctrl) => {
-            if ctrl.get_info().is_ok() {
+    match UblkCtrl::new_simple(id) {
+        Ok(ctrl) => {
+            if ctrl.read_dev_info().is_ok() {
                 ctrl.dump();
             }
             Ok(0)

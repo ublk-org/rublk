@@ -1,11 +1,11 @@
 [package]
 name = "rublk"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 description = "Rust ublk generic targets"
 authors = ["Ming Lei <tom.leiming@gmail.com>"]
 readme = "README.md"
-repository = "https://github.com/ming1/rublk"
+repository = "https://github.com/ublk-org/rublk"
 license = "GPL-2.0"
 keywords = ["ublk", "io_uring", "userspace", "block", "storage"]
 publish = true
@@ -16,8 +16,8 @@ maintenance = { status = "actively-developed" }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-qcow2-rs = "0.1.1"
-libublk = "0.2.2"
+qcow2-rs = "0.1.2"
+libublk = "0.3"
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
 libc = "0.2"

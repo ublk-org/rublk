@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use libublk::helpers::IoBuf;
 use libublk::sys::ublksrv_io_desc;
 use libublk::sys::{
     BLK_ZONE_COND_CLOSED, BLK_ZONE_COND_EMPTY, BLK_ZONE_COND_EXP_OPEN, BLK_ZONE_COND_FULL,
@@ -11,7 +12,8 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_CLOSE, UBLK_IO_OP_ZONE_FINISH, UBLK_IO_OP_ZONE_OPEN, UBLK_IO_OP_ZONE_RESET,
     UBLK_IO_OP_ZONE_RESET_ALL,
 };
-use libublk::{exe::Executor, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError, UblkSession};
+use libublk::uring_async::ublk_wait_and_handle_ios;
+use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError};
 
 use log::trace;
 use std::path::PathBuf;
@@ -41,7 +43,7 @@ struct TgtData {
     zones: Vec<Zone>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ZonedTgt {
     size: u64,
     start: u64,
@@ -52,14 +54,16 @@ struct ZonedTgt {
     zone_max_open: u32,
     zone_max_active: u32,
     nr_zones: u32,
-    fd: i32,
 
     data: RwLock<TgtData>,
+    _buf: IoBuf<u8>,
 }
 
 impl ZonedTgt {
-    fn new(size: u64, zone_size: u64, fd: i32) -> ZonedTgt {
-        let buf_addr = libublk::ublk_alloc_buf(size as usize, 4096) as u64;
+    #[allow(clippy::uninit_vec)]
+    fn new(size: u64, zone_size: u64) -> ZonedTgt {
+        let _buf = IoBuf::<u8>::new(size as usize);
+        let buf_addr = _buf.as_mut_ptr() as u64;
         let zone_cap = zone_size >> 9;
         let nr_zones = size / zone_size;
         let mut sector = 0;
@@ -88,12 +92,12 @@ impl ZonedTgt {
             zone_max_open: 0,
             zone_max_active: 0,
             nr_zones: nr_zones as u32,
-            fd,
             data: RwLock::new(TgtData {
                 zones,
                 ..Default::default()
             }),
-            ..Default::default()
+            zone_nr_conv: 0,
+            _buf,
         }
     }
 
@@ -155,7 +159,7 @@ impl ZonedTgt {
             return 0;
         }
 
-        return -libc::EBUSY;
+        -libc::EBUSY
     }
 
     fn check_open(&self, data: &mut std::sync::RwLockWriteGuard<'_, TgtData>) -> i32 {
@@ -167,14 +171,12 @@ impl ZonedTgt {
             return 0;
         }
 
-        if data.nr_zones_imp_open > 0 {
-            if self.check_active(data) == 0 {
-                self.close_imp_open_zone(data);
-                return 0;
-            }
+        if data.nr_zones_imp_open > 0 && self.check_active(data) == 0 {
+            self.close_imp_open_zone(data);
+            return 0;
         }
 
-        return -libc::EBUSY;
+        -libc::EBUSY
     }
 
     fn check_zone_resources(
@@ -186,12 +188,13 @@ impl ZonedTgt {
             BLK_ZONE_COND_EMPTY => {
                 let ret = self.check_active(data);
                 if ret != 0 {
-                    return ret;
+                    ret
+                } else {
+                    self.check_open(data)
                 }
-                return self.check_open(data);
             }
-            BLK_ZONE_COND_CLOSED => return self.check_open(data),
-            _ => return -libc::EIO,
+            BLK_ZONE_COND_CLOSED => self.check_open(data),
+            _ => -libc::EIO,
         }
     }
 
@@ -321,12 +324,6 @@ impl ZonedTgt {
     }
 }
 
-impl Drop for ZonedTgt {
-    fn drop(&mut self) {
-        libublk::ublk_dealloc_buf(self.start as *mut u8, self.size as usize, 4096);
-    }
-}
-
 fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -> isize {
     let zsects = (tgt.zone_size >> 9) as u32;
     let zones = iod.nr_sectors; //union
@@ -334,7 +331,8 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
     let blkz_sz = core::mem::size_of::<libublk::sys::blk_zone>() as u32;
 
     // USER_COPY is enabled, so we have to allocate buffer for report_zones
-    let buf_addr = libublk::ublk_alloc_buf((blkz_sz * zones) as usize, 4096);
+    let buf = IoBuf::<u8>::new((blkz_sz * zones) as usize);
+    let buf_addr = buf.as_mut_ptr();
     let mut off = buf_addr as u64;
 
     trace!(
@@ -363,19 +361,16 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
     }
 
     let dsize = off - buf_addr as u64;
-    let ret = unsafe {
+    unsafe {
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
         libc::pwrite(
-            tgt.fd,
+            q.dev.tgt.fds[0],
             buf_addr as *const libc::c_void,
             dsize.try_into().unwrap(),
             offset.try_into().unwrap(),
         )
-    };
-    libublk::ublk_dealloc_buf(buf_addr, (blkz_sz * zones) as usize, 4096);
-
-    ret
+    }
 }
 
 fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc) -> i32 {
@@ -398,15 +393,13 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
         }
     }
 
-    let ret = match iod.op_flags & 0xff {
+    match iod.op_flags & 0xff {
         UBLK_IO_OP_ZONE_RESET => tgt.zone_reset(iod.start_sector),
         UBLK_IO_OP_ZONE_OPEN => tgt.zone_open(iod.start_sector),
         UBLK_IO_OP_ZONE_CLOSE => tgt.zone_close(iod.start_sector),
         UBLK_IO_OP_ZONE_FINISH => tgt.zone_finish(iod.start_sector),
         _ => -libc::EINVAL,
-    };
-
-    ret
+    }
 }
 
 fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -> i32 {
@@ -419,7 +412,7 @@ fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -
     }
 
     let bytes = (iod.nr_sectors << 9) as usize;
-    let off = (iod.start_sector << 9) as u64;
+    let off = iod.start_sector << 9;
 
     trace!(
         "read lba {:06x}-{:04}), zone: no {:4} cond {:4} start/wp {:06x}/{:06x}",
@@ -431,24 +424,21 @@ fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -
         data.zones[zno].wp,
     );
     unsafe {
-        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag as u16, 0);
+        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
         let mut addr = (tgt.start + off) as *mut libc::c_void;
+        let fd = q.dev.tgt.fds[0];
 
         // make sure data is zeroed for reset zone
         if cond == BLK_ZONE_COND_EMPTY {
-            addr = libublk::ublk_alloc_buf(bytes as usize, 4096) as *mut libc::c_void;
+            let buf = IoBuf::<u8>::new(bytes);
+            addr = buf.as_mut_ptr() as *mut libc::c_void;
 
             libc::memset(addr, 0, bytes);
+            libc::pwrite(fd, addr, bytes, offset.try_into().unwrap()) as i32
+        } else {
+            //write data to /dev/ublkcN from our ram directly
+            libc::pwrite(fd, addr, bytes, offset.try_into().unwrap()) as i32
         }
-
-        //write data to /dev/ublkcN from our ram directly
-        let ret = libc::pwrite(tgt.fd as i32, addr, bytes, offset.try_into().unwrap()) as i32;
-
-        if cond == BLK_ZONE_COND_EMPTY {
-            libublk::ublk_dealloc_buf(addr as *mut u8, bytes as usize, 4096);
-        }
-
-        ret
     }
 }
 
@@ -459,14 +449,14 @@ fn handle_plain_write(
     start_sector: u64,
     nr_sectors: u32,
 ) -> i32 {
-    let off = (start_sector << 9) as u64;
+    let off = start_sector << 9;
     let bytes = (nr_sectors << 9) as usize;
     let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
     unsafe {
         //read data from /dev/ublkcN to our ram directly
         libc::pread(
-            tgt.fd as i32,
+            q.dev.tgt.fds[0],
             (tgt.start + off) as *mut libc::c_void,
             bytes,
             offset.try_into().unwrap(),
@@ -491,7 +481,7 @@ fn handle_write(
         }
 
         return (
-            u64::MAX as u64,
+            u64::MAX,
             handle_plain_write(tgt, q, tag, iod.start_sector, iod.nr_sectors),
         );
     }
@@ -503,7 +493,7 @@ fn handle_write(
     }
 
     let sector = data.zones[zno].wp;
-    if append == false && iod.start_sector != sector {
+    if !append && iod.start_sector != sector {
         return (u64::MAX, ret);
     }
 
@@ -615,7 +605,7 @@ async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u
 }
 
 #[derive(clap::Args, Debug)]
-pub struct ZonedAddArgs {
+pub(crate) struct ZonedAddArgs {
     #[command(flatten)]
     pub gen_arg: super::args::GenAddArgs,
 
@@ -633,11 +623,7 @@ pub struct ZonedAddArgs {
     zone_size: u32,
 }
 
-pub fn ublk_add_zoned(
-    sess: UblkSession,
-    _id: i32,
-    opt: Option<ZonedAddArgs>,
-) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Result<i32, UblkError> {
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (size, zone_size) = match opt {
         Some(ref o) => {
@@ -646,7 +632,7 @@ pub fn ublk_add_zoned(
                 return Err(UblkError::OtherError(-libc::EINVAL));
             }
 
-            if o.path != None {
+            if o.path.is_some() {
                 eprintln!("only support ramdisk now with 'None' path\n");
                 return Err(UblkError::OtherError(-libc::EINVAL));
             } else {
@@ -677,12 +663,11 @@ pub fn ublk_add_zoned(
             o.gen_arg.apply_read_only(dev);
         }
 
-        Ok(0)
+        Ok(())
     };
 
-    let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, dev.tgt.fds[0]));
-    let depth = dev.dev_info.queue_depth;
+    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size));
+    let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
         Some(f) => {
@@ -698,19 +683,20 @@ pub fn ublk_add_zoned(
     }
 
     let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-        let exe = Executor::new(dev.get_nr_ios());
+        let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+        let exe = smol::LocalExecutor::new();
+        let mut f_vec = Vec::new();
 
         //// `q_handler` closure implements Clone()
         let ztgt_q = Rc::new(&zoned_tgt);
 
-        for tag in 0..depth as u16 {
+        for tag in 0..depth {
             let q = q_rc.clone();
             let ztgt_io = ztgt_q.clone();
 
-            exe.spawn(tag as u16, async move {
+            f_vec.push(exe.spawn(async move {
                 let mut lba = 0_u64;
-                let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
                 let mut res = 0;
                 loop {
                     let cmd_res = q.submit_io_cmd(tag, cmd_op, lba as *mut u8, res).await;
@@ -719,22 +705,18 @@ pub fn ublk_add_zoned(
                     }
 
                     (res, lba) = zoned_handle_io(&ztgt_io, &q, tag).await;
-                    cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                 }
-            });
+            }));
         }
-        q_rc.wait_and_wake_io_tasks(&exe);
+        ublk_wait_and_handle_ios(&exe, &q_rc);
+        smol::block_on(async { futures::future::join_all(f_vec).await });
     };
 
-    let _shm = {
-        if let Some(o) = opt {
-            Some(o.gen_arg.get_shm_id())
-        } else {
-            None
-        }
-    };
-    sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
+    let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
+    ctrl.run_target(tgt_init, q_handler, |ctrl: &_| {
         if let Some(shm) = _shm {
+            let dev_id = ctrl.dev_info().dev_id;
             crate::rublk_write_id_into_shm(&shm, dev_id);
         }
     })

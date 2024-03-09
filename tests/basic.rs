@@ -6,7 +6,7 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn check_ro(ctrl: &mut UblkCtrl, exp_ro: bool) {
+    fn check_ro(ctrl: &UblkCtrl, exp_ro: bool) {
         let mut params: sys::ublk_params = { Default::default() };
         ctrl.get_params(&mut params).unwrap();
 
@@ -14,7 +14,7 @@ mod integration {
         assert!(ro == exp_ro);
     }
 
-    fn check_block_size(ctrl: &mut UblkCtrl, exp_bs: u32) {
+    fn check_block_size(ctrl: &UblkCtrl, exp_bs: u32) {
         let mut params: sys::ublk_params = { Default::default() };
         ctrl.get_params(&mut params).unwrap();
 
@@ -74,14 +74,14 @@ mod integration {
         assert!(out.status.success() == true);
     }
 
-    fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u16, timeout: u32) {
+    fn ublk_state_wait_until(ctrl: &UblkCtrl, state: u16, timeout: u32) {
         let mut count = 0;
         let unit = 100_u32;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(unit as u64));
 
-            ctrl.get_info().unwrap();
-            if ctrl.dev_info.state == state {
+            ctrl.read_dev_info().unwrap();
+            if ctrl.dev_info().state == state {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 break;
             }
@@ -143,8 +143,8 @@ mod integration {
         };
         assert!(id >= 0);
 
-        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
-        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 5000);
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 5000);
 
         //ublk block device should be observed now
         let dev_path = ctrl.get_bdev_path();
@@ -156,24 +156,30 @@ mod integration {
     fn run_rublk_del_dev(id: i32) {
         let id_str = id.to_string();
 
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let para = ["del", "-n", &id_str].to_vec();
         let _ = run_rublk_cmd(para, 0);
     }
 
-    fn __test_ublk_add_del_null(bs: u32) {
-        let id =
-            run_rublk_add_dev(["add", "null", "--logical-block-size", &bs.to_string()].to_vec());
-        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+    fn __test_ublk_add_del_null(bs: u32, aa: bool) {
+        let binding = bs.to_string();
+        let mut cmd_line = ["add", "null", "--logical-block-size", &binding].to_vec();
+        if aa {
+            cmd_line.push("-a");
+        }
+        let id = run_rublk_add_dev(cmd_line);
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
 
         read_ublk_disk(&ctrl);
-        check_block_size(&mut ctrl, bs);
+        check_block_size(&ctrl, bs);
         run_rublk_del_dev(id);
     }
     #[test]
     fn test_ublk_add_del_null() {
-        __test_ublk_add_del_null(512);
-        __test_ublk_add_del_null(1024);
-        __test_ublk_add_del_null(4096);
+        __test_ublk_add_del_null(512, false);
+        __test_ublk_add_del_null(1024, false);
+        __test_ublk_add_del_null(4096, false);
+        __test_ublk_add_del_null(4096, true);
     }
 
     fn __test_ublk_add_del_zoned(bs: u32) {
@@ -191,23 +197,31 @@ mod integration {
                         ]
                         .to_vec(),
                     );
-                    let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+                    let ctrl = UblkCtrl::new_simple(id).unwrap();
 
                     read_ublk_disk(&ctrl);
-                    check_block_size(&mut ctrl, bs);
+                    check_block_size(&ctrl, bs);
                     run_rublk_del_dev(id);
                 }
             }
             _ => {}
         }
     }
+
     #[test]
     fn test_ublk_add_del_zoned() {
-        __test_ublk_add_del_zoned(512);
-        __test_ublk_add_del_zoned(4096);
+        match UblkCtrl::get_features() {
+            Some(f) => {
+                if f & (libublk::sys::UBLK_F_ZONED as u64) != 0 {
+                    __test_ublk_add_del_zoned(512);
+                    __test_ublk_add_del_zoned(4096);
+                }
+            }
+            None => {}
+        }
     }
 
-    fn __test_ublk_add_del_loop(bs: u32) {
+    fn __test_ublk_add_del_loop(bs: u32, aa: bool) {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024; // 1 MB
         let p = tmp_file.path();
@@ -218,33 +232,28 @@ mod integration {
             _ => panic!(),
         };
 
-        let id = run_rublk_add_dev(
-            [
-                "add",
-                "loop",
-                "-f",
-                &pstr,
-                "--logical-block-size",
-                &bs.to_string(),
-            ]
-            .to_vec(),
-        );
+        let binding = bs.to_string();
+        let mut cmd_line = ["add", "loop", "-f", &pstr, "--logical-block-size", &binding].to_vec();
+        if aa {
+            cmd_line.push("-a");
+        }
+        let id = run_rublk_add_dev(cmd_line);
 
-        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
-
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
         read_ublk_disk(&ctrl);
-        check_block_size(&mut ctrl, bs);
+        check_block_size(&ctrl, bs);
         run_rublk_del_dev(id);
     }
     #[test]
     fn test_ublk_add_del_loop() {
-        __test_ublk_add_del_loop(4096);
+        __test_ublk_add_del_loop(4096, false);
+        __test_ublk_add_del_loop(4096, true);
     }
 
     fn __test_ublk_null_read_only(cmds: &[&str], exp_ro: bool) {
         let id = run_rublk_add_dev(cmds.to_vec());
-        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
-        check_ro(&mut ctrl, exp_ro);
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        check_ro(&ctrl, exp_ro);
         run_rublk_del_dev(id);
     }
     #[test]
@@ -276,11 +285,11 @@ mod integration {
             .to_vec(),
         );
 
-        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
 
         read_ublk_disk(&ctrl);
         write_ublk_disk(&ctrl, bs, file_size);
-        check_block_size(&mut ctrl, bs);
+        check_block_size(&ctrl, bs);
         run_rublk_del_dev(id);
     }
     #[test]
