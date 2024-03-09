@@ -20,9 +20,8 @@ pub(crate) struct NullAddArgs {
 #[inline]
 fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
     let iod = q.get_iod(tag);
-    let bytes = (iod.nr_sectors << 9) as i32;
 
-    bytes
+    (iod.nr_sectors << 9) as i32
 }
 
 #[inline]
@@ -54,11 +53,11 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
 }
 
 fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+    let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
 
-    for tag in 0..dev.dev_info.queue_depth as u16 {
+    for tag in 0..dev.dev_info.queue_depth {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
