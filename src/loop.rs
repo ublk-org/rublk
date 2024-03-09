@@ -47,9 +47,9 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH
         | libublk::sys::UBLK_IO_OP_READ
-        | libublk::sys::UBLK_IO_OP_WRITE => return 0,
-        _ => return -libc::EINVAL,
-    };
+        | libublk::sys::UBLK_IO_OP_WRITE => 0,
+        _ => -libc::EINVAL,
+    }
 }
 
 #[inline]
@@ -82,8 +82,8 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) 
     for _ in 0..4 {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
-        let off = (iod.start_sector << 9) as u64;
-        let bytes = (iod.nr_sectors << 9) as u32;
+        let off = iod.start_sector << 9;
+        let bytes = iod.nr_sectors << 9;
 
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
         let res = q.ublk_submit_sqe(sqe).await;
@@ -92,7 +92,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) 
         }
     }
 
-    return -libc::EAGAIN;
+    -libc::EAGAIN
 }
 
 fn lo_init_tgt(
@@ -164,7 +164,7 @@ fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
 fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
-    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
+    let data = UblkIOCtx::build_user_data(tag, op, 0, true);
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
@@ -184,8 +184,8 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
-        let off = (iod.start_sector << 9) as u64;
-        let bytes = (iod.nr_sectors << 9) as u32;
+        let off = iod.start_sector << 9;
+        let bytes = iod.nr_sectors << 9;
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
     }
@@ -209,7 +209,7 @@ fn q_fn(qid: u16, dev: &UblkDev) {
 
 fn q_a_fn(qid: u16, dev: &UblkDev) {
     let depth = dev.dev_info.queue_depth;
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+    let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
 
@@ -286,13 +286,7 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
         async_await: aa,
     };
 
-    let _shm = {
-        if let Some(ref o) = opt {
-            Some(o.gen_arg.get_shm_id())
-        } else {
-            None
-        }
-    };
+    let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
 
     //todo: USER_COPY should be the default option
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
