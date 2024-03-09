@@ -142,12 +142,12 @@ fn rublk_read_id_from_shm(shm_id: &String) -> Result<i32, UblkError> {
 
         let ss = String::from_utf8(s[4..8].to_vec()).unwrap();
         if let Ok(i) = i32::from_str_radix(&ss, 16) {
-            return Ok(i);
+            Ok(i)
         } else {
-            return Err(UblkError::OtherError(-libc::EINVAL));
+            Err(UblkError::OtherError(-libc::EINVAL))
         }
     } else {
-        return Err(UblkError::OtherError(-libc::EAGAIN));
+        Err(UblkError::OtherError(-libc::EAGAIN))
     }
 }
 
@@ -286,7 +286,7 @@ fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
 }
 
 const NR_FEATURES: usize = 9;
-const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
+const FEATURES_TABLE: [&str; NR_FEATURES] = [
     "ZERO_COPY",
     "COMP_IN_TASK",
     "NEED_GET_DATA",
@@ -298,6 +298,7 @@ const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
     "ZONED",
 ];
 
+#[allow(clippy::needless_range_loop)]
 fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
     match UblkCtrl::get_features() {
         Some(f) => {
@@ -328,7 +329,7 @@ fn __ublk_del(id: i32) -> Result<i32, UblkError> {
 
     let run_path = ctrl.run_path();
     let json_path = std::path::Path::new(&run_path);
-    assert!(json_path.exists() == false);
+    assert!(!json_path.exists());
 
     Ok(0)
 }

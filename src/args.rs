@@ -61,13 +61,11 @@ pub(crate) struct GenAddArgs {
 
 impl GenAddArgs {
     pub fn apply_block_size(&self, dev: &mut UblkDev) {
-        match self.logical_block_size {
-            Some(bs) => dev.tgt.params.basic.logical_bs_shift = bs.log2() as u8,
-            None => {}
+        if let Some(bs) = self.logical_block_size {
+            dev.tgt.params.basic.logical_bs_shift = bs.log2() as u8;
         }
-        match self.physical_block_size {
-            Some(bs) => dev.tgt.params.basic.physical_bs_shift = bs.log2() as u8,
-            None => {}
+        if let Some(bs) = self.physical_block_size {
+            dev.tgt.params.basic.physical_bs_shift = bs.log2() as u8;
         }
     }
 
@@ -160,24 +158,19 @@ impl GenAddArgs {
             }
         }
 
-        match self.physical_block_size {
-            Some(pbs) => {
-                if !is_power2_of(pbs, 512) {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        "invalid physical block size",
-                    ));
-                }
-                match self.logical_block_size {
-                    Some(lbs) => {
-                        if lbs > pbs {
-                            return Err(Error::new(ErrorKind::InvalidInput, "invalid block size"));
-                        }
-                    }
-                    None => {}
+        if let Some(pbs) = self.physical_block_size {
+            if !is_power2_of(pbs, 512) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid physical block size",
+                ));
+            }
+
+            if let Some(lbs) = self.logical_block_size {
+                if lbs > pbs {
+                    return Err(Error::new(ErrorKind::InvalidInput, "invalid block size"));
                 }
             }
-            None => {}
         }
 
         if !is_power2_of(self.io_buf_size, 4096) {
