@@ -26,7 +26,7 @@ modprobe ublk_drv
 rublk help
 
 ```console
-# rublk help
+$ rublk help
 Usage: rublk <COMMAND>
 
 Commands:
@@ -53,7 +53,7 @@ Usage: rublk add <COMMAND>
 Commands:
   loop   Add loop target
   null   Add null target
-  zoned  Add Zoned target, supported since v6.6
+  zoned  Add zoned target, supported since v6.6
   qcow2  Add qcow2 target
   help   Print this message or the help of the given subcommand(s)
 

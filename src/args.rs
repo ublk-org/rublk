@@ -220,7 +220,7 @@ pub(crate) enum AddCommands {
     /// Add null target
     Null(super::null::NullAddArgs),
 
-    /// Add Zoned target, supported since v6.6
+    /// Add zoned target, supported since linux kernel v6.6
     Zoned(super::zoned::ZonedAddArgs),
 
     /// Add qcow2 target
