@@ -201,11 +201,11 @@ async fn qcow2_handle_io_cmd_async<T: Qcow2IoOps>(
 ) -> i32 {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
-    let off = (iod.start_sector << 9) as u64;
+    let off = iod.start_sector << 9;
     let bytes = (iod.nr_sectors << 9) as usize;
 
     log::trace!("ublk_io: {} op {} offset {:x} len {}", tag, op, off, bytes);
-    let res = match op {
+    match op {
         libublk::sys::UBLK_IO_OP_FLUSH => {
             qdev.fsync_range(0, qdev.info.virtual_size() as usize)
                 .await
@@ -222,9 +222,7 @@ async fn qcow2_handle_io_cmd_async<T: Qcow2IoOps>(
             bytes as i32
         }
         _ => -libc::EINVAL,
-    };
-
-    res
+    }
 }
 
 fn qcow2_init_tgt<T: Qcow2IoOps>(
@@ -302,7 +300,7 @@ async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, t
             break;
         }
 
-        res = qcow2_handle_io_cmd_async(&q, &qdev_q, tag, &mut buf).await;
+        res = qcow2_handle_io_cmd_async(q, qdev_q, tag, &mut buf).await;
         cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
     q.unregister_io_buf(tag);
@@ -323,7 +321,7 @@ fn ublk_qcow2_start<'a, T: Qcow2IoOps + 'a>(
     // Prepare qcow2 for handling IO
     let tgt = tgt_rc.clone();
     let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
-    ublk_run_io_task(&exe, &task, q, 1)?;
+    ublk_run_io_task(exe, &task, q, 1)?;
 
     // Start device in one dedicated io task
     let task = exe.spawn(async move {
@@ -349,7 +347,7 @@ fn ublk_qcow2_shutdown<'a, T: Qcow2IoOps + 'a>(
         tgt.qdev.flush_meta().await.unwrap();
     });
 
-    ublk_run_io_task(&exe, &task, q, 0)?;
+    ublk_run_io_task(exe, &task, q, 0)?;
     Ok(())
 }
 
@@ -377,24 +375,23 @@ fn ublk_qcow2_drive_exec<'a, T: Qcow2IoOps + 'a>(
     while exe.try_tick() {}
     let q = q_rc.clone();
     loop {
-        match q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
-            Err(_) => break,
-            _ => {}
+        if q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1)
+            .is_err()
+        {
+            break;
         }
         while exe.try_tick() {}
-        if tgt_rc.qdev.need_flush_meta() {
-            if flush_task.is_finished() {
-                let tgt = tgt_rc.clone();
-                let q = q_rc.clone();
-                flush_task = exe.spawn(async move {
-                    ublk_qcow2_flush_meta(&tgt, &q).await;
-                });
-                exe.try_tick();
-            }
+        if tgt_rc.qdev.need_flush_meta() && flush_task.is_finished() {
+            let tgt = tgt_rc.clone();
+            let q = q_rc.clone();
+            flush_task = exe.spawn(async move {
+                ublk_qcow2_flush_meta(&tgt, &q).await;
+            });
+            exe.try_tick();
         }
     }
 
-    ublk_run_io_task(&exe, &flush_task, &q_rc, 0).unwrap();
+    ublk_run_io_task(exe, &flush_task, q_rc, 0).unwrap();
     smol::block_on(flush_task);
 }
 
@@ -443,13 +440,7 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
         qdev,
     });
 
-    let _shm = {
-        if let Some(ref o) = opt {
-            Some(o.gen_arg.get_shm_id())
-        } else {
-            None
-        }
-    };
+    let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
 
     let tgt_clone = tgt_rc.clone();
     let tgt_init = move |dev: &mut UblkDev| qcow2_init_tgt(dev, &tgt_clone, opt, dev_size);
@@ -466,7 +457,7 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
 
     // Spawn io tasks
     let mut f_vec = Vec::new();
-    for tag in 0..ctrl.dev_info().queue_depth as u16 {
+    for tag in 0..ctrl.dev_info().queue_depth {
         let q = q_rc.clone();
         let tgt = tgt_rc.clone();
 
