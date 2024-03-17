@@ -101,11 +101,15 @@ pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<
         Ok(())
     };
 
-    let (_shm, aa) = {
+    let (_shm, aa, fg) = {
         if let Some(ref o) = opt {
-            (Some(o.gen_arg.get_shm_id()), o.async_await)
+            (
+                Some(o.gen_arg.get_shm_id()),
+                o.async_await,
+                o.gen_arg.foreground,
+            )
         } else {
-            (None, false)
+            (None, false, false)
         }
     };
 
@@ -116,8 +120,8 @@ pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<
             q_sync_fn(qid, dev, user_copy)
         }
     };
-    ctrl.run_target(tgt_init, q_handler, |dev: &UblkCtrl| {
-        crate::rublk_prep_dump_dev(_shm, dev);
+    ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
+        crate::rublk_prep_dump_dev(_shm, fg, dev);
     })
     .unwrap();
 

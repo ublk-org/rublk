@@ -408,11 +408,16 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
         return Err(UblkError::InvalidVal);
     }
 
-    let (file, dio) = match opt {
+    let (file, dio, _shm, fg) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
 
-            (to_absolute_path(o.file.clone(), parent), !o.buffered_io)
+            (
+                to_absolute_path(o.file.clone(), parent),
+                !o.buffered_io,
+                Some(o.gen_arg.get_shm_id()),
+                o.gen_arg.foreground,
+            )
         }
         None => match ctrl.get_target_data_from_json() {
             Some(val) => {
@@ -420,7 +425,12 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
                 let tgt_data: Result<Qcow2Json, _> = serde_json::from_value(lo.clone());
 
                 match tgt_data {
-                    Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
+                    Ok(t) => (
+                        PathBuf::from(t.back_file_path.as_str()),
+                        t.direct_io != 0,
+                        None,
+                        false,
+                    ),
                     Err(_) => return Err(UblkError::InvalidVal),
                 }
             }
@@ -439,8 +449,6 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
         back_file_path: file_path,
         qdev,
     });
-
-    let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
 
     let tgt_clone = tgt_rc.clone();
     let tgt_init = move |dev: &mut UblkDev| qcow2_init_tgt(dev, &tgt_clone, opt, dev_size);
@@ -473,7 +481,7 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
     log::info!("qcow2: device started");
 
     // Tell parent we are up
-    crate::rublk_prep_dump_dev(_shm, &ctrl);
+    crate::rublk_prep_dump_dev(_shm, fg, &ctrl);
 
     // Drive IO tasks for moving on
     ublk_qcow2_drive_exec(&exe, &tgt_rc, &q_rc);

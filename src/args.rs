@@ -52,6 +52,10 @@ pub(crate) struct GenAddArgs {
     #[clap(long, short = 'o', default_value_t = false)]
     pub read_only: bool,
 
+    /// start the device in foreground
+    #[clap(long, default_value_t = false)]
+    pub foreground: bool,
+
     #[clap(skip)]
     shm_id: RefCell<String>,
 

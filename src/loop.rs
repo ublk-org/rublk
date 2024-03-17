@@ -239,7 +239,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
 }
 
 pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
-    let (file, dio, ro, aa) = match opt {
+    let (file, dio, ro, aa, _shm, fg) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
 
@@ -248,6 +248,8 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
                 !o.buffered_io,
                 o.gen_arg.read_only,
                 o.async_await,
+                Some(o.gen_arg.get_shm_id()),
+                o.gen_arg.foreground,
             )
         }
         None => {
@@ -265,6 +267,8 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
                             t.direct_io != 0,
                             (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
                             t.async_await,
+                            None,
+                            false,
                         ),
                         Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
                     }
@@ -286,8 +290,6 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
         async_await: aa,
     };
 
-    let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
-
     //todo: USER_COPY should be the default option
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
         return Err(UblkError::OtherError(-libc::EINVAL));
@@ -296,7 +298,7 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
     ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt, dio),
         move |qid, dev: &_| if aa { q_a_fn(qid, dev) } else { q_fn(qid, dev) },
-        |ctrl: &UblkCtrl| crate::rublk_prep_dump_dev(_shm, ctrl),
+        move |ctrl: &UblkCtrl| crate::rublk_prep_dump_dev(_shm, fg, ctrl),
     )
     .unwrap();
     Ok(0)

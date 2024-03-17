@@ -625,7 +625,7 @@ pub(crate) struct ZonedAddArgs {
 
 pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Result<i32, UblkError> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (size, zone_size) = match opt {
+    let (size, zone_size, _shm, fg) = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
                 eprintln!("zoned(ramdisk) can't support recovery\n");
@@ -636,7 +636,12 @@ pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Resul
                 eprintln!("only support ramdisk now with 'None' path\n");
                 return Err(UblkError::OtherError(-libc::EINVAL));
             } else {
-                ((o.size << 20) as u64, (o.zone_size << 20) as u64)
+                (
+                    (o.size << 20) as u64,
+                    (o.zone_size << 20) as u64,
+                    Some(o.gen_arg.get_shm_id()),
+                    o.gen_arg.foreground,
+                )
             }
         }
         None => return Err(UblkError::OtherError(-libc::EINVAL)),
@@ -713,9 +718,8 @@ pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Resul
         smol::block_on(async { futures::future::join_all(f_vec).await });
     };
 
-    let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
-    ctrl.run_target(tgt_init, q_handler, |ctrl: &_| {
-        crate::rublk_prep_dump_dev(_shm, ctrl)
+    ctrl.run_target(tgt_init, q_handler, move |ctrl: &_| {
+        crate::rublk_prep_dump_dev(_shm, fg, ctrl)
     })
     .unwrap();
 

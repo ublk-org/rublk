@@ -129,9 +129,13 @@ fn rublk_write_id_into_shm(shm_id: &String, id: u32) {
     }
 }
 
-pub(crate) fn rublk_prep_dump_dev(shm_id: Option<String>, ctrl: &UblkCtrl) {
-    if let Some(shm) = shm_id {
-        crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);
+pub(crate) fn rublk_prep_dump_dev(shm_id: Option<String>, fg: bool, ctrl: &UblkCtrl) {
+    if !fg {
+        if let Some(shm) = shm_id {
+            crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);
+        }
+    } else {
+        ctrl.dump();
     }
 }
 
@@ -198,9 +202,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
 
 fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
-    let ctrl = gen_arg
-        .new_ublk_ctrl(tgt_type, UblkFlags::UBLK_DEV_F_ADD_DEV)
-        .unwrap();
+    let ctrl = gen_arg.new_ublk_ctrl(tgt_type, UblkFlags::UBLK_DEV_F_ADD_DEV)?;
 
     match opt {
         AddCommands::Loop(opt) => r#loop::ublk_add_loop(ctrl, Some(opt)),
@@ -212,21 +214,26 @@ fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
 
 fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
     let (_, gen_arg) = ublk_parse_add_args(&opt);
-    let daemonize = daemonize::Daemonize::new()
-        .stdout(daemonize::Stdio::keep())
-        .stderr(daemonize::Stdio::keep());
-
-    gen_arg.generate_shm_id();
     gen_arg.save_start_dir();
 
-    let shm_id = gen_arg.get_shm_id();
-    match ShmemConf::new().os_id(&shm_id).size(4096).create() {
-        Ok(_shm) => match daemonize.execute() {
-            daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt),
-            daemonize::Outcome::Parent(Ok(_)) => rublk_wait_and_dump(&shm_id),
-            _ => Err(UblkError::OtherError(-libc::EINVAL)),
-        },
-        Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
+    if gen_arg.foreground {
+        ublk_add_worker(opt)
+    } else {
+        let daemonize = daemonize::Daemonize::new()
+            .stdout(daemonize::Stdio::keep())
+            .stderr(daemonize::Stdio::keep());
+
+        gen_arg.generate_shm_id();
+
+        let shm_id = gen_arg.get_shm_id();
+        match ShmemConf::new().os_id(&shm_id).size(4096).create() {
+            Ok(_shm) => match daemonize.execute() {
+                daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt),
+                daemonize::Outcome::Parent(Ok(_)) => rublk_wait_and_dump(&shm_id),
+                _ => Err(UblkError::OtherError(-libc::EINVAL)),
+            },
+            Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
+        }
     }
 }
 

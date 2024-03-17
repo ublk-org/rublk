@@ -108,6 +108,7 @@ mod integration {
         let tgt_dir = get_curr_bin_dir().unwrap();
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         let file = std::fs::File::create(tmpfile.path()).unwrap();
+        let fg = s.contains(&"--foreground");
 
         //println!("top dir: path {:?} {:?}", &tgt_dir, &file);
         let rd_path = tgt_dir.display().to_string() + &"/rublk".to_string();
@@ -117,7 +118,9 @@ mod integration {
             .spawn()
             .expect("Failed to execute process");
 
-        cmd.wait().unwrap();
+        if !fg {
+            cmd.wait().unwrap();
+        }
         let buf = loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let _buf = std::fs::read_to_string(tmpfile.path()).unwrap();
@@ -260,6 +263,7 @@ mod integration {
     fn test_ublk_null_read_only() {
         __test_ublk_null_read_only(&["add", "null"], false);
         __test_ublk_null_read_only(&["add", "null", "--read-only"], true);
+        __test_ublk_null_read_only(&["add", "null", "--foreground"], false);
     }
 
     fn __test_ublk_add_del_qcow2(bs: u32) {
