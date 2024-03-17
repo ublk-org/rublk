@@ -715,10 +715,7 @@ pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Resul
 
     let _shm = opt.as_ref().map(|o| o.gen_arg.get_shm_id());
     ctrl.run_target(tgt_init, q_handler, |ctrl: &_| {
-        if let Some(shm) = _shm {
-            let dev_id = ctrl.dev_info().dev_id;
-            crate::rublk_write_id_into_shm(&shm, dev_id);
-        }
+        crate::rublk_prep_dump_dev(_shm, ctrl)
     })
     .unwrap();
 

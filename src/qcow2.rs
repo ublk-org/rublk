@@ -473,10 +473,7 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
     log::info!("qcow2: device started");
 
     // Tell parent we are up
-    if let Some(shm) = _shm {
-        let dev_id = ctrl.dev_info().dev_id;
-        crate::rublk_write_id_into_shm(&shm, dev_id);
-    }
+    crate::rublk_prep_dump_dev(_shm, &ctrl);
 
     // Drive IO tasks for moving on
     ublk_qcow2_drive_exec(&exe, &tgt_rc, &q_rc);

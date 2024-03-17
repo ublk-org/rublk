@@ -104,7 +104,7 @@ fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Resul
 ///
 /// The 1st 4 char is : 'U' 'B' 'L' 'K', then follows the 4
 /// ID chars which is encoded by hex.
-pub(crate) fn rublk_write_id_into_shm(shm_id: &String, id: u32) {
+fn rublk_write_id_into_shm(shm_id: &String, id: u32) {
     log::info!("shm_id {} id {}", shm_id, id);
     match ShmemConf::new().os_id(shm_id).size(4096).open() {
         Ok(mut shmem) => {
@@ -126,6 +126,12 @@ pub(crate) fn rublk_write_id_into_shm(shm_id: &String, id: u32) {
             s[3] = b'K';
         }
         Err(e) => println!("write id open failed {} {}", shm_id, e),
+    }
+}
+
+pub(crate) fn rublk_prep_dump_dev(shm_id: Option<String>, ctrl: &UblkCtrl) {
+    if let Some(shm) = shm_id {
+        crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);
     }
 }
 

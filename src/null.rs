@@ -117,9 +117,7 @@ pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<
         }
     };
     ctrl.run_target(tgt_init, q_handler, |dev: &UblkCtrl| {
-        if let Some(shm) = _shm {
-            crate::rublk_write_id_into_shm(&shm, dev.dev_info().dev_id);
-        }
+        crate::rublk_prep_dump_dev(_shm, dev);
     })
     .unwrap();
 
