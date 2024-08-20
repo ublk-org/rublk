@@ -172,12 +172,17 @@ mod integration {
         let _ = run_rublk_cmd(para, 0);
     }
 
-    fn __test_ublk_add_del_null(bs: u32, aa: bool) {
+    fn __test_ublk_add_del_null(bs: u32, aa: bool, bpf: bool) {
         let binding = bs.to_string();
         let mut cmd_line = ["add", "null", "--logical-block-size", &binding].to_vec();
         if aa {
             cmd_line.push("-a");
         }
+
+        if bpf {
+            cmd_line.push("--bpf");
+        }
+
         let id = run_rublk_add_dev(cmd_line);
         let ctrl = UblkCtrl::new_simple(id).unwrap();
 
@@ -193,8 +198,10 @@ mod integration {
 
         let mut aa = false;
         for bs in [512, 1024, 4096] {
-            __test_ublk_add_del_null(bs, aa);
-            aa = !aa;
+            for bpf in [false, true] {
+                __test_ublk_add_del_null(bs, aa, bpf);
+                aa = !aa;
+            }
         }
     }
 

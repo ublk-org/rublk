@@ -7,6 +7,21 @@ use libublk::{
 };
 use std::rc::Rc;
 
+use anyhow::Result;
+use libbpf_rs::skel::OpenSkel;
+use libbpf_rs::skel::Skel;
+use libbpf_rs::skel::SkelBuilder;
+use std::mem::MaybeUninit;
+
+mod nullbpf {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bpf/ublk_null.skel.rs"
+    ));
+}
+
+use nullbpf::*;
+
 #[derive(clap::Args, Debug)]
 pub(crate) struct NullAddArgs {
     #[command(flatten)]
@@ -88,7 +103,7 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<i32, UblkError> {
+fn __ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<i32, UblkError> {
     let size = 250_u64 << 30;
     let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
 
@@ -126,4 +141,35 @@ pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<
     .unwrap();
 
     Ok(0)
+}
+
+fn __ublk_add_null_bpf(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<()> {
+    let skel_builder = UblkNullSkelBuilder::default();
+    let mut open_object = MaybeUninit::uninit();
+    let mut open_skel = skel_builder.open(&mut open_object)?;
+    open_skel.struct_ops.null_ublk_bpf_ops_mut().dev_id = ctrl.dev_info().dev_id as i32;
+
+    let mut skel = open_skel.load()?;
+
+    let _link = skel.maps.null_ublk_bpf_ops.attach_struct_ops()?;
+
+    skel.attach()?;
+
+    __ublk_add_null(ctrl, opt)?;
+
+    Ok(())
+}
+
+pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<i32, UblkError> {
+    let info = ctrl.dev_info();
+
+    if (info.flags & (libublk::sys::UBLK_F_BPF as u64)) != 0 {
+        let res = __ublk_add_null_bpf(ctrl, opt);
+        match res {
+            Ok(_) => Ok(0),
+            _ => Err(UblkError::OtherError(-libc::EINVAL)),
+        }
+    } else {
+        __ublk_add_null(ctrl, opt)
+    }
 }

@@ -56,6 +56,10 @@ pub(crate) struct GenAddArgs {
     #[clap(long, default_value_t = false)]
     pub foreground: bool,
 
+    /// ublk io logic is handled by bpf prog
+    #[clap(long, default_value_t = false)]
+    pub bpf: bool,
+
     #[clap(skip)]
     shm_id: RefCell<String>,
 
@@ -145,6 +149,10 @@ impl GenAddArgs {
 
         if self.unprivileged {
             ctrl_flags |= libublk::sys::UBLK_F_UNPRIVILEGED_DEV;
+        }
+
+        if self.bpf {
+            ctrl_flags |= libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_BPF;
         }
 
         let mut gen_flags: u64 = 0;
