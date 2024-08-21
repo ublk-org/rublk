@@ -44,7 +44,7 @@ struct Qcow2Tgt<T> {
 }
 
 std::thread_local! {
-    static MY_THREAD_QUEUE: UnsafeCell<*const ()> = UnsafeCell::new(std::ptr::null());
+    static MY_THREAD_QUEUE: UnsafeCell<*const ()> = const { UnsafeCell::new(std::ptr::null()) };
 }
 
 #[inline]
