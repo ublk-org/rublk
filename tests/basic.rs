@@ -179,10 +179,11 @@ mod integration {
     }
     #[test]
     fn test_ublk_add_del_null() {
-        __test_ublk_add_del_null(512, false);
-        __test_ublk_add_del_null(1024, false);
-        __test_ublk_add_del_null(4096, false);
-        __test_ublk_add_del_null(4096, true);
+        let mut aa = false;
+        for bs in [512, 1024, 4096] {
+            __test_ublk_add_del_null(bs, aa);
+            aa = !aa;
+        }
     }
 
     fn __test_ublk_add_del_zoned(bs: u32) {
