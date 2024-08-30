@@ -6,6 +6,14 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    fn support_ublk() -> bool {
+        if !Path::new("/dev/ublk-control").exists() {
+            eprintln!("ublk isn't supported or its module isn't loaded");
+            return false;
+        }
+        return true;
+    }
+
     fn check_ro(ctrl: &UblkCtrl, exp_ro: bool) {
         let mut params: sys::ublk_params = { Default::default() };
         ctrl.get_params(&mut params).unwrap();
@@ -179,6 +187,10 @@ mod integration {
     }
     #[test]
     fn test_ublk_add_del_null() {
+        if !support_ublk() {
+            return;
+        }
+
         let mut aa = false;
         for bs in [512, 1024, 4096] {
             __test_ublk_add_del_null(bs, aa);
@@ -214,6 +226,9 @@ mod integration {
 
     #[test]
     fn test_ublk_add_del_zoned() {
+        if !support_ublk() {
+            return;
+        }
         match UblkCtrl::get_features() {
             Some(f) => {
                 if f & (libublk::sys::UBLK_F_ZONED as u64) != 0 {
@@ -250,6 +265,9 @@ mod integration {
     }
     #[test]
     fn test_ublk_add_del_loop() {
+        if !support_ublk() {
+            return;
+        }
         __test_ublk_add_del_loop(4096, false);
         __test_ublk_add_del_loop(4096, true);
     }
@@ -262,6 +280,9 @@ mod integration {
     }
     #[test]
     fn test_ublk_null_read_only() {
+        if !support_ublk() {
+            return;
+        }
         __test_ublk_null_read_only(&["add", "null"], false);
         __test_ublk_null_read_only(&["add", "null", "--read-only"], true);
         __test_ublk_null_read_only(&["add", "null", "--foreground"], false);
@@ -299,6 +320,9 @@ mod integration {
     }
     #[test]
     fn test_ublk_add_del_qcow2() {
+        if !support_ublk() {
+            return;
+        }
         __test_ublk_add_del_qcow2(4096);
     }
 }
