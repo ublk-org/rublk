@@ -6,7 +6,7 @@ description = "Rust ublk generic targets"
 authors = ["Ming Lei <tom.leiming@gmail.com>"]
 readme = "README.md"
 repository = "https://github.com/ublk-org/rublk"
-license = "GPL-2.0"
+license = "GPL-2.0-or-later"
 keywords = ["ublk", "io_uring", "userspace", "block", "storage"]
 publish = true
 
