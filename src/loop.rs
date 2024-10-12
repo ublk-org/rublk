@@ -8,6 +8,23 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use anyhow::Result;
+use libbpf_rs::skel::OpenSkel;
+use libbpf_rs::skel::Skel;
+use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::MapCore as _;
+use libbpf_rs::MapFlags;
+use std::mem::MaybeUninit;
+
+mod loopbpf {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bpf/ublk_loop.skel.rs"
+    ));
+}
+
+use loopbpf::*;
+
 #[derive(clap::Args, Debug)]
 pub struct LoopArgs {
     #[command(flatten)]
@@ -191,6 +208,18 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
     }
 }
 
+fn q_bpf_fn(qid: u16, dev: &UblkDev) {
+    let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+        lo_handle_io_cmd_sync(q, tag, io, std::ptr::null_mut());
+    };
+
+    UblkQueue::new(qid, dev)
+        .unwrap()
+        .regiser_io_bufs(None)
+        .submit_fetch_commands(None)
+        .wait_and_handle_io(lo_io_handler);
+}
+
 fn q_fn(qid: u16, dev: &UblkDev) {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
@@ -238,7 +267,11 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
+fn __ublk_add_loop(
+    ctrl: UblkCtrl,
+    opt: Option<LoopArgs>,
+    bpf_skel: Option<UblkLoopSkel>,
+) -> Result<i32, UblkError> {
     let (file, dio, ro, aa, _shm, fg) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
@@ -290,16 +323,72 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
         async_await: aa,
     };
 
+    let bpf;
+    if let Some(skel) = bpf_skel {
+        let key = (0_i32).to_ne_bytes();
+        let val = lo.back_file.as_raw_fd().to_ne_bytes();
+        let _ = skel.maps.fd_map.update(&key, &val, MapFlags::ANY);
+        bpf = true;
+    } else {
+        bpf = false;
+    }
+
     //todo: USER_COPY should be the default option
-    if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
+    if !bpf && (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
+        log::error!("wrong user_copy flag");
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
     ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt, dio),
-        move |qid, dev: &_| if aa { q_a_fn(qid, dev) } else { q_fn(qid, dev) },
+        move |qid, dev: &_| {
+            if bpf {
+                q_bpf_fn(qid, dev)
+            } else if aa {
+                q_a_fn(qid, dev)
+            } else {
+                q_fn(qid, dev)
+            }
+        },
         move |ctrl: &UblkCtrl| crate::rublk_prep_dump_dev(_shm, fg, ctrl),
     )
     .unwrap();
     Ok(0)
+}
+
+fn __ublk_add_loop_bpf(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<()> {
+    let skel_builder = UblkLoopSkelBuilder::default();
+    let mut open_object = MaybeUninit::uninit();
+    let mut open_skel = skel_builder.open(&mut open_object)?;
+    let dev_id = ctrl.dev_info().dev_id as i32;
+
+    open_skel.struct_ops.loop_ublk_bpf_ops_mut().dev_id = dev_id;
+    open_skel.struct_ops.loop_ublk_bpf_aio_ops_mut().id = dev_id;
+
+    let mut skel = open_skel.load()?;
+    let _link = skel.maps.loop_ublk_bpf_ops.attach_struct_ops()?;
+    let _aio_link = skel.maps.loop_ublk_bpf_aio_ops.attach_struct_ops()?;
+
+    skel.attach()?;
+
+    __ublk_add_loop(ctrl, opt, Some(skel))?;
+
+    Ok(())
+}
+
+pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
+    let info = ctrl.dev_info();
+
+    if (info.flags & (libublk::sys::UBLK_F_BPF as u64)) != 0 {
+        let res = __ublk_add_loop_bpf(ctrl, opt);
+        match res {
+            Ok(_) => Ok(0),
+            _ => {
+                log::error!("add loop bpf failed");
+                Err(UblkError::OtherError(-libc::EINVAL))
+            }
+        }
+    } else {
+        __ublk_add_loop(ctrl, opt, None)
+    }
 }
