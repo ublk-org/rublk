@@ -3,6 +3,7 @@
 #define UBLK_BPF_GEN_H
 
 #include "ublk_bpf_kfunc.h"
+#include "bpf_aio_kfunc.h"
 
 #ifdef DEBUG
 #define BPF_DBG(...) bpf_printk(__VA_ARGS__)
