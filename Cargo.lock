@@ -916,9 +916,9 @@ dependencies = [
 
 [[package]]
 name = "libublk"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038c540e337b7ee8010037570b15afbfb88c54c8fbae890ac1ed7e54cd0c9fdf"
+checksum = "4408b2a36bb1cdce0a9b9658d346d8fbf5813f28c2c5fd2cd874f11dd354b1e4"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -1305,7 +1305,7 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
 name = "rublk"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
