@@ -2,7 +2,6 @@ use crate::target_flags::*;
 use clap::{Args, Subcommand};
 use ilog::IntLog;
 use libublk::{ctrl::UblkCtrl, io::UblkDev, UblkFlags};
-use rand::Rng;
 use std::cell::RefCell;
 use std::io::{Error, ErrorKind};
 
@@ -57,9 +56,6 @@ pub(crate) struct GenAddArgs {
     pub foreground: bool,
 
     #[clap(skip)]
-    shm_id: RefCell<String>,
-
-    #[clap(skip)]
     start_dir: RefCell<Option<std::path::PathBuf>>,
 }
 
@@ -95,23 +91,6 @@ impl GenAddArgs {
         let dir = self.start_dir.borrow();
 
         (*dir).clone()
-    }
-    /// Return shared memory os id
-    pub fn get_shm_id(&self) -> String {
-        let shm_id = self.shm_id.borrow();
-
-        (*shm_id).clone()
-    }
-
-    /// Generate shared memory os id
-    ///
-    /// The 1st 4 hex is from process id, and the other 4 hex
-    /// is from random generator
-    pub fn generate_shm_id(&self) {
-        let mut rng = rand::thread_rng();
-        let mut shm = self.shm_id.borrow_mut();
-
-        *shm = format!("{:04x}{:04x}", std::process::id(), rng.gen::<i32>());
     }
 
     pub fn save_start_dir(&self) {

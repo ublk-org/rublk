@@ -2,7 +2,6 @@ use args::{AddCommands, Commands};
 use clap::Parser;
 use ilog::IntLog;
 use libublk::{ctrl::UblkCtrl, UblkError, UblkFlags};
-use shared_memory::*;
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -189,16 +188,10 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
             .stdout(daemonize::Stdio::keep())
             .stderr(daemonize::Stdio::keep());
 
-        gen_arg.generate_shm_id();
-
-        let shm_id = gen_arg.get_shm_id();
-        match ShmemConf::new().os_id(&shm_id).size(4096).create() {
-            Ok(_shm) => match daemonize.execute() {
-                daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt, &comm),
-                daemonize::Outcome::Parent(Ok(_)) => ublk_dump_dev(&comm),
-                _ => Err(UblkError::OtherError(-libc::EINVAL)),
-            },
-            Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
+        match daemonize.execute() {
+            daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt, &comm),
+            daemonize::Outcome::Parent(Ok(_)) => ublk_dump_dev(&comm),
+            _ => Err(UblkError::OtherError(-libc::EINVAL)),
         }
     }
 }
