@@ -15,6 +15,7 @@ use std::cell::UnsafeCell;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Qcow2Args {
@@ -395,7 +396,12 @@ fn ublk_qcow2_drive_exec<'a, T: Qcow2IoOps + 'a>(
     smol::block_on(flush_task);
 }
 
-pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_qcow2(
+    ctrl_in: UblkCtrl,
+    opt: Option<Qcow2Args>,
+    comm_arc: &Arc<crate::DevIdComm>,
+) -> Result<i32, UblkError> {
+    let dev_id = ctrl_in.dev_info().dev_id;
     let ctrl = Rc::new(ctrl_in);
 
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
@@ -481,7 +487,7 @@ pub(crate) fn ublk_add_qcow2(ctrl_in: UblkCtrl, opt: Option<Qcow2Args>) -> Resul
     log::info!("qcow2: device started");
 
     // Tell parent we are up
-    crate::rublk_prep_dump_dev(_shm, fg, &ctrl);
+    comm_arc.send_dev_id(dev_id).unwrap();
 
     // Drive IO tasks for moving on
     ublk_qcow2_drive_exec(&exe, &tgt_rc, &q_rc);

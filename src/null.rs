@@ -6,6 +6,7 @@ use libublk::{
     UblkError, UblkIORes,
 };
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct NullAddArgs {
@@ -88,7 +89,11 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_null(
+    ctrl: UblkCtrl,
+    opt: Option<NullAddArgs>,
+    comm_arc: &Arc<crate::DevIdComm>,
+) -> Result<i32, UblkError> {
     let size = 250_u64 << 30;
     let flags = ctrl.dev_info().flags;
     let user_copy = (flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
@@ -125,8 +130,10 @@ pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<
             q_sync_fn(qid, dev, user_copy)
         }
     };
+
+    let comm = comm_arc.clone();
     ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
-        crate::rublk_prep_dump_dev(_shm, fg, dev);
+        comm.send_dev_id(dev.dev_info().dev_id).unwrap();
     })
     .unwrap();
 

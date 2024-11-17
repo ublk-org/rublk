@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(clap::Args, Debug)]
 pub struct LoopArgs {
@@ -229,7 +230,11 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_loop(
+    ctrl: UblkCtrl,
+    opt: Option<LoopArgs>,
+    comm_rc: &Arc<crate::DevIdComm>,
+) -> Result<i32, UblkError> {
     let (file, dio, ro, aa, _shm, fg) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
@@ -286,10 +291,11 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
+    let comm = comm_rc.clone();
     ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
         move |qid, dev: &_| if aa { q_a_fn(qid, dev) } else { q_fn(qid, dev) },
-        move |ctrl: &UblkCtrl| crate::rublk_prep_dump_dev(_shm, fg, ctrl),
+        move |ctrl: &UblkCtrl| comm.send_dev_id(ctrl.dev_info().dev_id).unwrap(),
     )
     .unwrap();
     Ok(0)

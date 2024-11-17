@@ -8,6 +8,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
 
 pub(crate) mod target_flags {
     pub const TGT_QUIET: u64 = 0b00000001;
@@ -46,6 +47,63 @@ ioctl_read_bad!(
     request_code_none!(BLK_IOCTL_TYPE, BLKPBSZGET_NR),
     u32
 );
+
+pub(crate) struct DevIdComm {
+    efd: i32,
+    dump: bool,
+}
+
+impl DevIdComm {
+    pub fn new(dump: bool) -> anyhow::Result<DevIdComm> {
+        let fd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty())?;
+
+        Ok(DevIdComm { efd: fd, dump })
+    }
+    fn write_dev_id(&self, dev_id: u32) -> anyhow::Result<i32> {
+        // Can't write 0 to eventfd file, otherwise the read() side may
+        // not be waken up
+        let id = (dev_id + 1) as i64;
+        let bytes = id.to_le_bytes();
+
+        match nix::unistd::write(self.efd, &bytes) {
+            Ok(_) => Ok(0),
+            _ => Err(anyhow::anyhow!("fail to write dev_id to eventfd")),
+        }
+    }
+
+    fn read_dev_id(&self) -> anyhow::Result<i32> {
+        let mut buffer = [0; 8];
+
+        let bytes_read = nix::unistd::read(self.efd, &mut buffer)?;
+        if bytes_read == 0 {
+            return Err(anyhow::anyhow!("fail to read dev_id from eventfd"));
+        }
+        return Ok((i64::from_le_bytes(buffer) - 1) as i32);
+    }
+
+    pub(crate) fn send_dev_id(&self, id: u32) -> anyhow::Result<()> {
+        if self.dump {
+            UblkCtrl::new_simple(id as i32).unwrap().dump();
+        } else {
+            self.write_dev_id(id).expect("Fail to write efd");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recieve_dev_id(&self) -> anyhow::Result<i32> {
+        let id = self.read_dev_id()?;
+        Ok(id)
+    }
+}
+
+fn ublk_dump_dev(comm: &Arc<DevIdComm>) -> Result<i32, UblkError> {
+    let id = comm
+        .recieve_dev_id()
+        .expect("recieve dev_id from efd failed");
+
+    UblkCtrl::new_simple(id).unwrap().dump();
+    Ok(0)
+}
 
 pub(crate) fn ublk_file_size(f: &std::fs::File) -> anyhow::Result<(u64, u8, u8)> {
     if let Ok(meta) = f.metadata() {
@@ -200,24 +258,25 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
     }
 }
 
-fn ublk_add_worker(opt: args::AddCommands) -> Result<i32, UblkError> {
+fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> Result<i32, UblkError> {
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
     let ctrl = gen_arg.new_ublk_ctrl(tgt_type, UblkFlags::UBLK_DEV_F_ADD_DEV)?;
 
     match opt {
-        AddCommands::Loop(opt) => r#loop::ublk_add_loop(ctrl, Some(opt)),
-        AddCommands::Null(opt) => null::ublk_add_null(ctrl, Some(opt)),
-        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(ctrl, Some(opt)),
-        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt)),
+        AddCommands::Loop(opt) => r#loop::ublk_add_loop(ctrl, Some(opt), comm),
+        AddCommands::Null(opt) => null::ublk_add_null(ctrl, Some(opt), comm),
+        AddCommands::Zoned(opt) => zoned::ublk_add_zoned(ctrl, Some(opt), comm),
+        AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt), comm),
     }
 }
 
 fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
     let (_, gen_arg) = ublk_parse_add_args(&opt);
+    let comm = Arc::new(DevIdComm::new(gen_arg.foreground).expect("Create eventfd failed"));
     gen_arg.save_start_dir();
 
     if gen_arg.foreground {
-        ublk_add_worker(opt)
+        ublk_add_worker(opt, &comm)
     } else {
         let daemonize = daemonize::Daemonize::new()
             .stdout(daemonize::Stdio::keep())
@@ -228,8 +287,8 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
         let shm_id = gen_arg.get_shm_id();
         match ShmemConf::new().os_id(&shm_id).size(4096).create() {
             Ok(_shm) => match daemonize.execute() {
-                daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt),
-                daemonize::Outcome::Parent(Ok(_)) => rublk_wait_and_dump(&shm_id),
+                daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt, &comm),
+                daemonize::Outcome::Parent(Ok(_)) => ublk_dump_dev(&comm),
                 _ => Err(UblkError::OtherError(-libc::EINVAL)),
             },
             Err(_) => Err(UblkError::OtherError(-libc::EINVAL)),
@@ -252,6 +311,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         return Err(UblkError::OtherError(-libc::EBUSY));
     }
 
+    let comm = Arc::new(DevIdComm::new(false).expect("Create eventfd failed"));
     ctrl.start_user_recover()?;
 
     let tgt_type = ctrl.get_target_type_from_json().unwrap();
@@ -266,9 +326,9 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         .unwrap();
 
     match tgt_type.as_str() {
-        "loop" => r#loop::ublk_add_loop(ctrl, None),
-        "null" => null::ublk_add_null(ctrl, None),
-        "zoned" => zoned::ublk_add_zoned(ctrl, None),
+        "loop" => r#loop::ublk_add_loop(ctrl, None, &comm),
+        "null" => null::ublk_add_null(ctrl, None, &comm),
+        "zoned" => zoned::ublk_add_zoned(ctrl, None, &comm),
         &_ => todo!(),
     }
 }

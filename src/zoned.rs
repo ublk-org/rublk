@@ -623,7 +623,11 @@ pub(crate) struct ZonedAddArgs {
     zone_size: u32,
 }
 
-pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Result<i32, UblkError> {
+pub(crate) fn ublk_add_zoned(
+    ctrl: UblkCtrl,
+    opt: Option<ZonedAddArgs>,
+    comm_arc: &Arc<crate::DevIdComm>,
+) -> Result<i32, UblkError> {
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (size, zone_size, _shm, fg) = match opt {
         Some(ref o) => {
@@ -718,8 +722,9 @@ pub(crate) fn ublk_add_zoned(ctrl: UblkCtrl, opt: Option<ZonedAddArgs>) -> Resul
         smol::block_on(async { futures::future::join_all(f_vec).await });
     };
 
+    let comm = comm_arc.clone();
     ctrl.run_target(tgt_init, q_handler, move |ctrl: &_| {
-        crate::rublk_prep_dump_dev(_shm, fg, ctrl)
+        comm.send_dev_id(ctrl.dev_info().dev_id).unwrap();
     })
     .unwrap();
 
