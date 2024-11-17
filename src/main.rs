@@ -229,6 +229,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
         "loop" => r#loop::ublk_add_loop(ctrl, None, &comm),
         "null" => null::ublk_add_null(ctrl, None, &comm),
         "zoned" => zoned::ublk_add_zoned(ctrl, None, &comm),
+        "qcow2" => qcow2::ublk_add_qcow2(ctrl, None, &comm),
         &_ => todo!(),
     }
 }
