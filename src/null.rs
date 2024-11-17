@@ -90,7 +90,12 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
 
 pub(crate) fn ublk_add_null(ctrl: UblkCtrl, opt: Option<NullAddArgs>) -> Result<i32, UblkError> {
     let size = 250_u64 << 30;
-    let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+    let flags = ctrl.dev_info().flags;
+    let user_copy = (flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+
+    if flags & libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64 != 0 {
+        return Err(UblkError::InvalidVal);
+    }
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
