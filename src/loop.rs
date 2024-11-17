@@ -95,12 +95,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) 
     -libc::EAGAIN
 }
 
-fn lo_init_tgt(
-    dev: &mut UblkDev,
-    lo: &LoopTgt,
-    opt: Option<LoopArgs>,
-    dio: bool,
-) -> Result<(), UblkError> {
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result<(), UblkError> {
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     let info = dev.dev_info;
 
@@ -116,11 +111,7 @@ fn lo_init_tgt(
     tgt.nr_fds = nr_fds + 1;
 
     let sz = crate::ublk_file_size(&lo.back_file).unwrap();
-    let attrs = if dio {
-        0
-    } else {
-        libublk::sys::UBLK_ATTR_VOLATILE_CACHE
-    };
+    let attrs = libublk::sys::UBLK_ATTR_VOLATILE_CACHE;
 
     tgt.dev_size = sz.0;
     //todo: figure out correct block size
@@ -296,7 +287,7 @@ pub(crate) fn ublk_add_loop(ctrl: UblkCtrl, opt: Option<LoopArgs>) -> Result<i32
     }
 
     ctrl.run_target(
-        |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt, dio),
+        |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
         move |qid, dev: &_| if aa { q_a_fn(qid, dev) } else { q_fn(qid, dev) },
         move |ctrl: &UblkCtrl| crate::rublk_prep_dump_dev(_shm, fg, ctrl),
     )
