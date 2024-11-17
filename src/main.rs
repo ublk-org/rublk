@@ -7,7 +7,6 @@ use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{fence, Ordering};
 use std::sync::Arc;
 
 pub(crate) mod target_flags {
@@ -154,98 +153,6 @@ fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Resul
         if count >= timeout {
             return Err(UblkError::OtherError(-libc::ETIME));
         }
-    }
-}
-
-/// Write device ID into shared memory, so that parent process can
-/// know this ID info
-///
-/// The 1st 4 char is : 'U' 'B' 'L' 'K', then follows the 4
-/// ID chars which is encoded by hex.
-fn rublk_write_id_into_shm(shm_id: &String, id: u32) {
-    log::info!("shm_id {} id {}", shm_id, id);
-    match ShmemConf::new().os_id(shm_id).size(4096).open() {
-        Ok(mut shmem) => {
-            let s: &mut [u8] = unsafe { shmem.as_slice_mut() };
-
-            let id_str = format!("{:04x}", id);
-            let mut i = 4;
-            for c in id_str.as_bytes() {
-                s[i] = *c;
-                i += 1;
-            }
-
-            // order the two WRITEs
-            fence(Ordering::Release);
-
-            s[0] = b'U';
-            s[1] = b'B';
-            s[2] = b'L';
-            s[3] = b'K';
-        }
-        Err(e) => println!("write id open failed {} {}", shm_id, e),
-    }
-}
-
-pub(crate) fn rublk_prep_dump_dev(shm_id: Option<String>, fg: bool, ctrl: &UblkCtrl) {
-    if !fg {
-        if let Some(shm) = shm_id {
-            crate::rublk_write_id_into_shm(&shm, ctrl.dev_info().dev_id);
-        }
-    } else {
-        ctrl.dump();
-    }
-}
-
-fn rublk_read_id_from_shm(shm_id: &String) -> Result<i32, UblkError> {
-    if let Ok(shmem) = ShmemConf::new().os_id(shm_id).size(4096).open() {
-        let s: &[u8] = unsafe { shmem.as_slice() };
-
-        if s[0] != b'U' || s[1] != b'B' || s[2] != b'L' || s[3] != b'K' {
-            return Err(UblkError::OtherError(-libc::EAGAIN));
-        }
-
-        // order the two READs
-        fence(Ordering::Acquire);
-
-        let ss = String::from_utf8(s[4..8].to_vec()).unwrap();
-        if let Ok(i) = i32::from_str_radix(&ss, 16) {
-            Ok(i)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
-    } else {
-        Err(UblkError::OtherError(-libc::EAGAIN))
-    }
-}
-
-fn rublk_wait_and_dump(shm_id: &String) -> Result<i32, UblkError> {
-    let mut count = 0;
-    loop {
-        if count >= 500 {
-            eprintln!("create ublk device failed");
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-        match rublk_read_id_from_shm(shm_id) {
-            Ok(id) => {
-                let ctrl = UblkCtrl::new_simple(id)?;
-
-                if (ctrl.dev_info().ublksrv_flags & target_flags::TGT_QUIET) == 0 {
-                    ctrl.dump();
-                }
-
-                return Ok(0);
-            }
-            Err(UblkError::OtherError(code)) => {
-                if code == -libc::EAGAIN {
-                    count += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                } else {
-                    return Err(UblkError::OtherError(code));
-                }
-            }
-            _ => return Err(UblkError::OtherError(-libc::EINVAL)),
-        };
     }
 }
 

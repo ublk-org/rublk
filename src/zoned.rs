@@ -629,7 +629,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> Result<i32, UblkError> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (size, zone_size, _shm, fg) = match opt {
+    let (size, zone_size) = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
                 eprintln!("zoned(ramdisk) can't support recovery\n");
@@ -640,12 +640,7 @@ pub(crate) fn ublk_add_zoned(
                 eprintln!("only support ramdisk now with 'None' path\n");
                 return Err(UblkError::OtherError(-libc::EINVAL));
             } else {
-                (
-                    (o.size << 20) as u64,
-                    (o.zone_size << 20) as u64,
-                    Some(o.gen_arg.get_shm_id()),
-                    o.gen_arg.foreground,
-                )
+                ((o.size << 20) as u64, (o.zone_size << 20) as u64)
             }
         }
         None => return Err(UblkError::OtherError(-libc::EINVAL)),

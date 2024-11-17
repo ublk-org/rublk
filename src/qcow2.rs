@@ -414,16 +414,11 @@ pub(crate) fn ublk_add_qcow2(
         return Err(UblkError::InvalidVal);
     }
 
-    let (file, dio, _shm, fg) = match opt {
+    let (file, dio) = match opt {
         Some(ref o) => {
             let parent = o.gen_arg.get_start_dir();
 
-            (
-                to_absolute_path(o.file.clone(), parent),
-                !o.buffered_io,
-                Some(o.gen_arg.get_shm_id()),
-                o.gen_arg.foreground,
-            )
+            (to_absolute_path(o.file.clone(), parent), !o.buffered_io)
         }
         None => match ctrl.get_target_data_from_json() {
             Some(val) => {
@@ -431,12 +426,7 @@ pub(crate) fn ublk_add_qcow2(
                 let tgt_data: Result<Qcow2Json, _> = serde_json::from_value(lo.clone());
 
                 match tgt_data {
-                    Ok(t) => (
-                        PathBuf::from(t.back_file_path.as_str()),
-                        t.direct_io != 0,
-                        None,
-                        false,
-                    ),
+                    Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
                     Err(_) => return Err(UblkError::InvalidVal),
                 }
             }

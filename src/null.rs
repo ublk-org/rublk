@@ -111,15 +111,11 @@ pub(crate) fn ublk_add_null(
         Ok(())
     };
 
-    let (_shm, aa, fg) = {
+    let aa = {
         if let Some(ref o) = opt {
-            (
-                Some(o.gen_arg.get_shm_id()),
-                o.async_await,
-                o.gen_arg.foreground,
-            )
+            o.async_await
         } else {
-            (None, false, false)
+            false
         }
     };
 
