@@ -14,6 +14,24 @@ mod integration {
         return true;
     }
 
+    fn format_and_mount(ctrl: &UblkCtrl) {
+        let dev_path = ctrl.get_bdev_path();
+
+        let ext4_options = block_utils::Filesystem::Ext4 {
+            inode_size: 512,
+            stride: Some(2),
+            stripe_width: None,
+            reserved_blocks_percentage: 10,
+        };
+        block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
+
+        block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
+        block_utils::unmount_device(tmp_dir.path()).unwrap();
+    }
+
     fn check_ro(ctrl: &UblkCtrl, exp_ro: bool) {
         let mut params: sys::ublk_params = { Default::default() };
         ctrl.get_params(&mut params).unwrap();
@@ -338,6 +356,28 @@ mod integration {
             read_ublk_disk(&ctrl);
             write_ublk_disk(&ctrl, bs, file_size);
             check_block_size(&ctrl, bs);
+        });
+    }
+
+    #[test]
+    fn test_ublk_format_mount_loop() {
+        if !support_ublk() {
+            return;
+        }
+        __test_ublk_add_del_loop(4096, true, |id, _bs, _file_size| {
+            let ctrl = UblkCtrl::new_simple(id).unwrap();
+            format_and_mount(&ctrl);
+        });
+    }
+
+    #[test]
+    fn test_ublk_format_mount_qcow2() {
+        if !support_ublk() {
+            return;
+        }
+        __test_ublk_add_del_qcow2(4096, |id, _bs, _file_size| {
+            let ctrl = UblkCtrl::new_simple(id).unwrap();
+            format_and_mount(&ctrl);
         });
     }
 }
