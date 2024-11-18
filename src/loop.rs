@@ -1,4 +1,4 @@
-use io_uring::{opcode, squeue, types};
+use io_uring::{opcode, types};
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError, UblkIORes};
@@ -56,18 +56,13 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
 #[inline]
 fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
     match op {
-        libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
-            .offset(off)
-            .build()
-            .flags(squeue::Flags::FIXED_FILE),
+        libublk::sys::UBLK_IO_OP_FLUSH => opcode::Fsync::new(types::Fixed(1)).build(),
         libublk::sys::UBLK_IO_OP_READ => opcode::Read::new(types::Fixed(1), buf_addr, bytes)
             .offset(off)
-            .build()
-            .flags(squeue::Flags::FIXED_FILE),
+            .build(),
         libublk::sys::UBLK_IO_OP_WRITE => opcode::Write::new(types::Fixed(1), buf_addr, bytes)
             .offset(off)
-            .build()
-            .flags(squeue::Flags::FIXED_FILE),
+            .build(),
         _ => panic!(),
     }
 }
