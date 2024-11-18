@@ -240,7 +240,10 @@ mod integration {
         }
     }
 
-    fn __test_ublk_add_del_loop(bs: u32, aa: bool) {
+    fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, f: F)
+    where
+        F: Fn(i32, u32, usize),
+    {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024; // 1 MB
         let p = tmp_file.path();
@@ -258,9 +261,8 @@ mod integration {
         }
         let id = run_rublk_add_dev(cmd_line);
 
-        let ctrl = UblkCtrl::new_simple(id).unwrap();
-        read_ublk_disk(&ctrl);
-        check_block_size(&ctrl, bs);
+        f(id, bs, file_size.try_into().unwrap());
+
         run_rublk_del_dev(id);
     }
     #[test]
@@ -268,8 +270,15 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_loop(4096, false);
-        __test_ublk_add_del_loop(4096, true);
+
+        let tf = |id: i32, bs: u32, _file_size: usize| {
+            let ctrl = UblkCtrl::new_simple(id).unwrap();
+            read_ublk_disk(&ctrl);
+            check_block_size(&ctrl, bs);
+        };
+
+        __test_ublk_add_del_loop(4096, false, tf);
+        __test_ublk_add_del_loop(4096, true, tf);
     }
 
     fn __test_ublk_null_read_only(cmds: &[&str], exp_ro: bool) {
@@ -288,7 +297,10 @@ mod integration {
         __test_ublk_null_read_only(&["add", "null", "--foreground"], false);
     }
 
-    fn __test_ublk_add_del_qcow2(bs: u32) {
+    fn __test_ublk_add_del_qcow2<F>(bs: u32, f: F)
+    where
+        F: Fn(i32, u32, usize),
+    {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024;
         let p = tmp_file.path();
@@ -311,11 +323,8 @@ mod integration {
             .to_vec(),
         );
 
-        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        f(id, bs, file_size);
 
-        read_ublk_disk(&ctrl);
-        write_ublk_disk(&ctrl, bs, file_size);
-        check_block_size(&ctrl, bs);
         run_rublk_del_dev(id);
     }
     #[test]
@@ -323,6 +332,12 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_qcow2(4096);
+        __test_ublk_add_del_qcow2(4096, |id, bs, file_size| {
+            let ctrl = UblkCtrl::new_simple(id).unwrap();
+
+            read_ublk_disk(&ctrl);
+            write_ublk_disk(&ctrl, bs, file_size);
+            check_block_size(&ctrl, bs);
+        });
     }
 }
