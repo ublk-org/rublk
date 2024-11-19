@@ -65,6 +65,10 @@ RUBLK=$1
 BLKTESTS_TOP=$2
 TMPF=`mktemp`
 
+[ ! -f ${RUBLK} ] && echo "rublk binary doesn't exist"
+[ ! -d ${BLKTESTS_TOP} ] && echo "blktests dir doesn't exist"
+set -x
+
 modprobe ublk_drv
 $RUBLK del -a
 
@@ -82,6 +86,5 @@ echo "TEST_DEVS=(${DEVL})" > $BLKTESTS_TOP/config
 
 unlink $TMPF
 
-set -x
 [ -f $BLKTESTS_TOP/zoned_config ] && cat $BLKTESTS_TOP/zoned_config
 cat $BLKTESTS_TOP/config
