@@ -57,6 +57,16 @@ impl DevIdComm {
 
         Ok(DevIdComm { efd: fd, dump })
     }
+
+    fn write_failure(&self) -> anyhow::Result<i32> {
+        let id = i64::MAX;
+        let bytes = id.to_le_bytes();
+
+        match nix::unistd::write(self.efd, &bytes) {
+            Ok(_) => Ok(0),
+            _ => Err(anyhow::anyhow!("fail to write failure to eventfd")),
+        }
+    }
     fn write_dev_id(&self, dev_id: u32) -> anyhow::Result<i32> {
         // Can't write 0 to eventfd file, otherwise the read() side may
         // not be waken up
@@ -76,7 +86,12 @@ impl DevIdComm {
         if bytes_read == 0 {
             return Err(anyhow::anyhow!("fail to read dev_id from eventfd"));
         }
-        return Ok((i64::from_le_bytes(buffer) - 1) as i32);
+        let ret = i64::from_le_bytes(buffer);
+        if ret == i64::MAX {
+            return Err(anyhow::anyhow!("Fail to start ublk daemon"));
+        }
+
+        return Ok((ret - 1) as i32);
     }
 
     pub(crate) fn send_dev_id(&self, id: u32) -> anyhow::Result<()> {
@@ -95,12 +110,13 @@ impl DevIdComm {
 }
 
 fn ublk_dump_dev(comm: &Arc<DevIdComm>) -> Result<i32, UblkError> {
-    let id = comm
-        .recieve_dev_id()
-        .expect("recieve dev_id from efd failed");
-
-    UblkCtrl::new_simple(id).unwrap().dump();
-    Ok(0)
+    match comm.recieve_dev_id() {
+        Ok(id) => {
+            UblkCtrl::new_simple(id).unwrap().dump();
+            Ok(0)
+        }
+        _ => Err(UblkError::InvalidVal),
+    }
 }
 
 pub(crate) fn ublk_file_size(f: &std::fs::File) -> anyhow::Result<(u64, u8, u8)> {
@@ -189,7 +205,13 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
             .stderr(daemonize::Stdio::keep());
 
         match daemonize.execute() {
-            daemonize::Outcome::Child(Ok(_)) => ublk_add_worker(opt, &comm),
+            daemonize::Outcome::Child(Ok(_)) => match ublk_add_worker(opt, &comm) {
+                Ok(res) => Ok(res),
+                Err(r) => {
+                    comm.write_failure().expect("fail to send failure");
+                    Err(r)
+                }
+            },
             daemonize::Outcome::Parent(Ok(_)) => ublk_dump_dev(&comm),
             _ => Err(UblkError::OtherError(-libc::EINVAL)),
         }
