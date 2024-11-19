@@ -6,6 +6,18 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    fn has_mkfs_btrfs() -> bool {
+        match Command::new("mkfs.btrfs")
+            .arg("--version") // Try running the binary with a harmless argument
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(res) => res.success(),
+            _ => false,
+        }
+    }
+
     fn support_ublk() -> bool {
         if !Path::new("/dev/ublk-control").exists() {
             eprintln!("ublk isn't supported or its module isn't loaded");
@@ -383,6 +395,42 @@ mod integration {
         __test_ublk_add_del_qcow2(4096, |id, _bs, _file_size| {
             let ctrl = UblkCtrl::new_simple(id).unwrap();
             format_and_mount(&ctrl);
+        });
+    }
+
+    #[test]
+    fn test_ublk_format_mount_zoned() {
+        if !support_ublk() {
+            return;
+        }
+
+        if !has_mkfs_btrfs() {
+            return;
+        }
+        __test_ublk_add_del_zoned(4096, |id, _bs, _file_size| {
+            let ctrl = UblkCtrl::new_simple(id).unwrap();
+            let bdev = ctrl.get_bdev_path();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+
+            let res = Command::new("mkfs.btrfs")
+                .args(["-O", "zoned", &bdev])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("Failed to execute mkfs.btrfs");
+            assert!(res.success());
+
+            let res = Command::new("mount")
+                .args([&bdev, &tmp_dir.path().to_string_lossy().to_string()])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("Failed to execute mount");
+            assert!(res.success());
+            let res = Command::new("umount")
+                .args([&tmp_dir.path().to_string_lossy().to_string()])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("Failed to execute umount");
+            assert!(res.success());
         });
     }
 }
