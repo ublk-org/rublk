@@ -34,7 +34,7 @@ build_ublk_dev_list()
 				let dev_id++
 		fi
 
-		truncate -s 1g $backing_file
+		truncate -s 128m $backing_file
 		dev_path=`add_ublk_dev $dev_id $rublk add loop -n $dev_id -q 2 -d 64 -f $backing_file`
 		if [ "$dev_path" != "error" ]; then
 				dev_list="$dev_path "$dev_list
