@@ -216,7 +216,10 @@ mod integration {
         }
     }
 
-    fn __test_ublk_add_del_zoned(bs: u32) {
+    fn __test_ublk_add_del_zoned<F>(bs: u32, tf: F)
+    where
+        F: Fn(i32, u32, usize),
+    {
         match UblkCtrl::get_features() {
             Some(f) => {
                 if (f & sys::UBLK_F_ZONED as u64) != 0 {
@@ -231,10 +234,7 @@ mod integration {
                         ]
                         .to_vec(),
                     );
-                    let ctrl = UblkCtrl::new_simple(id).unwrap();
-
-                    read_ublk_disk(&ctrl);
-                    check_block_size(&ctrl, bs);
+                    tf(id, bs, 4 << 20);
                     run_rublk_del_dev(id);
                 }
             }
@@ -250,8 +250,13 @@ mod integration {
         match UblkCtrl::get_features() {
             Some(f) => {
                 if f & (libublk::sys::UBLK_F_ZONED as u64) != 0 {
-                    __test_ublk_add_del_zoned(512);
-                    __test_ublk_add_del_zoned(4096);
+                    let tf = |id: i32, bs: u32, _file_size: usize| {
+                        let ctrl = UblkCtrl::new_simple(id).unwrap();
+                        read_ublk_disk(&ctrl);
+                        check_block_size(&ctrl, bs);
+                    };
+                    __test_ublk_add_del_zoned(512, tf);
+                    __test_ublk_add_del_zoned(4096, tf);
                 }
             }
             None => {}
