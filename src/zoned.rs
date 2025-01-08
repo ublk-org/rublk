@@ -40,7 +40,6 @@ struct TgtData {
     nr_zones_exp_open: u32,
     nr_zones_closed: u32,
     imp_close_zone_no: u32,
-    zones: Vec<Zone>,
 }
 
 #[derive(Debug)]
@@ -55,6 +54,7 @@ struct ZonedTgt {
     zone_max_active: u32,
     nr_zones: u32,
 
+    zones: Vec<RwLock<Zone>>,
     data: RwLock<TgtData>,
     _buf: IoBuf<u8>,
 }
@@ -68,12 +68,17 @@ impl ZonedTgt {
         let nr_zones = size / zone_size;
         let mut sector = 0;
 
-        let mut zones = Vec::<Zone>::with_capacity(nr_zones as usize);
-        unsafe {
-            zones.set_len(nr_zones as usize);
-        }
+        let mut zones: Vec<RwLock<Zone>> = (0..nr_zones as usize)
+            .map(|_x| {
+                RwLock::new(Zone {
+                    ..Default::default()
+                })
+            })
+            .collect();
 
-        for (idx, z) in zones.iter_mut().enumerate() {
+        for (idx, lz) in zones.iter_mut().enumerate() {
+            let mut z = lz.write().unwrap();
+
             z.capacity = zone_cap as u32;
             z.len = (zone_size >> 9) as u32;
 
@@ -100,16 +105,20 @@ impl ZonedTgt {
             zone_max_active: 0,
             nr_zones: nr_zones as u32,
             data: RwLock::new(TgtData {
-                zones,
                 ..Default::default()
             }),
             zone_nr_conv: conv_zones,
+            zones,
             _buf,
         }
     }
 
-    fn __close_zone(&self, data: &mut std::sync::RwLockWriteGuard<'_, TgtData>, zno: usize) -> i32 {
-        match data.zones[zno].cond {
+    fn __close_zone(
+        &self,
+        data: &mut std::sync::RwLockWriteGuard<'_, TgtData>,
+        z: &mut std::sync::RwLockWriteGuard<'_, Zone>,
+    ) -> i32 {
+        match z.cond {
             BLK_ZONE_COND_CLOSED => return 0,
             BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
             BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
@@ -118,10 +127,10 @@ impl ZonedTgt {
             _ => return -libc::EIO,
         }
 
-        if data.zones[zno].wp == data.zones[zno].start {
-            data.zones[zno].cond = BLK_ZONE_COND_EMPTY;
+        if z.wp == z.start {
+            z.cond = BLK_ZONE_COND_EMPTY;
         } else {
-            data.zones[zno].cond = BLK_ZONE_COND_CLOSED;
+            z.cond = BLK_ZONE_COND_CLOSED;
             data.nr_zones_closed += 1;
         }
 
@@ -140,6 +149,7 @@ impl ZonedTgt {
 
         for _ in self.zone_nr_conv..total {
             let _zno = zno as usize;
+            let mut z = self.zones[_zno].write().unwrap();
 
             zno += 1;
 
@@ -147,8 +157,8 @@ impl ZonedTgt {
                 zno = self.zone_nr_conv;
             }
 
-            if data.zones[_zno].cond == BLK_ZONE_COND_IMP_OPEN {
-                self.__close_zone(data, _zno);
+            if z.cond == BLK_ZONE_COND_IMP_OPEN {
+                self.__close_zone(data, &mut z);
                 data.imp_close_zone_no = zno;
                 return;
             }
@@ -214,13 +224,14 @@ impl ZonedTgt {
 
     fn zone_reset(&self, sector: u64) -> i32 {
         let zno = self.get_zone_no(sector) as usize;
+        let mut z = self.zones[zno].write().unwrap();
         let mut data = self.data.write().unwrap();
 
-        if data.zones[zno].r#type == BLK_ZONE_TYPE_CONVENTIONAL {
+        if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
         }
 
-        match data.zones[zno].cond {
+        match z.cond {
             BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return 0,
             BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
             BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
@@ -229,9 +240,9 @@ impl ZonedTgt {
             _ => return -libc::EINVAL,
         }
 
-        let start = data.zones[zno].start;
-        data.zones[zno].cond = BLK_ZONE_COND_EMPTY;
-        data.zones[zno].wp = start;
+        let start = z.start;
+        z.cond = BLK_ZONE_COND_EMPTY;
+        z.wp = start;
         //data.zones[zno].map.clear();
 
         self.discard_zone(&mut data, zno);
@@ -241,14 +252,15 @@ impl ZonedTgt {
 
     fn zone_open(&self, sector: u64) -> i32 {
         let zno = self.get_zone_no(sector) as usize;
+        let mut z = self.zones[zno].write().unwrap();
         let mut data = self.data.write().unwrap();
 
-        if data.zones[zno].r#type == BLK_ZONE_TYPE_CONVENTIONAL {
+        if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
         }
 
         //fixme: add zone check
-        match data.zones[zno].cond {
+        match z.cond {
             BLK_ZONE_COND_EXP_OPEN => {}
             BLK_ZONE_COND_EMPTY => {
                 let ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_EMPTY);
@@ -266,32 +278,34 @@ impl ZonedTgt {
             }
             _ => return -libc::EINVAL,
         }
-        data.zones[zno].cond = BLK_ZONE_COND_EXP_OPEN;
+        z.cond = BLK_ZONE_COND_EXP_OPEN;
         data.nr_zones_exp_open += 1;
         0
     }
 
     fn zone_close(&self, sector: u64) -> i32 {
         let zno = self.get_zone_no(sector) as usize;
+        let mut z = self.zones[zno].write().unwrap();
         let mut data = self.data.write().unwrap();
 
-        if data.zones[zno].r#type == BLK_ZONE_TYPE_CONVENTIONAL {
+        if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
         }
 
-        self.__close_zone(&mut data, zno)
+        self.__close_zone(&mut data, &mut z)
     }
 
     fn zone_finish(&self, sector: u64) -> i32 {
         let mut ret = 0;
         let zno = self.get_zone_no(sector) as usize;
+        let mut z = self.zones[zno].write().unwrap();
         let mut data = self.data.write().unwrap();
 
-        if data.zones[zno].r#type == BLK_ZONE_TYPE_CONVENTIONAL {
+        if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
         }
 
-        match data.zones[zno].cond {
+        match z.cond {
             // finish operation on full is not an error
             BLK_ZONE_COND_FULL => return ret,
             BLK_ZONE_COND_EMPTY => {
@@ -312,8 +326,8 @@ impl ZonedTgt {
             _ => ret = libc::EIO,
         }
 
-        data.zones[zno].cond = BLK_ZONE_COND_FULL;
-        data.zones[zno].wp = data.zones[zno].start + data.zones[zno].len as u64;
+        z.cond = BLK_ZONE_COND_FULL;
+        z.wp = z.start + z.len as u64;
 
         ret
     }
@@ -354,8 +368,7 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
     );
     for i in zno..(zno + zones as u64) {
         let zone = unsafe { &mut *(off as *mut libublk::sys::blk_zone) };
-        let data = tgt.data.read().unwrap();
-        let z = &data.zones[i as usize];
+        let z = tgt.zones[i as usize].read().unwrap();
 
         zone.capacity = z.capacity as u64;
         zone.len = z.len as u64;
@@ -392,8 +405,7 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
 
     {
         let zno = tgt.get_zone_no(iod.start_sector);
-        let data = tgt.data.read().unwrap();
-        let z = &data.zones[zno as usize];
+        let z = tgt.zones[zno as usize].read().unwrap();
 
         if z.cond == BLK_ZONE_COND_READONLY || z.cond == BLK_ZONE_COND_OFFLINE {
             return -libc::EPIPE;
@@ -411,9 +423,9 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
 
 async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_io_desc) -> i32 {
     let zno = tgt.get_zone_no(iod.start_sector) as usize;
-    let data = tgt.data.read().unwrap();
+    let z = tgt.zones[zno].read().unwrap();
 
-    let cond = data.zones[zno].cond;
+    let cond = z.cond;
     if cond == BLK_ZONE_COND_OFFLINE {
         return -libc::EIO;
     }
@@ -426,9 +438,9 @@ async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_
         iod.start_sector,
         iod.nr_sectors,
         zno,
-        data.zones[zno].cond,
-        data.zones[zno].start,
-        data.zones[zno].wp,
+        z.cond,
+        z.start,
+        z.wp,
     );
     unsafe {
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
@@ -488,10 +500,10 @@ async fn handle_write(
     append: bool,
 ) -> (u64, i32) {
     let zno = tgt.get_zone_no(iod.start_sector) as usize;
-    let mut data = tgt.data.write().unwrap();
+    let mut z = tgt.zones[zno].write().unwrap();
     let mut ret = -libc::EIO;
 
-    if data.zones[zno].r#type == BLK_ZONE_TYPE_CONVENTIONAL {
+    if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
         if append {
             return (u64::MAX, ret);
         }
@@ -502,23 +514,25 @@ async fn handle_write(
         );
     }
 
-    let cond = data.zones[zno].cond;
+    let cond = z.cond;
     if cond == BLK_ZONE_COND_FULL || cond == BLK_ZONE_COND_READONLY || cond == BLK_ZONE_COND_OFFLINE
     {
         return (u64::MAX, ret);
     }
 
-    let sector = data.zones[zno].wp;
+    let sector = z.wp;
     if !append && iod.start_sector != sector {
         return (u64::MAX, ret);
     }
 
-    let zone_end = data.zones[zno].start + data.zones[zno].capacity as u64;
-    if data.zones[zno].wp + iod.nr_sectors as u64 > zone_end {
+    let zone_end = z.start + z.capacity as u64;
+    if z.wp + iod.nr_sectors as u64 > zone_end {
         return (u64::MAX, ret);
     }
 
     if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
+        let mut data = tgt.data.write().unwrap();
+
         ret = tgt.check_zone_resources(&mut data, cond);
         if ret != 0 {
             return (u64::MAX, ret);
@@ -532,7 +546,7 @@ async fn handle_write(
         }
 
         if cond != BLK_ZONE_COND_EXP_OPEN {
-            data.zones[zno].cond = BLK_ZONE_COND_IMP_OPEN;
+            z.cond = BLK_ZONE_COND_IMP_OPEN;
         }
     }
 
@@ -542,17 +556,17 @@ async fn handle_write(
     //    .insert((iod.start_sector, iod.nr_sectors), offset);
 
     ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await;
-    data.zones[zno].wp += iod.nr_sectors as u64;
+    z.wp += iod.nr_sectors as u64;
 
-    if data.zones[zno].wp == zone_end {
-        let cond = data.zones[zno].cond;
+    if z.wp == zone_end {
+        let mut data = tgt.data.write().unwrap();
 
-        if cond == BLK_ZONE_COND_EXP_OPEN {
+        if z.cond == BLK_ZONE_COND_EXP_OPEN {
             data.nr_zones_exp_open -= 1;
-        } else if cond == BLK_ZONE_COND_IMP_OPEN {
+        } else if z.cond == BLK_ZONE_COND_IMP_OPEN {
             data.nr_zones_imp_open -= 1;
         }
-        data.zones[zno].cond = BLK_ZONE_COND_FULL;
+        z.cond = BLK_ZONE_COND_FULL;
     }
     trace!(
         "write done(append {:1} lba {:06x}-{:04}), zone: no {:4} cond {:4} start/wp {:06x}/{:06x} end {:06x} sector {:06x} sects {:03x}",
@@ -560,9 +574,9 @@ async fn handle_write(
         iod.start_sector,
         iod.nr_sectors,
         zno,
-        data.zones[zno].cond,
-        data.zones[zno].start,
-        data.zones[zno].wp,
+        z.cond,
+        z.start,
+        z.wp,
         zone_end, sector, ret >> 9,
     );
 
