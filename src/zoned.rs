@@ -113,6 +113,40 @@ impl ZonedTgt {
         }
     }
 
+    #[inline(always)]
+    fn get_zone_no(&self, sector: u64) -> u32 {
+        let zsects = (self.zone_size >> 9) as u32;
+
+        (sector / (zsects as u64)) as u32
+    }
+
+    #[inline(always)]
+    fn get_zone_meta(&self, zno: u32) -> (libublk::sys::blk_zone_cond, u64, u32, u64) {
+        let z = self.zones[zno as usize].read().unwrap();
+
+        (z.cond, z.start, z.len, z.wp)
+    }
+
+    #[inline(always)]
+    fn get_imp_close_zone_no(&self) -> u32 {
+        let data = self.data.read().unwrap();
+
+        data.imp_close_zone_no
+    }
+
+    #[inline(always)]
+    fn set_imp_close_zone_no(&self, zno: u32) {
+        let mut data = self.data.write().unwrap();
+        data.imp_close_zone_no = zno;
+    }
+
+    #[inline(always)]
+    fn get_open_zones(&self) -> (u32, u32) {
+        let data = self.data.read().unwrap();
+
+        (data.nr_zones_exp_open, data.nr_zones_imp_open)
+    }
+
     fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> i32 {
         match z.cond {
             BLK_ZONE_COND_CLOSED => return 0,
@@ -138,20 +172,7 @@ impl ZonedTgt {
             data.nr_zones_closed += 1;
         }
 
-        //data.zones[zno].map.clear();
-
         0
-    }
-
-    fn get_imp_close_zone_no(&self) -> u32 {
-        let data = self.data.read().unwrap();
-
-        data.imp_close_zone_no
-    }
-
-    fn set_imp_close_zone_no(&self, zno: u32) {
-        let mut data = self.data.write().unwrap();
-        data.imp_close_zone_no = zno;
     }
 
     fn close_imp_open_zone(&self) {
@@ -195,12 +216,6 @@ impl ZonedTgt {
         -libc::EBUSY
     }
 
-    fn get_open_zones(&self) -> (u32, u32) {
-        let data = self.data.read().unwrap();
-
-        (data.nr_zones_exp_open, data.nr_zones_imp_open)
-    }
-
     fn check_open(&self) -> i32 {
         if self.zone_max_open == 0 {
             return 0;
@@ -233,13 +248,6 @@ impl ZonedTgt {
             BLK_ZONE_COND_CLOSED => self.check_open(),
             _ => -libc::EIO,
         }
-    }
-
-    #[inline(always)]
-    fn get_zone_no(&self, sector: u64) -> u32 {
-        let zsects = (self.zone_size >> 9) as u32;
-
-        (sector / (zsects as u64)) as u32
     }
 
     fn zone_reset(&self, sector: u64) -> i32 {
@@ -459,10 +467,10 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
 }
 
 async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_io_desc) -> i32 {
-    let zno = tgt.get_zone_no(iod.start_sector) as usize;
-    let z = tgt.zones[zno].read().unwrap();
+    let zno = tgt.get_zone_no(iod.start_sector);
+    let z = tgt.get_zone_meta(zno);
+    let cond = z.0;
 
-    let cond = z.cond;
     if cond == BLK_ZONE_COND_OFFLINE {
         return -libc::EIO;
     }
@@ -475,10 +483,11 @@ async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_
         iod.start_sector,
         iod.nr_sectors,
         zno,
-        z.cond,
-        z.start,
-        z.wp,
+        z.0,
+        z.1,
+        z.2,
     );
+
     unsafe {
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
         let mut addr = (tgt.start + off) as *mut libc::c_void;
