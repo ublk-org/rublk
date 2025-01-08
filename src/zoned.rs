@@ -4,7 +4,7 @@ use libublk::helpers::IoBuf;
 use libublk::sys::ublksrv_io_desc;
 use libublk::sys::{
     BLK_ZONE_COND_CLOSED, BLK_ZONE_COND_EMPTY, BLK_ZONE_COND_EXP_OPEN, BLK_ZONE_COND_FULL,
-    BLK_ZONE_COND_IMP_OPEN, BLK_ZONE_COND_OFFLINE, BLK_ZONE_COND_READONLY,
+    BLK_ZONE_COND_IMP_OPEN, BLK_ZONE_COND_NOT_WP, BLK_ZONE_COND_OFFLINE, BLK_ZONE_COND_READONLY,
 };
 use libublk::sys::{BLK_ZONE_TYPE_CONVENTIONAL, BLK_ZONE_TYPE_SEQWRITE_REQ};
 use libublk::sys::{
@@ -61,7 +61,7 @@ struct ZonedTgt {
 
 impl ZonedTgt {
     #[allow(clippy::uninit_vec)]
-    fn new(size: u64, zone_size: u64) -> ZonedTgt {
+    fn new(size: u64, zone_size: u64, conv_zones: u32) -> ZonedTgt {
         let _buf = IoBuf::<u8>::new(size as usize);
         let buf_addr = _buf.as_mut_ptr() as u64;
         let zone_cap = zone_size >> 9;
@@ -72,12 +72,19 @@ impl ZonedTgt {
         unsafe {
             zones.set_len(nr_zones as usize);
         }
-        for z in &mut zones {
+
+        for (idx, z) in zones.iter_mut().enumerate() {
             z.capacity = zone_cap as u32;
             z.len = (zone_size >> 9) as u32;
-            z.r#type = BLK_ZONE_TYPE_SEQWRITE_REQ;
+
+            if idx < conv_zones.try_into().unwrap() {
+                z.r#type = BLK_ZONE_TYPE_CONVENTIONAL;
+                z.cond = BLK_ZONE_COND_NOT_WP;
+            } else {
+                z.r#type = BLK_ZONE_TYPE_SEQWRITE_REQ;
+                z.cond = BLK_ZONE_COND_EMPTY;
+            }
             z.start = sector;
-            z.cond = BLK_ZONE_COND_EMPTY;
 
             z.wp = sector;
             //z.map = BTreeMap::new();
@@ -96,7 +103,7 @@ impl ZonedTgt {
                 zones,
                 ..Default::default()
             }),
-            zone_nr_conv: 0,
+            zone_nr_conv: conv_zones,
             _buf,
         }
     }
@@ -622,6 +629,10 @@ pub(crate) struct ZonedAddArgs {
     ///zone size, unit is megabytes(MB)
     #[clap(long, default_value_t = 256)]
     zone_size: u32,
+
+    /// How many conventioanl zones starting from sector 0
+    #[clap(long, default_value_t = 2)]
+    conv_zones: u32,
 }
 
 pub(crate) fn ublk_add_zoned(
@@ -630,7 +641,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (size, zone_size) = match opt {
+    let (size, zone_size, conv_zones) = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
                 return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
@@ -639,7 +650,11 @@ pub(crate) fn ublk_add_zoned(
             if o.path.is_some() {
                 return Err(anyhow::anyhow!("only support ramdisk now\n"));
             } else {
-                ((o.size << 20) as u64, (o.zone_size << 20) as u64)
+                (
+                    ((o.size as u64) << 20),
+                    ((o.zone_size as u64) << 20),
+                    o.conv_zones,
+                )
             }
         }
         None => return Err(anyhow::anyhow!("invalid parameter")),
@@ -647,6 +662,10 @@ pub(crate) fn ublk_add_zoned(
 
     if size < zone_size {
         return Err(anyhow::anyhow!("size is less than zone size\n"));
+    }
+
+    if u64::from((conv_zones as u64) * zone_size) >= size {
+        return Err(anyhow::anyhow!("Too many conventioanl zones"));
     }
 
     let tgt_init = |dev: &mut UblkDev| {
@@ -668,7 +687,7 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size));
+    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, conv_zones));
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
