@@ -409,7 +409,7 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
     }
 }
 
-fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -> i32 {
+async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_io_desc) -> i32 {
     let zno = tgt.get_zone_no(iod.start_sector) as usize;
     let data = tgt.data.read().unwrap();
 
@@ -449,9 +449,9 @@ fn handle_read(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -
     }
 }
 
-fn handle_plain_write(
+async fn handle_plain_write(
     tgt: &ZonedTgt,
-    q: &UblkQueue,
+    q: &UblkQueue<'_>,
     tag: u16,
     start_sector: u64,
     nr_sectors: u32,
@@ -471,9 +471,18 @@ fn handle_plain_write(
     }
 }
 
-fn handle_write(
+fn handle_flush(
+    _tgt: &ZonedTgt,
+    _q: &UblkQueue<'_>,
+    _tag: u16,
+    _iod: &libublk::sys::ublksrv_io_desc,
+) -> i32 {
+    return 0;
+}
+
+async fn handle_write(
     tgt: &ZonedTgt,
-    q: &UblkQueue,
+    q: &UblkQueue<'_>,
     tag: u16,
     iod: &libublk::sys::ublksrv_io_desc,
     append: bool,
@@ -489,7 +498,7 @@ fn handle_write(
 
         return (
             u64::MAX,
-            handle_plain_write(tgt, q, tag, iod.start_sector, iod.nr_sectors),
+            handle_plain_write(tgt, q, tag, iod.start_sector, iod.nr_sectors).await,
         );
     }
 
@@ -532,7 +541,7 @@ fn handle_write(
     //    .map
     //    .insert((iod.start_sector, iod.nr_sectors), offset);
 
-    ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors);
+    ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await;
     data.zones[zno].wp += iod.nr_sectors as u64;
 
     if data.zones[zno].wp == zone_end {
@@ -576,15 +585,15 @@ async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u
     );
 
     match op {
-        UBLK_IO_OP_FLUSH => bytes = 0,
+        UBLK_IO_OP_FLUSH => bytes = handle_flush(tgt, q, tag, iod),
         UBLK_IO_OP_READ => {
-            bytes = handle_read(tgt, q, tag, iod);
+            bytes = handle_read(tgt, q, tag, iod).await;
         }
         UBLK_IO_OP_WRITE => {
-            (_, bytes) = handle_write(tgt, q, tag, iod, false);
+            (_, bytes) = handle_write(tgt, q, tag, iod, false).await;
         }
         UBLK_IO_OP_ZONE_APPEND => {
-            (sector, bytes) = handle_write(tgt, q, tag, iod, true);
+            (sector, bytes) = handle_write(tgt, q, tag, iod, true).await;
         }
         UBLK_IO_OP_REPORT_ZONES => {
             bytes = handle_report_zones(tgt, q, tag, iod) as i32;
