@@ -542,12 +542,11 @@ async fn handle_write(
     iod: &libublk::sys::ublksrv_io_desc,
     append: bool,
 ) -> (u64, i32) {
-    let mut z = tgt.get_zone_mut(iod.start_sector);
-    let mut ret = -libc::EIO;
+    let zno = tgt.get_zone_no(iod.start_sector);
 
-    if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
+    if zno < tgt.zone_nr_conv {
         if append {
-            return (u64::MAX, ret);
+            return (u64::MAX, -libc::EIO);
         }
 
         return (
@@ -556,63 +555,76 @@ async fn handle_write(
         );
     }
 
-    let cond = z.cond;
-    if cond == BLK_ZONE_COND_FULL || cond == BLK_ZONE_COND_READONLY || cond == BLK_ZONE_COND_OFFLINE
-    {
-        return (u64::MAX, ret);
-    }
+    let (wp, zone_end, sector) = {
+        let mut z = tgt.get_zone_mut(iod.start_sector);
+        let mut ret = -libc::EIO;
 
-    let sector = z.wp;
-    if !append && iod.start_sector != sector {
-        return (u64::MAX, ret);
-    }
-
-    let zone_end = z.start + z.capacity as u64;
-    if z.wp + iod.nr_sectors as u64 > zone_end {
-        return (u64::MAX, ret);
-    }
-
-    if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
-        ret = tgt.check_zone_resources(cond);
-        if ret != 0 {
+        let cond = z.cond;
+        if cond == BLK_ZONE_COND_FULL
+            || cond == BLK_ZONE_COND_READONLY
+            || cond == BLK_ZONE_COND_OFFLINE
+        {
             return (u64::MAX, ret);
         }
 
-        let mut data = tgt.data.write().unwrap();
-        if cond == BLK_ZONE_COND_CLOSED {
-            data.nr_zones_closed -= 1;
-            data.nr_zones_imp_open += 1;
-        } else if cond == BLK_ZONE_COND_EMPTY {
-            data.nr_zones_imp_open += 1;
+        let sector = z.wp;
+        if !append && iod.start_sector != sector {
+            return (u64::MAX, ret);
         }
 
-        if cond != BLK_ZONE_COND_EXP_OPEN {
-            z.cond = BLK_ZONE_COND_IMP_OPEN;
+        let zone_end = z.start + z.capacity as u64;
+        if z.wp + iod.nr_sectors as u64 > zone_end {
+            return (u64::MAX, ret);
         }
-    }
 
-    ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await;
-    z.wp += iod.nr_sectors as u64;
+        if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
+            ret = tgt.check_zone_resources(cond);
+            if ret != 0 {
+                return (u64::MAX, ret);
+            }
 
-    if z.wp == zone_end {
-        let mut data = tgt.data.write().unwrap();
+            let mut data = tgt.data.write().unwrap();
+            if cond == BLK_ZONE_COND_CLOSED {
+                data.nr_zones_closed -= 1;
+                data.nr_zones_imp_open += 1;
+            } else if cond == BLK_ZONE_COND_EMPTY {
+                data.nr_zones_imp_open += 1;
+            }
 
-        if z.cond == BLK_ZONE_COND_EXP_OPEN {
-            data.nr_zones_exp_open -= 1;
-        } else if z.cond == BLK_ZONE_COND_IMP_OPEN {
-            data.nr_zones_imp_open -= 1;
+            if cond != BLK_ZONE_COND_EXP_OPEN {
+                z.cond = BLK_ZONE_COND_IMP_OPEN;
+            }
         }
-        z.cond = BLK_ZONE_COND_FULL;
+        z.wp += iod.nr_sectors as u64;
+
+        (z.wp, zone_end, sector)
+    };
+
+    let ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await;
+
+    if wp == zone_end {
+        let mut z = tgt.get_zone_mut(iod.start_sector);
+
+        if z.cond != BLK_ZONE_COND_FULL {
+            if z.cond == BLK_ZONE_COND_EXP_OPEN {
+                let mut data = tgt.data.write().unwrap();
+
+                data.nr_zones_exp_open -= 1;
+            } else if z.cond == BLK_ZONE_COND_IMP_OPEN {
+                let mut data = tgt.data.write().unwrap();
+
+                data.nr_zones_imp_open -= 1;
+            }
+            z.cond = BLK_ZONE_COND_FULL;
+        }
     }
     trace!(
-        "write done(append {:1} lba {:06x}-{:04}), zone: no {:4} cond {:4} start/wp {:06x}/{:06x} end {:06x} sector {:06x} sects {:03x}",
+        "write done(append {:1} lba {:06x}-{:04}), zone: no {:4} wp {:06x} end {:06x} sector {:06x} sects {:03x}",
         append,
         iod.start_sector,
         iod.nr_sectors,
         tgt.get_zone_no(iod.start_sector),
-        z.cond,
-        z.start,
-        z.wp,
+        wp,
         zone_end, sector, ret >> 9,
     );
 
