@@ -113,15 +113,17 @@ impl ZonedTgt {
         }
     }
 
-    fn __close_zone(
-        &self,
-        data: &mut std::sync::RwLockWriteGuard<'_, TgtData>,
-        z: &mut std::sync::RwLockWriteGuard<'_, Zone>,
-    ) -> i32 {
+    fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> i32 {
         match z.cond {
             BLK_ZONE_COND_CLOSED => return 0,
-            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
-            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
+            BLK_ZONE_COND_IMP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_imp_open -= 1;
+            }
+            BLK_ZONE_COND_EXP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_exp_open -= 1;
+            }
             //case BLK_ZONE_COND_EMPTY:
             //case BLK_ZONE_COND_FULL:
             _ => return -libc::EIO,
@@ -131,6 +133,8 @@ impl ZonedTgt {
             z.cond = BLK_ZONE_COND_EMPTY;
         } else {
             z.cond = BLK_ZONE_COND_CLOSED;
+
+            let mut data = self.data.write().unwrap();
             data.nr_zones_closed += 1;
         }
 
@@ -139,8 +143,19 @@ impl ZonedTgt {
         0
     }
 
-    fn close_imp_open_zone(&self, data: &mut std::sync::RwLockWriteGuard<'_, TgtData>) {
-        let mut zno = data.imp_close_zone_no;
+    fn get_imp_close_zone_no(&self) -> u32 {
+        let data = self.data.read().unwrap();
+
+        data.imp_close_zone_no
+    }
+
+    fn set_imp_close_zone_no(&self, zno: u32) {
+        let mut data = self.data.write().unwrap();
+        data.imp_close_zone_no = zno;
+    }
+
+    fn close_imp_open_zone(&self) {
+        let mut zno = self.get_imp_close_zone_no();
         if zno >= self.nr_zones {
             zno = self.zone_nr_conv;
         }
@@ -158,18 +173,19 @@ impl ZonedTgt {
             }
 
             if z.cond == BLK_ZONE_COND_IMP_OPEN {
-                self.__close_zone(data, &mut z);
-                data.imp_close_zone_no = zno;
+                self.__close_zone(&mut z);
+                self.set_imp_close_zone_no(zno);
                 return;
             }
         }
     }
 
-    fn check_active(&self, data: &std::sync::RwLockWriteGuard<'_, TgtData>) -> i32 {
+    fn check_active(&self) -> i32 {
         if self.zone_max_active == 0 {
             return 0;
         }
 
+        let data = self.data.read().unwrap();
         if data.nr_zones_exp_open + data.nr_zones_imp_open + data.nr_zones_closed
             < self.zone_max_active
         {
@@ -179,38 +195,42 @@ impl ZonedTgt {
         -libc::EBUSY
     }
 
-    fn check_open(&self, data: &mut std::sync::RwLockWriteGuard<'_, TgtData>) -> i32 {
+    fn get_open_zones(&self) -> (u32, u32) {
+        let data = self.data.read().unwrap();
+
+        (data.nr_zones_exp_open, data.nr_zones_imp_open)
+    }
+
+    fn check_open(&self) -> i32 {
         if self.zone_max_open == 0 {
             return 0;
         }
 
-        if data.nr_zones_exp_open + data.nr_zones_imp_open < self.zone_max_open {
+        let (exp_open, imp_open) = self.get_open_zones();
+
+        if exp_open + imp_open < self.zone_max_open {
             return 0;
         }
 
-        if data.nr_zones_imp_open > 0 && self.check_active(data) == 0 {
-            self.close_imp_open_zone(data);
+        if imp_open > 0 && self.check_active() == 0 {
+            self.close_imp_open_zone();
             return 0;
         }
 
         -libc::EBUSY
     }
 
-    fn check_zone_resources(
-        &self,
-        data: &mut std::sync::RwLockWriteGuard<'_, TgtData>,
-        cond: libublk::sys::blk_zone_cond,
-    ) -> i32 {
+    fn check_zone_resources(&self, cond: libublk::sys::blk_zone_cond) -> i32 {
         match cond {
             BLK_ZONE_COND_EMPTY => {
-                let ret = self.check_active(data);
+                let ret = self.check_active();
                 if ret != 0 {
                     ret
                 } else {
-                    self.check_open(data)
+                    self.check_open()
                 }
             }
-            BLK_ZONE_COND_CLOSED => self.check_open(data),
+            BLK_ZONE_COND_CLOSED => self.check_open(),
             _ => -libc::EIO,
         }
     }
@@ -225,7 +245,6 @@ impl ZonedTgt {
     fn zone_reset(&self, sector: u64) -> i32 {
         let zno = self.get_zone_no(sector) as usize;
         let mut z = self.zones[zno].write().unwrap();
-        let mut data = self.data.write().unwrap();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -233,9 +252,18 @@ impl ZonedTgt {
 
         match z.cond {
             BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return 0,
-            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
-            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
-            BLK_ZONE_COND_CLOSED => data.nr_zones_closed -= 1,
+            BLK_ZONE_COND_IMP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_imp_open -= 1;
+            }
+            BLK_ZONE_COND_EXP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_exp_open -= 1;
+            }
+            BLK_ZONE_COND_CLOSED => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_closed -= 1;
+            }
             BLK_ZONE_COND_FULL => {}
             _ => return -libc::EINVAL,
         }
@@ -243,9 +271,8 @@ impl ZonedTgt {
         let start = z.start;
         z.cond = BLK_ZONE_COND_EMPTY;
         z.wp = start;
-        //data.zones[zno].map.clear();
 
-        self.discard_zone(&mut data, zno);
+        self.discard_zone(zno);
 
         0
     }
@@ -253,7 +280,6 @@ impl ZonedTgt {
     fn zone_open(&self, sector: u64) -> i32 {
         let zno = self.get_zone_no(sector) as usize;
         let mut z = self.zones[zno].write().unwrap();
-        let mut data = self.data.write().unwrap();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -263,22 +289,27 @@ impl ZonedTgt {
         match z.cond {
             BLK_ZONE_COND_EXP_OPEN => {}
             BLK_ZONE_COND_EMPTY => {
-                let ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_EMPTY);
+                let ret = self.check_zone_resources(BLK_ZONE_COND_EMPTY);
                 if ret != 0 {
                     return ret;
                 }
             }
-            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
+            BLK_ZONE_COND_IMP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_imp_open -= 1;
+            }
             BLK_ZONE_COND_CLOSED => {
-                let ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_CLOSED);
+                let ret = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
                 if ret != 0 {
                     return ret;
                 }
+                let mut data = self.data.write().unwrap();
                 data.nr_zones_closed -= 1;
             }
             _ => return -libc::EINVAL,
         }
         z.cond = BLK_ZONE_COND_EXP_OPEN;
+        let mut data = self.data.write().unwrap();
         data.nr_zones_exp_open += 1;
         0
     }
@@ -286,20 +317,18 @@ impl ZonedTgt {
     fn zone_close(&self, sector: u64) -> i32 {
         let zno = self.get_zone_no(sector) as usize;
         let mut z = self.zones[zno].write().unwrap();
-        let mut data = self.data.write().unwrap();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
         }
 
-        self.__close_zone(&mut data, &mut z)
+        self.__close_zone(&mut z)
     }
 
     fn zone_finish(&self, sector: u64) -> i32 {
         let mut ret = 0;
         let zno = self.get_zone_no(sector) as usize;
         let mut z = self.zones[zno].write().unwrap();
-        let mut data = self.data.write().unwrap();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -309,18 +338,26 @@ impl ZonedTgt {
             // finish operation on full is not an error
             BLK_ZONE_COND_FULL => return ret,
             BLK_ZONE_COND_EMPTY => {
-                ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_EMPTY);
+                ret = self.check_zone_resources(BLK_ZONE_COND_EMPTY);
                 if ret != 0 {
                     return ret;
                 }
             }
-            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
-            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
+            BLK_ZONE_COND_IMP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_imp_open -= 1;
+            }
+
+            BLK_ZONE_COND_EXP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_exp_open -= 1;
+            }
             BLK_ZONE_COND_CLOSED => {
-                ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_CLOSED);
+                ret = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
                 if ret != 0 {
                     return ret;
                 }
+                let mut data = self.data.write().unwrap();
                 data.nr_zones_closed -= 1;
             }
             _ => ret = libc::EIO,
@@ -332,7 +369,7 @@ impl ZonedTgt {
         ret
     }
 
-    fn discard_zone(&self, _data: &mut std::sync::RwLockWriteGuard<'_, TgtData>, zon: usize) {
+    fn discard_zone(&self, zon: usize) {
         unsafe {
             let off = zon as u64 * self.zone_size;
 
@@ -531,13 +568,12 @@ async fn handle_write(
     }
 
     if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
-        let mut data = tgt.data.write().unwrap();
-
-        ret = tgt.check_zone_resources(&mut data, cond);
+        ret = tgt.check_zone_resources(cond);
         if ret != 0 {
             return (u64::MAX, ret);
         }
 
+        let mut data = tgt.data.write().unwrap();
         if cond == BLK_ZONE_COND_CLOSED {
             data.nr_zones_closed -= 1;
             data.nr_zones_imp_open += 1;
