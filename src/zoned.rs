@@ -64,34 +64,27 @@ impl ZonedTgt {
         let buf_addr = _buf.as_mut_ptr() as u64;
         let zone_cap = zone_size >> 9;
         let nr_zones = size / zone_size;
-        let mut sector = 0;
 
-        let mut zones: Vec<RwLock<Zone>> = (0..nr_zones as usize)
-            .map(|_x| {
+        let zones: Vec<RwLock<Zone>> = (0..nr_zones as usize)
+            .map(|i| {
                 RwLock::new(Zone {
-                    ..Default::default()
+                    capacity: zone_cap as u32,
+                    len: (zone_size >> 9) as u32,
+                    r#type: if i < conv_zones.try_into().unwrap() {
+                        BLK_ZONE_TYPE_CONVENTIONAL
+                    } else {
+                        BLK_ZONE_TYPE_SEQWRITE_REQ
+                    },
+                    cond: if i < conv_zones.try_into().unwrap() {
+                        BLK_ZONE_COND_NOT_WP
+                    } else {
+                        BLK_ZONE_COND_EMPTY
+                    },
+                    start: (i as u64) * (zone_size >> 9),
+                    wp: (i as u64) * (zone_size >> 9),
                 })
             })
             .collect();
-
-        for (idx, lz) in zones.iter_mut().enumerate() {
-            let mut z = lz.write().unwrap();
-
-            z.capacity = zone_cap as u32;
-            z.len = (zone_size >> 9) as u32;
-
-            if idx < conv_zones.try_into().unwrap() {
-                z.r#type = BLK_ZONE_TYPE_CONVENTIONAL;
-                z.cond = BLK_ZONE_COND_NOT_WP;
-            } else {
-                z.r#type = BLK_ZONE_TYPE_SEQWRITE_REQ;
-                z.cond = BLK_ZONE_COND_EMPTY;
-            }
-            z.start = sector;
-
-            z.wp = sector;
-            sector += zone_size >> 9;
-        }
 
         ZonedTgt {
             size,
