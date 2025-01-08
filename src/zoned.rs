@@ -17,7 +17,6 @@ use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 
 use log::trace;
 use std::path::PathBuf;
-//use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -31,7 +30,6 @@ struct Zone {
     capacity: u32,
 
     wp: u64,
-    //map: BTreeMap<(u64, u32), u32>,
 }
 
 #[derive(Debug, Default)]
@@ -92,7 +90,6 @@ impl ZonedTgt {
             z.start = sector;
 
             z.wp = sector;
-            //z.map = BTreeMap::new();
             sector += zone_size >> 9;
         }
 
@@ -118,6 +115,18 @@ impl ZonedTgt {
         let zsects = (self.zone_size >> 9) as u32;
 
         (sector / (zsects as u64)) as u32
+    }
+
+    #[inline(always)]
+    fn get_zone(&self, sector: u64) -> std::sync::RwLockReadGuard<'_, Zone> {
+        let zno = self.get_zone_no(sector) as usize;
+        self.zones[zno].read().unwrap()
+    }
+
+    #[inline(always)]
+    fn get_zone_mut(&self, sector: u64) -> std::sync::RwLockWriteGuard<'_, Zone> {
+        let zno = self.get_zone_no(sector) as usize;
+        self.zones[zno].write().unwrap()
     }
 
     #[inline(always)]
@@ -251,8 +260,7 @@ impl ZonedTgt {
     }
 
     fn zone_reset(&self, sector: u64) -> i32 {
-        let zno = self.get_zone_no(sector) as usize;
-        let mut z = self.zones[zno].write().unwrap();
+        let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -280,14 +288,13 @@ impl ZonedTgt {
         z.cond = BLK_ZONE_COND_EMPTY;
         z.wp = start;
 
-        self.discard_zone(zno);
+        self.discard_zone(self.get_zone_no(sector));
 
         0
     }
 
     fn zone_open(&self, sector: u64) -> i32 {
-        let zno = self.get_zone_no(sector) as usize;
-        let mut z = self.zones[zno].write().unwrap();
+        let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -323,8 +330,7 @@ impl ZonedTgt {
     }
 
     fn zone_close(&self, sector: u64) -> i32 {
-        let zno = self.get_zone_no(sector) as usize;
-        let mut z = self.zones[zno].write().unwrap();
+        let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -335,8 +341,7 @@ impl ZonedTgt {
 
     fn zone_finish(&self, sector: u64) -> i32 {
         let mut ret = 0;
-        let zno = self.get_zone_no(sector) as usize;
-        let mut z = self.zones[zno].write().unwrap();
+        let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
@@ -377,7 +382,7 @@ impl ZonedTgt {
         ret
     }
 
-    fn discard_zone(&self, zon: usize) {
+    fn discard_zone(&self, zon: u32) {
         unsafe {
             let off = zon as u64 * self.zone_size;
 
@@ -449,8 +454,7 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
     }
 
     {
-        let zno = tgt.get_zone_no(iod.start_sector);
-        let z = tgt.zones[zno as usize].read().unwrap();
+        let z = tgt.get_zone(iod.start_sector);
 
         if z.cond == BLK_ZONE_COND_READONLY || z.cond == BLK_ZONE_COND_OFFLINE {
             return -libc::EPIPE;
@@ -545,8 +549,7 @@ async fn handle_write(
     iod: &libublk::sys::ublksrv_io_desc,
     append: bool,
 ) -> (u64, i32) {
-    let zno = tgt.get_zone_no(iod.start_sector) as usize;
-    let mut z = tgt.zones[zno].write().unwrap();
+    let mut z = tgt.get_zone_mut(iod.start_sector);
     let mut ret = -libc::EIO;
 
     if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
@@ -595,11 +598,6 @@ async fn handle_write(
         }
     }
 
-    //let offset = (sector - data.zones[zno].start) as u32;
-    //data.zones[zno]
-    //    .map
-    //    .insert((iod.start_sector, iod.nr_sectors), offset);
-
     ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await;
     z.wp += iod.nr_sectors as u64;
 
@@ -618,7 +616,7 @@ async fn handle_write(
         append,
         iod.start_sector,
         iod.nr_sectors,
-        zno,
+        tgt.get_zone_no(iod.start_sector),
         z.cond,
         z.start,
         z.wp,
