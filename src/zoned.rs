@@ -189,9 +189,9 @@ impl ZonedTgt {
     fn check_zone_resources(
         &self,
         data: &mut std::sync::RwLockWriteGuard<'_, TgtData>,
-        zno: usize,
+        cond: libublk::sys::blk_zone_cond,
     ) -> i32 {
-        match data.zones[zno].cond {
+        match cond {
             BLK_ZONE_COND_EMPTY => {
                 let ret = self.check_active(data);
                 if ret != 0 {
@@ -251,14 +251,14 @@ impl ZonedTgt {
         match data.zones[zno].cond {
             BLK_ZONE_COND_EXP_OPEN => {}
             BLK_ZONE_COND_EMPTY => {
-                let ret = self.check_zone_resources(&mut data, zno);
+                let ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_EMPTY);
                 if ret != 0 {
                     return ret;
                 }
             }
             BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
             BLK_ZONE_COND_CLOSED => {
-                let ret = self.check_zone_resources(&mut data, zno);
+                let ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_CLOSED);
                 if ret != 0 {
                     return ret;
                 }
@@ -295,7 +295,7 @@ impl ZonedTgt {
             // finish operation on full is not an error
             BLK_ZONE_COND_FULL => return ret,
             BLK_ZONE_COND_EMPTY => {
-                ret = self.check_zone_resources(&mut data, zno);
+                ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_EMPTY);
                 if ret != 0 {
                     return ret;
                 }
@@ -303,7 +303,7 @@ impl ZonedTgt {
             BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
             BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
             BLK_ZONE_COND_CLOSED => {
-                ret = self.check_zone_resources(&mut data, zno);
+                ret = self.check_zone_resources(&mut data, BLK_ZONE_COND_CLOSED);
                 if ret != 0 {
                     return ret;
                 }
@@ -519,7 +519,7 @@ async fn handle_write(
     }
 
     if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
-        ret = tgt.check_zone_resources(&mut data, zno);
+        ret = tgt.check_zone_resources(&mut data, cond);
         if ret != 0 {
             return (u64::MAX, ret);
         }
