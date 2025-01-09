@@ -389,18 +389,16 @@ pub(crate) fn ublk_add_qcow2(
     ctrl_in: UblkCtrl,
     opt: Option<Qcow2Args>,
     comm_arc: &Arc<crate::DevIdComm>,
-) -> Result<i32, UblkError> {
+) -> anyhow::Result<i32> {
     let dev_id = ctrl_in.dev_info().dev_id;
     let ctrl = Rc::new(ctrl_in);
 
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
-        eprintln!("qcow2 doesn't support USER_COPY yet");
-        return Err(UblkError::InvalidVal);
+        return Err(anyhow::anyhow!("qcow2 doesn't support USER_COPY yet"));
     }
 
     if ctrl.dev_info().nr_hw_queues != 1 {
-        eprintln!("qcow2 doesn't support MQ yet");
-        return Err(UblkError::InvalidVal);
+        return Err(anyhow::anyhow!("qcow2 doesn't support MQ yet"));
     }
 
     let (file, dio) = match opt {
@@ -412,10 +410,10 @@ pub(crate) fn ublk_add_qcow2(
 
                 match tgt_data {
                     Ok(t) => (PathBuf::from(t.back_file_path.as_str()), t.direct_io != 0),
-                    Err(_) => return Err(UblkError::InvalidVal),
+                    Err(_) => return Err(anyhow::anyhow!("invalid json data")),
                 }
             }
-            None => return Err(UblkError::InvalidVal),
+            None => return Err(anyhow::anyhow!("no json data")),
         },
     };
 

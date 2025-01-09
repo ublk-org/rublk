@@ -3,7 +3,7 @@ use libublk::{
     helpers::IoBuf,
     io::{UblkDev, UblkIOCtx, UblkQueue},
     uring_async::ublk_wait_and_handle_ios,
-    UblkError, UblkIORes,
+    UblkIORes,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -93,13 +93,13 @@ pub(crate) fn ublk_add_null(
     ctrl: UblkCtrl,
     opt: Option<NullAddArgs>,
     comm_arc: &Arc<crate::DevIdComm>,
-) -> Result<i32, UblkError> {
+) -> anyhow::Result<i32> {
     let size = 250_u64 << 30;
     let flags = ctrl.dev_info().flags;
     let user_copy = (flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
 
     if flags & libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64 != 0 {
-        return Err(UblkError::InvalidVal);
+        return Err(anyhow::anyhow!("null doesn't support unprivileged"));
     }
 
     let tgt_init = |dev: &mut UblkDev| {

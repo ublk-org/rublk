@@ -13,7 +13,7 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_RESET, UBLK_IO_OP_ZONE_RESET_ALL,
 };
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError};
+use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 
 use log::trace;
 use std::path::PathBuf;
@@ -628,28 +628,25 @@ pub(crate) fn ublk_add_zoned(
     ctrl: UblkCtrl,
     opt: Option<ZonedAddArgs>,
     comm_arc: &Arc<crate::DevIdComm>,
-) -> Result<i32, UblkError> {
+) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (size, zone_size) = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
-                eprintln!("zoned(ramdisk) can't support recovery\n");
-                return Err(UblkError::OtherError(-libc::EINVAL));
+                return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
             }
 
             if o.path.is_some() {
-                eprintln!("only support ramdisk now with 'None' path\n");
-                return Err(UblkError::OtherError(-libc::EINVAL));
+                return Err(anyhow::anyhow!("only support ramdisk now\n"));
             } else {
                 ((o.size << 20) as u64, (o.zone_size << 20) as u64)
             }
         }
-        None => return Err(UblkError::OtherError(-libc::EINVAL)),
+        None => return Err(anyhow::anyhow!("invalid parameter")),
     };
 
     if size < zone_size {
-        eprintln!("size is less than zone size\n");
-        return Err(UblkError::OtherError(-libc::EINVAL));
+        return Err(anyhow::anyhow!("size is less than zone size\n"));
     }
 
     let tgt_init = |dev: &mut UblkDev| {
@@ -677,14 +674,10 @@ pub(crate) fn ublk_add_zoned(
     match ctrl.get_driver_features() {
         Some(f) => {
             if (f & (libublk::sys::UBLK_F_ZONED as u64)) == 0 {
-                eprintln!("ublk zoned feature isn't supported, needs v6.6 kernel");
-                return Err(UblkError::OtherError(-libc::EINVAL));
+                return Err(anyhow::anyhow!("zoned isn't supported until v6.6 kernel"));
             }
         }
-        _ => {
-            eprintln!("ublk zoned feature isn't supported, needs v6.6 kernel");
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
+        _ => return Err(anyhow::anyhow!("zoned isn't supported until v6.6 kernel")),
     }
 
     let q_handler = move |qid: u16, dev: &UblkDev| {

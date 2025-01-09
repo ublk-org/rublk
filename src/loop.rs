@@ -218,7 +218,7 @@ pub(crate) fn ublk_add_loop(
     ctrl: UblkCtrl,
     opt: Option<LoopArgs>,
     comm_rc: &Arc<crate::DevIdComm>,
-) -> Result<i32, UblkError> {
+) -> anyhow::Result<i32> {
     let (file, dio, ro, aa) = match opt {
         Some(ref o) => (
             o.gen_arg.build_abs_path(o.file.clone()),
@@ -242,10 +242,10 @@ pub(crate) fn ublk_add_loop(
                             (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
                             t.async_await,
                         ),
-                        Err(_) => return Err(UblkError::OtherError(-libc::EINVAL)),
+                        Err(_) => return Err(anyhow::anyhow!("wrong json data")),
                     }
                 }
-                None => return Err(UblkError::OtherError(-libc::EINVAL)),
+                None => return Err(anyhow::anyhow!("not get json data")),
             }
         }
     };
@@ -262,9 +262,8 @@ pub(crate) fn ublk_add_loop(
         async_await: aa,
     };
 
-    //todo: USER_COPY should be the default option
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
-        return Err(UblkError::OtherError(-libc::EINVAL));
+        return Err(anyhow::anyhow!("loop doesn't support user copy"));
     }
 
     let comm = comm_rc.clone();

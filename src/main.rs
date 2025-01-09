@@ -1,7 +1,7 @@
 use args::{AddCommands, Commands};
 use clap::Parser;
 use ilog::IntLog;
-use libublk::{ctrl::UblkCtrl, UblkError, UblkFlags};
+use libublk::{ctrl::UblkCtrl, UblkFlags};
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -109,13 +109,13 @@ impl DevIdComm {
     }
 }
 
-fn ublk_dump_dev(comm: &Arc<DevIdComm>) -> Result<i32, UblkError> {
+fn ublk_dump_dev(comm: &Arc<DevIdComm>) -> anyhow::Result<i32> {
     match comm.recieve_dev_id() {
         Ok(id) => {
             UblkCtrl::new_simple(id).unwrap().dump();
             Ok(0)
         }
-        _ => Err(UblkError::InvalidVal),
+        _ => Err(anyhow::anyhow!("not recieved device id")),
     }
 }
 
@@ -154,7 +154,7 @@ pub(crate) fn ublk_file_size(f: &std::fs::File) -> anyhow::Result<(u64, u8, u8)>
 }
 
 /// Wait until control device state is updated to `state`
-fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Result<i32, UblkError> {
+fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> anyhow::Result<i32> {
     let mut count = 0;
     let unit = 100_u32;
     loop {
@@ -166,7 +166,7 @@ fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u32, timeout: u32) -> Resul
         }
         count += unit;
         if count >= timeout {
-            return Err(UblkError::OtherError(-libc::ETIME));
+            return Err(anyhow::anyhow!("timeout error"));
         }
     }
 }
@@ -180,7 +180,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
     }
 }
 
-fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> Result<i32, UblkError> {
+fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> anyhow::Result<i32> {
     let (tgt_type, gen_arg) = ublk_parse_add_args(&opt);
     let ctrl = gen_arg.new_ublk_ctrl(tgt_type, UblkFlags::UBLK_DEV_F_ADD_DEV)?;
 
@@ -192,7 +192,7 @@ fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> Result<i32,
     }
 }
 
-fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
+fn ublk_add(opt: args::AddCommands) -> anyhow::Result<i32> {
     let (_, gen_arg) = ublk_parse_add_args(&opt);
     let comm = Arc::new(DevIdComm::new(gen_arg.foreground).expect("Create eventfd failed"));
     gen_arg.save_start_dir();
@@ -213,24 +213,24 @@ fn ublk_add(opt: args::AddCommands) -> Result<i32, UblkError> {
                 }
             },
             daemonize::Outcome::Parent(Ok(_)) => ublk_dump_dev(&comm),
-            _ => Err(UblkError::OtherError(-libc::EINVAL)),
+            _ => Err(anyhow::anyhow!("daemonize execute failure")),
         }
     }
 }
 
-fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
+fn ublk_recover_work(opt: args::UblkArgs) -> anyhow::Result<i32> {
     if opt.number < 0 {
-        return Err(UblkError::OtherError(-libc::EINVAL));
+        return Err(anyhow::anyhow!("invalid device number"));
     }
 
     let ctrl = UblkCtrl::new_simple(opt.number)?;
 
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_RECOVERY as u64)) == 0 {
-        return Err(UblkError::OtherError(-libc::EOPNOTSUPP));
+        return Err(anyhow::anyhow!("not set user recovery flag"));
     }
 
     if ctrl.dev_info().state != libublk::sys::UBLK_S_DEV_QUIESCED as u16 {
-        return Err(UblkError::OtherError(-libc::EBUSY));
+        return Err(anyhow::anyhow!("device isn't quiesced"));
     }
 
     let comm = Arc::new(DevIdComm::new(false).expect("Create eventfd failed"));
@@ -256,14 +256,14 @@ fn ublk_recover_work(opt: args::UblkArgs) -> Result<i32, UblkError> {
     }
 }
 
-fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
+fn ublk_recover(opt: args::UblkArgs) -> anyhow::Result<i32> {
     let daemonize = daemonize::Daemonize::new()
         .stdout(daemonize::Stdio::keep())
         .stderr(daemonize::Stdio::keep());
 
     let id = opt.number;
     if id < 0 {
-        return Err(UblkError::OtherError(-libc::EINVAL));
+        return Err(anyhow::anyhow!("invalid device id"));
     }
 
     match daemonize.execute() {
@@ -277,7 +277,7 @@ fn ublk_recover(opt: args::UblkArgs) -> Result<i32, UblkError> {
             }
             Ok(0)
         }
-        _ => Err(UblkError::OtherError(-libc::EINVAL)),
+        _ => Err(anyhow::anyhow!("daemonize execute failed")),
     }
 }
 
@@ -295,7 +295,7 @@ const FEATURES_TABLE: [&str; NR_FEATURES] = [
 ];
 
 #[allow(clippy::needless_range_loop)]
-fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
+fn ublk_features(_opt: args::UblkFeaturesArgs) -> anyhow::Result<i32> {
     match UblkCtrl::get_features() {
         Some(f) => {
             println!("\t{:<22} {:#12x}", "UBLK FEATURES", f);
@@ -317,7 +317,7 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> Result<i32, UblkError> {
     Ok(0)
 }
 
-fn __ublk_del(id: i32) -> Result<i32, UblkError> {
+fn __ublk_del(id: i32) -> anyhow::Result<i32> {
     let ctrl = UblkCtrl::new_simple(id)?;
 
     let _ = ctrl.kill_dev();
@@ -330,7 +330,7 @@ fn __ublk_del(id: i32) -> Result<i32, UblkError> {
     Ok(0)
 }
 
-fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
+fn ublk_del(opt: args::DelArgs) -> anyhow::Result<i32> {
     log::trace!("ublk del {} {}", opt.number, opt.all);
 
     if !opt.all {
@@ -357,7 +357,7 @@ fn ublk_del(opt: args::DelArgs) -> Result<i32, UblkError> {
     Ok(0)
 }
 
-fn __ublk_list(id: i32) -> Result<i32, UblkError> {
+fn __ublk_list(id: i32) -> anyhow::Result<i32> {
     match UblkCtrl::new_simple(id) {
         Ok(ctrl) => {
             if ctrl.read_dev_info().is_ok() {
@@ -365,11 +365,11 @@ fn __ublk_list(id: i32) -> Result<i32, UblkError> {
             }
             Ok(0)
         }
-        _ => Err(UblkError::OtherError(-libc::ENODEV)),
+        _ => Err(anyhow::anyhow!("nodev failure")),
     }
 }
 
-fn ublk_list(opt: args::UblkArgs) -> Result<i32, UblkError> {
+fn ublk_list(opt: args::UblkArgs) -> anyhow::Result<i32> {
     if opt.number > 0 {
         let _ = __ublk_list(opt.number);
         return Ok(0);
