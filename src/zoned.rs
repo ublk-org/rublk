@@ -18,7 +18,8 @@ use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 use io_uring::{opcode, types};
 use libc::{c_void, memset, pread, pwrite};
 use log::trace;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -58,6 +59,11 @@ impl Zone {
     #[inline(always)]
     fn get_stat(&self) -> std::sync::RwLockReadGuard<'_, ZoneState> {
         self.stat.read().unwrap()
+    }
+
+    #[inline(always)]
+    fn get_cond(&self) -> libublk::sys::blk_zone_cond {
+        self.get_stat().cond
     }
 }
 
@@ -112,6 +118,19 @@ impl TgtCfg {
 
         Ok(tcfg)
     }
+    fn from_file(p: &PathBuf) -> anyhow::Result<Self> {
+        let first_line = BufReader::new(File::open(p)?).lines().next();
+        if let Some(Ok(l)) = first_line {
+            let n: Vec<u32> = l
+                .split_whitespace()
+                .map(|s| s.parse().expect("fail"))
+                .collect();
+            let base = p.parent().expect("no parent?").to_path_buf();
+            let c = TgtCfg::new(n[0], n[1], n[2], n[3], n[4], Some(base));
+            return Ok(c);
+        }
+        anyhow::bail!("faile to create TgtCfg from file")
+    }
 }
 
 #[derive(Debug)]
@@ -126,9 +145,55 @@ struct ZonedTgt {
 }
 
 impl ZonedTgt {
+    fn install_zone_files(&mut self, new_dev: bool) -> anyhow::Result<()> {
+        for i in 0..self.nr_zones as usize {
+            let path = self.back_file_path(i.try_into().unwrap())?;
+            let f = OpenOptions::new()
+                .create(new_dev)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            unsafe {
+                libc::fcntl(f.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
+            }
+            self.zfiles.push(f);
+        }
+        Ok(())
+    }
+
+    fn setup_zone_backing_file(&mut self, zno: u32) -> anyhow::Result<()> {
+        if zno < self.cfg.zone_nr_conv.try_into().unwrap() {
+            self.back_file_truncate(zno, self.cfg.zone_size)
+        } else {
+            self.back_file_truncate(zno, 0)
+        }
+    }
+
+    fn update_seq_zone(&mut self, zno: u32) -> anyhow::Result<()> {
+        let secs = self.back_file_size(zno)? >> 9;
+        let z = &self.zones[zno as usize];
+        let mut zs = z.get_stat_mut();
+
+        if secs > (z.capacity as u64) {
+            anyhow::bail!("zone file size {:?} is too big", secs);
+        }
+
+        if secs == 0 {
+            zs.cond = BLK_ZONE_COND_EMPTY;
+            zs.wp = z.start;
+        } else if secs == (z.capacity as u64) {
+            zs.cond = BLK_ZONE_COND_FULL;
+            zs.wp = z.start + self.cfg.zone_size;
+        } else {
+            zs.cond = BLK_ZONE_COND_CLOSED;
+            zs.wp = z.start + secs;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::uninit_vec)]
-    fn new(cfg: TgtCfg) -> ZonedTgt {
-        let ram_backed = true;
+    fn new(cfg: TgtCfg, new_dev: bool) -> anyhow::Result<ZonedTgt> {
+        let ram_backed = cfg.base.is_none();
         let _buf = if ram_backed {
             Some(IoBuf::<u8>::new(cfg.size as usize))
         } else {
@@ -162,7 +227,7 @@ impl ZonedTgt {
             })
             .collect();
 
-        ZonedTgt {
+        let mut dev = ZonedTgt {
             start: buf_addr,
             nr_zones: nr_zones as u32,
             data: RwLock::new(TgtData {
@@ -172,7 +237,25 @@ impl ZonedTgt {
             _buf,
             zfiles: Vec::new(),
             cfg,
+        };
+
+        if !ram_backed {
+            dev.install_zone_files(new_dev)?;
+            for zno in 0..dev.nr_zones as usize {
+                if new_dev {
+                    dev.setup_zone_backing_file(zno as u32)?;
+                }
+                if zno >= dev.cfg.zone_nr_conv.try_into().unwrap() {
+                    dev.update_seq_zone(zno as u32)?;
+                    if dev.zones[zno].get_cond() == BLK_ZONE_COND_CLOSED {
+                        let mut data = dev.data.write().unwrap();
+                        data.nr_zones_closed += 1;
+                    }
+                }
+            }
         }
+
+        Ok(dev)
     }
 
     #[inline(always)]
@@ -194,29 +277,22 @@ impl ZonedTgt {
     #[inline(always)]
     fn get_zone_no(&self, sector: u64) -> u32 {
         let zsects = (self.cfg.zone_size >> 9) as u32;
-
         (sector / (zsects as u64)) as u32
     }
 
     #[inline(always)]
     fn get_zone(&self, sector: u64) -> &Zone {
-        let zno = self.get_zone_no(sector);
-
-        &self.zones[zno as usize]
+        &self.zones[self.get_zone_no(sector) as usize]
     }
 
     #[inline(always)]
     fn get_zone_cond(&self, sector: u64) -> libublk::sys::blk_zone_cond {
-        let z = self.get_zone(sector);
-        let zs = z.get_stat();
-
-        zs.cond
+        self.get_zone(sector).get_cond()
     }
 
     #[inline(always)]
     fn get_imp_close_zone_no(&self) -> u32 {
         let data = self.data.read().unwrap();
-
         data.imp_close_zone_no
     }
 
@@ -229,11 +305,9 @@ impl ZonedTgt {
     #[inline(always)]
     fn get_open_zones(&self) -> (u32, u32) {
         let data = self.data.read().unwrap();
-
         (data.nr_zones_exp_open, data.nr_zones_imp_open)
     }
 
-    #[allow(dead_code)]
     fn back_file_path(&self, zno: u32) -> anyhow::Result<PathBuf> {
         match self.cfg.base {
             Some(ref p) => {
@@ -250,7 +324,6 @@ impl ZonedTgt {
         }
     }
 
-    #[allow(dead_code)]
     fn back_file_size(&self, zno: u32) -> anyhow::Result<u64> {
         let fd = self.__get_zone_fd(zno as usize);
         let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -854,8 +927,11 @@ pub(crate) struct ZonedAddArgs {
     #[command(flatten)]
     pub gen_arg: super::args::GenAddArgs,
 
-    ///backing file of Zoned; So far, only None is allowed, and
-    ///support ramdisk only
+    ///work directory of file-backed Zoned, if `superblock` file exists,
+    ///parse parameters from this file and setup zoned; otherwise, create
+    ///it and store current parameters to this file
+    ///
+    /// Default: ram backed zoned
     #[clap(long, default_value = None)]
     path: Option<PathBuf>,
 
@@ -882,23 +958,49 @@ pub(crate) struct ZonedAddArgs {
     max_active_zones: u32,
 }
 
+fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
+    if zo.path.is_none() {
+        Ok((TgtCfg::from_argument(zo)?, true))
+    } else {
+        let path = zo.path.clone().ok_or(PathBuf::new()).expect("path failure");
+        let path = zo.gen_arg.build_abs_path(path);
+
+        if !path.exists() {
+            return Err(anyhow::anyhow!("base dir doesn't exist"));
+        }
+        let zf = path.join("superblock");
+        if zf.exists() {
+            Ok((TgtCfg::from_file(&zf)?, false))
+        } else {
+            //create superblock file with passed parameter
+            let cfg = TgtCfg::from_argument(zo)?;
+            let mut file = File::create(zf)?;
+            let zs = cfg.zone_size >> 20;
+            let s = cfg.size >> 20;
+
+            writeln!(
+                file,
+                "{} {} {} {} {}",
+                s, zs, zo.conv_zones, zo.max_open_zones, zo.max_active_zones
+            )?;
+            Ok((cfg, true))
+        }
+    }
+}
+
 pub(crate) fn ublk_add_zoned(
     ctrl: UblkCtrl,
     opt: Option<ZonedAddArgs>,
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let cfg = match opt {
+    let (cfg, is_new) = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
                 return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
             }
 
-            if o.path.is_some() {
-                return Err(anyhow::anyhow!("only support ramdisk now\n"));
-            } else {
-                TgtCfg::from_argument(o)?
-            }
+            parse_zone_params(o)?
         }
         None => return Err(anyhow::anyhow!("invalid parameter")),
     };
@@ -931,7 +1033,7 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(cfg));
+    let zoned_tgt = Arc::new(ZonedTgt::new(cfg, is_new)?);
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {

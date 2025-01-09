@@ -249,24 +249,33 @@ mod integration {
         }
     }
 
-    fn __test_ublk_add_del_zoned<F>(bs: u32, tf: F)
+    fn __test_ublk_add_del_zoned<F>(bs: u32, tf: F, dir: Option<&String>)
     where
         F: Fn(i32, u32, usize),
     {
         match UblkCtrl::get_features() {
             Some(f) => {
                 if (f & sys::UBLK_F_ZONED as u64) != 0 {
-                    let id = run_rublk_add_dev(
-                        [
-                            "add",
-                            "zoned",
-                            "--zone-size",
-                            "4",
-                            "--logical-block-size",
-                            &bs.to_string(),
-                        ]
-                        .to_vec(),
-                    );
+                    let bs_str = format!("{}", bs).to_string();
+                    let mut cmdline = [
+                        "add",
+                        "zoned",
+                        "--zone-size",
+                        "4",
+                        "--logical-block-size",
+                        &bs_str,
+                    ]
+                    .to_vec();
+
+                    match dir {
+                        Some(d) => {
+                            cmdline.push("--path");
+                            cmdline.push(d);
+                        }
+                        _ => {}
+                    };
+
+                    let id = run_rublk_add_dev(cmdline);
                     tf(id, bs, 4 << 20);
                     run_rublk_del_dev(id);
                 }
@@ -288,8 +297,8 @@ mod integration {
                         read_ublk_disk(&ctrl);
                         check_block_size(&ctrl, bs);
                     };
-                    __test_ublk_add_del_zoned(512, tf);
-                    __test_ublk_add_del_zoned(4096, tf);
+                    __test_ublk_add_del_zoned(512, tf, None);
+                    __test_ublk_add_del_zoned(4096, tf, None);
                 }
             }
             None => {}
@@ -428,14 +437,15 @@ mod integration {
         if !has_mkfs_btrfs() {
             return;
         }
-        __test_ublk_add_del_zoned(4096, |id, _bs, _file_size| {
+
+        let tf = |id: i32, _bs: u32, _file_size: usize| {
             let ctrl = UblkCtrl::new_simple(id).unwrap();
             let bdev = ctrl.get_bdev_path();
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let tmp_str = tmp_dir.path().to_string_lossy().to_string();
 
             let res = Command::new("mkfs.btrfs")
-                .args(["-O", "zoned", &bdev])
+                .args(["-O", "zoned", "-f", &bdev])
                 .stdout(std::process::Stdio::null())
                 .status()
                 .expect("Failed to execute mkfs.btrfs");
@@ -457,6 +467,14 @@ mod integration {
                 .status()
                 .expect("Failed to execute umount");
             assert!(res.success());
-        });
+        };
+
+        __test_ublk_add_del_zoned(4096, tf, None);
+
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+
+        __test_ublk_add_del_zoned(4096, tf, Some(&path_str));
+        __test_ublk_add_del_zoned(4096, tf, Some(&path_str));
     }
 }
