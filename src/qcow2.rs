@@ -275,17 +275,6 @@ fn qcow2_init_tgt<T: Qcow2IoOps>(
     Ok(())
 }
 
-fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
-    if p.is_absolute() {
-        p
-    } else {
-        match parent {
-            None => p,
-            Some(n) => n.join(p),
-        }
-    }
-}
-
 async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, tag: u16) {
     let qdev_q = &tgt.qdev;
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
@@ -415,11 +404,7 @@ pub(crate) fn ublk_add_qcow2(
     }
 
     let (file, dio) = match opt {
-        Some(ref o) => {
-            let parent = o.gen_arg.get_start_dir();
-
-            (to_absolute_path(o.file.clone(), parent), !o.buffered_io)
-        }
+        Some(ref o) => (o.gen_arg.build_abs_path(o.file.clone()), !o.buffered_io),
         None => match ctrl.get_target_data_from_json() {
             Some(val) => {
                 let lo = &val["qcow2"];

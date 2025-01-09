@@ -137,17 +137,6 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     Ok(())
 }
 
-fn to_absolute_path(p: PathBuf, parent: Option<PathBuf>) -> PathBuf {
-    if p.is_absolute() {
-        p
-    } else {
-        match parent {
-            None => p,
-            Some(n) => n.join(p),
-        }
-    }
-}
-
 fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
@@ -231,16 +220,12 @@ pub(crate) fn ublk_add_loop(
     comm_rc: &Arc<crate::DevIdComm>,
 ) -> Result<i32, UblkError> {
     let (file, dio, ro, aa) = match opt {
-        Some(ref o) => {
-            let parent = o.gen_arg.get_start_dir();
-
-            (
-                to_absolute_path(o.file.clone(), parent),
-                !o.buffered_io,
-                o.gen_arg.read_only,
-                o.async_await,
-            )
-        }
+        Some(ref o) => (
+            o.gen_arg.build_abs_path(o.file.clone()),
+            !o.buffered_io,
+            o.gen_arg.read_only,
+            o.async_await,
+        ),
         None => {
             let mut p: libublk::sys::ublk_params = Default::default();
             ctrl.get_params(&mut p)?;

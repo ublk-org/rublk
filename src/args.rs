@@ -4,6 +4,7 @@ use ilog::IntLog;
 use libublk::{ctrl::UblkCtrl, io::UblkDev, UblkFlags};
 use std::cell::RefCell;
 use std::io::{Error, ErrorKind};
+use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub(crate) struct GenAddArgs {
@@ -56,7 +57,7 @@ pub(crate) struct GenAddArgs {
     pub foreground: bool,
 
     #[clap(skip)]
-    start_dir: RefCell<Option<std::path::PathBuf>>,
+    start_dir: RefCell<Option<PathBuf>>,
 }
 
 impl GenAddArgs {
@@ -87,12 +88,24 @@ fn is_power2_of(input: u32, base: u32) -> bool {
 
 impl GenAddArgs {
     /// Return shared memory os id
-    pub fn get_start_dir(&self) -> Option<std::path::PathBuf> {
+    pub fn get_start_dir(&self) -> Option<PathBuf> {
         let dir = self.start_dir.borrow();
 
         (*dir).clone()
     }
 
+    pub fn build_abs_path(&self, p: PathBuf) -> PathBuf {
+        let parent = self.get_start_dir();
+
+        if p.is_absolute() {
+            p
+        } else {
+            match parent {
+                None => p,
+                Some(n) => n.join(p),
+            }
+        }
+    }
     pub fn save_start_dir(&self) {
         let start_dir = match std::env::current_dir() {
             Ok(p) => Some(p),
