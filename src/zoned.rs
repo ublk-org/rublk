@@ -15,7 +15,11 @@ use libublk::sys::{
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 
+use io_uring::{opcode, types};
+use libc::{c_void, memset, pread, pwrite};
 use log::trace;
+use std::fs::File;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -73,24 +77,38 @@ struct TgtCfg {
     zone_nr_conv: u32,
     zone_max_open: u32,
     zone_max_active: u32,
+    base: Option<PathBuf>,
 }
 
 impl TgtCfg {
-    fn new(s: u64, zs: u64, conv: u32, m_open: u32, m_act: u32) -> Self {
+    fn new(s: u32, zs: u32, conv: u32, m_open: u32, m_act: u32, b: Option<PathBuf>) -> Self {
         TgtCfg {
-            size: s,
-            zone_size: zs,
-            _zone_capacity: zs,
+            size: (s as u64) << 20,
+            zone_size: (zs as u64) << 20,
+            _zone_capacity: (zs as u64) << 20,
             zone_nr_conv: conv,
             zone_max_open: m_open,
             zone_max_active: m_act,
+            base: b,
         }
     }
     fn from_argument(a: &ZonedAddArgs) -> anyhow::Result<Self> {
+        let p = match a.path.clone() {
+            Some(p) => {
+                if p.is_absolute() {
+                    Some(p)
+                } else {
+                    Some(a.gen_arg.build_abs_path(p))
+                }
+            }
+            _ => None,
+        };
         let cfg = parse_size::Config::new().with_default_factor(1_048_576);
-        let s = cfg.parse_size(a.size.clone())?;
-        let zs = cfg.parse_size(a.zone_size.clone())?;
-        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, a.max_active_zones);
+        let s = (cfg.parse_size(a.size.clone())? >> 20).try_into().unwrap();
+        let zs = (cfg.parse_size(a.zone_size.clone())? >> 20)
+            .try_into()
+            .unwrap();
+        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, a.max_active_zones, p);
 
         Ok(tcfg)
     }
@@ -102,15 +120,24 @@ struct ZonedTgt {
     nr_zones: u32,
     zones: Vec<Zone>,
     data: RwLock<TgtData>,
-    _buf: IoBuf<u8>,
+    _buf: Option<IoBuf<u8>>,
+    zfiles: Vec<File>,
     cfg: TgtCfg,
 }
 
 impl ZonedTgt {
     #[allow(clippy::uninit_vec)]
     fn new(cfg: TgtCfg) -> ZonedTgt {
-        let _buf = IoBuf::<u8>::new(cfg.size as usize);
-        let buf_addr = _buf.as_mut_ptr() as u64;
+        let ram_backed = true;
+        let _buf = if ram_backed {
+            Some(IoBuf::<u8>::new(cfg.size as usize))
+        } else {
+            None
+        };
+        let buf_addr = match _buf {
+            None => 0,
+            Some(ref val) => val.as_mut_ptr() as u64,
+        };
         let zone_cap = cfg.zone_size >> 9;
         let nr_zones = cfg.size / cfg.zone_size;
 
@@ -143,8 +170,25 @@ impl ZonedTgt {
             }),
             zones,
             _buf,
+            zfiles: Vec::new(),
             cfg,
         }
+    }
+
+    #[inline(always)]
+    fn ram_backed(&self) -> bool {
+        self.cfg.base.is_none()
+    }
+
+    #[inline(always)]
+    fn __get_zone_fd(&self, zno: usize) -> i32 {
+        self.zfiles[zno].as_raw_fd()
+    }
+
+    #[inline(always)]
+    fn get_zone_fd(&self, sector: u64) -> i32 {
+        let zno = self.get_zone_no(sector) as usize;
+        self.__get_zone_fd(zno)
     }
 
     #[inline(always)]
@@ -187,6 +231,46 @@ impl ZonedTgt {
         let data = self.data.read().unwrap();
 
         (data.nr_zones_exp_open, data.nr_zones_imp_open)
+    }
+
+    #[allow(dead_code)]
+    fn back_file_path(&self, zno: u32) -> anyhow::Result<PathBuf> {
+        match self.cfg.base {
+            Some(ref p) => {
+                let mut path = p.clone();
+                let t = if zno < self.cfg.zone_nr_conv {
+                    "conv"
+                } else {
+                    "seq"
+                };
+                path = path.join(format!("{}-{:06}", t, zno));
+                Ok(PathBuf::from(path))
+            }
+            None => Err(anyhow::anyhow!("base dir doesn't exist")),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn back_file_size(&self, zno: u32) -> anyhow::Result<u64> {
+        let fd = self.__get_zone_fd(zno as usize);
+        let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::fstat(fd, &mut file_stat) };
+
+        if result < 0 {
+            Err(anyhow::anyhow!("fstat() failed"))
+        } else {
+            Ok(file_stat.st_size as u64)
+        }
+    }
+
+    fn back_file_truncate(&self, zno: u32, size: u64) -> anyhow::Result<()> {
+        let fd = self.__get_zone_fd(zno as usize);
+        let result = unsafe { libc::ftruncate(fd, size as libc::off_t) };
+        if result < 0 {
+            Err(anyhow::anyhow!("fruncate() failed size {}", size))
+        } else {
+            Ok(())
+        }
     }
 
     fn close_imp_open_zone(&self) -> anyhow::Result<()> {
@@ -292,7 +376,7 @@ impl ZonedTgt {
         zs.cond = BLK_ZONE_COND_EMPTY;
         zs.wp = start;
 
-        self.discard_zone(self.get_zone_no(sector));
+        self.discard_zone(self.get_zone_no(sector))?;
 
         Ok(0)
     }
@@ -406,20 +490,28 @@ impl ZonedTgt {
 
         zs.cond = BLK_ZONE_COND_FULL;
         zs.wp = z.start + z.len as u64;
+        if !self.ram_backed() {
+            self.back_file_truncate(self.get_zone_no(sector), self.cfg.zone_size)?;
+        }
 
         Ok(0)
     }
 
-    fn discard_zone(&self, zon: u32) {
-        unsafe {
-            let off = zon as u64 * self.cfg.zone_size;
+    fn discard_zone(&self, zon: u32) -> anyhow::Result<i32> {
+        if self.ram_backed() {
+            unsafe {
+                let off = zon as u64 * self.cfg.zone_size;
 
-            libc::madvise(
-                (self.start + off) as *mut libc::c_void,
-                self.cfg.zone_size.try_into().unwrap(),
-                libc::MADV_DONTNEED,
-            );
+                libc::madvise(
+                    (self.start + off) as *mut libc::c_void,
+                    self.cfg.zone_size.try_into().unwrap(),
+                    libc::MADV_DONTNEED,
+                );
+            }
+        } else {
+            self.back_file_truncate(zon, 0)?;
         }
+        Ok(0)
     }
 }
 
@@ -500,6 +592,33 @@ fn handle_mgmt(
     }
 }
 
+fn handle_read_copy(
+    fd: i32,
+    bytes: usize,
+    offset: u64,
+    addr: *mut c_void,
+    zero: bool,
+) -> anyhow::Result<i32> {
+    let res = unsafe {
+        // make sure data is zeroed for reset zone
+        if zero {
+            let buf = IoBuf::<u8>::new(bytes);
+            let mut _addr = buf.as_mut_ptr() as *mut c_void;
+
+            memset(_addr, 0, bytes);
+            pwrite(fd, _addr, bytes, offset.try_into().unwrap()) as i32
+        } else {
+            //write data to /dev/ublkcN from our ram directly
+            pwrite(fd, addr, bytes, offset.try_into().unwrap()) as i32
+        }
+    };
+    if res < 0 {
+        Err(anyhow::anyhow!("wrong pwrite to ublkc {}", res))
+    } else {
+        Ok(res)
+    }
+}
+
 async fn handle_read(
     tgt: &ZonedTgt,
     q: &UblkQueue<'_>,
@@ -512,30 +631,31 @@ async fn handle_read(
     }
 
     let bytes = (iod.nr_sectors << 9) as usize;
-    let off = iod.start_sector << 9;
+    let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
+    let fd = q.dev.tgt.fds[0];
 
-    let res = unsafe {
-        let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
-        let mut addr = (tgt.start + off) as *mut libc::c_void;
-        let fd = q.dev.tgt.fds[0];
+    if !tgt.ram_backed() {
+        let zfd = tgt.get_zone_fd(iod.start_sector);
+        let buf = IoBuf::<u8>::new(bytes);
+        let buf_addr = buf.as_mut_ptr() as *mut c_void;
+        let zf_offset = (iod.start_sector << 9) & (tgt.cfg.zone_size - 1);
 
-        // make sure data is zeroed for reset zone
-        if cond == BLK_ZONE_COND_EMPTY {
-            let buf = IoBuf::<u8>::new(bytes);
-            addr = buf.as_mut_ptr() as *mut libc::c_void;
-
-            libc::memset(addr, 0, bytes);
-            libc::pwrite(fd, addr, bytes, offset.try_into().unwrap()) as i32
-        } else {
-            //write data to /dev/ublkcN from our ram directly
-            libc::pwrite(fd, addr, bytes, offset.try_into().unwrap()) as i32
+        //read to temp buffer from backed-file
+        let sqe = opcode::Read::new(types::Fd(zfd), buf_addr as *mut u8, bytes as u32)
+            .offset(zf_offset)
+            .build();
+        let res = q.ublk_submit_sqe(sqe).await;
+        if res < 0 {
+            return Err(anyhow::anyhow!("io uring read failure {}", res));
         }
-    };
-
-    if res < 0 {
-        Err(anyhow::anyhow!("handle_read failure {}", res))
+        //write data from temp buffer to ublkc request
+        handle_read_copy(fd, bytes, offset, buf_addr, cond == BLK_ZONE_COND_EMPTY)
     } else {
-        Ok(res)
+        let off = iod.start_sector << 9;
+        let addr = (tgt.start + off) as *mut c_void;
+
+        //write data from ram-backed zoned buffer to ublkc request
+        handle_read_copy(fd, bytes, offset, addr, cond == BLK_ZONE_COND_EMPTY)
     }
 }
 
@@ -546,34 +666,60 @@ async fn handle_plain_write(
     start_sector: u64,
     nr_sectors: u32,
 ) -> anyhow::Result<i32> {
-    let off = start_sector << 9;
     let bytes = (nr_sectors << 9) as usize;
     let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
+    let fd = q.dev.tgt.fds[0];
 
-    let res = unsafe {
-        //read data from /dev/ublkcN to our ram directly
-        libc::pread(
-            q.dev.tgt.fds[0],
-            (tgt.start + off) as *mut libc::c_void,
-            bytes,
-            offset.try_into().unwrap(),
-        ) as i32
+    let res = if !tgt.ram_backed() {
+        let zfd = tgt.get_zone_fd(start_sector);
+        let buf = IoBuf::<u8>::new(bytes);
+        let buf_addr = buf.as_mut_ptr() as *mut c_void;
+        let zf_offset = (start_sector << 9) & (tgt.cfg.zone_size - 1);
+
+        // read data from ublk driver first
+        let res = unsafe { pread(fd, buf_addr, bytes, offset.try_into().unwrap()) };
+        if res < 0 {
+            return Err(anyhow::anyhow!("pread on ublkc failure {}", res));
+        }
+
+        // handle the write
+        let sqe = opcode::Write::new(types::Fd(zfd), buf_addr as *const u8, bytes as u32)
+            .offset(zf_offset)
+            .build();
+        q.ublk_submit_sqe(sqe).await
+    } else {
+        let off = start_sector << 9;
+        let addr = (tgt.start + off) as *mut c_void;
+
+        unsafe {
+            //read data from /dev/ublkcN to the zoned ramdisk
+            pread(fd, addr, bytes, offset.try_into().unwrap()) as i32
+        }
     };
 
     if res < 0 {
-        Err(anyhow::anyhow!("wrong pread on ublkc {}", res))
+        Err(anyhow::anyhow!("failure to handle plain write {}", res))
     } else {
         Ok(res)
     }
 }
 
 fn handle_flush(
-    _tgt: &ZonedTgt,
+    tgt: &ZonedTgt,
     _q: &UblkQueue<'_>,
     _tag: u16,
     _iod: &libublk::sys::ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
-    Ok(0)
+    let res = if !tgt.ram_backed() {
+        unsafe { libc::syncfs(tgt.__get_zone_fd(0)) }
+    } else {
+        0
+    };
+    if res < 0 {
+        Err(anyhow::anyhow!("fail to syncfs {}", res))
+    } else {
+        Ok(res)
+    }
 }
 
 async fn handle_write(
