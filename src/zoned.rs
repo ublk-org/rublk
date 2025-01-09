@@ -111,20 +111,22 @@ impl ZonedTgt {
     }
 
     #[inline(always)]
-    fn get_zone(&self, sector: u64) -> std::sync::RwLockReadGuard<'_, Zone> {
-        let zno = self.get_zone_no(sector) as usize;
-        self.zones[zno].read().unwrap()
-    }
-
-    #[inline(always)]
     fn get_zone_mut(&self, sector: u64) -> std::sync::RwLockWriteGuard<'_, Zone> {
         let zno = self.get_zone_no(sector) as usize;
         self.zones[zno].write().unwrap()
     }
 
     #[inline(always)]
-    fn get_zone_meta(&self, zno: u32) -> (libublk::sys::blk_zone_cond, u64, u32, u64) {
+    fn __get_zone_meta(&self, zno: u32) -> (libublk::sys::blk_zone_cond, u64, u32, u64) {
         let z = self.zones[zno as usize].read().unwrap();
+
+        (z.cond, z.start, z.len, z.wp)
+    }
+
+    #[inline(always)]
+    fn get_zone_meta(&self, sector: u64) -> (libublk::sys::blk_zone_cond, u64, u32, u64) {
+        let zno = self.get_zone_no(sector) as usize;
+        let z = self.zones[zno].read().unwrap();
 
         (z.cond, z.start, z.len, z.wp)
     }
@@ -399,16 +401,6 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
     let buf_addr = buf.as_mut_ptr();
     let mut off = buf_addr as u64;
 
-    trace!(
-        "start_sec {} nr_sectors {} zones {}-{} zone_size {} buf {:x}/{:x}",
-        iod.start_sector,
-        iod.nr_sectors,
-        zno,
-        zones,
-        tgt.zone_size,
-        buf_addr as u64,
-        off
-    );
     for i in zno..(zno + zones as u64) {
         let zone = unsafe { &mut *(off as *mut libublk::sys::blk_zone) };
         let z = tgt.zones[i as usize].read().unwrap();
@@ -446,12 +438,9 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
         return 0;
     }
 
-    {
-        let z = tgt.get_zone(iod.start_sector);
-
-        if z.cond == BLK_ZONE_COND_READONLY || z.cond == BLK_ZONE_COND_OFFLINE {
-            return -libc::EPIPE;
-        }
+    let (cond, _, _, _) = tgt.get_zone_meta(iod.start_sector);
+    if cond == BLK_ZONE_COND_READONLY || cond == BLK_ZONE_COND_OFFLINE {
+        return -libc::EPIPE;
     }
 
     match iod.op_flags & 0xff {
@@ -464,26 +453,13 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
 }
 
 async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_io_desc) -> i32 {
-    let zno = tgt.get_zone_no(iod.start_sector);
-    let z = tgt.get_zone_meta(zno);
-    let cond = z.0;
-
+    let (cond, _, _, _) = tgt.get_zone_meta(iod.start_sector);
     if cond == BLK_ZONE_COND_OFFLINE {
         return -libc::EIO;
     }
 
     let bytes = (iod.nr_sectors << 9) as usize;
     let off = iod.start_sector << 9;
-
-    trace!(
-        "read lba {:06x}-{:04}), zone: no {:4} cond {:4} start/wp {:06x}/{:06x}",
-        iod.start_sector,
-        iod.nr_sectors,
-        zno,
-        z.0,
-        z.1,
-        z.2,
-    );
 
     unsafe {
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
@@ -558,8 +534,8 @@ async fn handle_write(
     let (wp, zone_end, sector) = {
         let mut z = tgt.get_zone_mut(iod.start_sector);
         let mut ret = -libc::EIO;
-
         let cond = z.cond;
+
         if cond == BLK_ZONE_COND_FULL
             || cond == BLK_ZONE_COND_READONLY
             || cond == BLK_ZONE_COND_OFFLINE
@@ -618,16 +594,6 @@ async fn handle_write(
             z.cond = BLK_ZONE_COND_FULL;
         }
     }
-    trace!(
-        "write done(append {:1} lba {:06x}-{:04}), zone: no {:4} wp {:06x} end {:06x} sector {:06x} sects {:03x}",
-        append,
-        iod.start_sector,
-        iod.nr_sectors,
-        tgt.get_zone_no(iod.start_sector),
-        wp,
-        zone_end, sector, ret >> 9,
-    );
-
     (sector, ret)
 }
 
@@ -648,36 +614,27 @@ async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u
 
     match op {
         UBLK_IO_OP_FLUSH => bytes = handle_flush(tgt, q, tag, iod),
-        UBLK_IO_OP_READ => {
-            bytes = handle_read(tgt, q, tag, iod).await;
-        }
-        UBLK_IO_OP_WRITE => {
-            (_, bytes) = handle_write(tgt, q, tag, iod, false).await;
-        }
-        UBLK_IO_OP_ZONE_APPEND => {
-            (sector, bytes) = handle_write(tgt, q, tag, iod, true).await;
-        }
-        UBLK_IO_OP_REPORT_ZONES => {
-            bytes = handle_report_zones(tgt, q, tag, iod) as i32;
-        }
+        UBLK_IO_OP_READ => bytes = handle_read(tgt, q, tag, iod).await,
+        UBLK_IO_OP_WRITE => (_, bytes) = handle_write(tgt, q, tag, iod, false).await,
+        UBLK_IO_OP_ZONE_APPEND => (sector, bytes) = handle_write(tgt, q, tag, iod, true).await,
+        UBLK_IO_OP_REPORT_ZONES => bytes = handle_report_zones(tgt, q, tag, iod) as i32,
         UBLK_IO_OP_ZONE_RESET
         | UBLK_IO_OP_ZONE_RESET_ALL
         | UBLK_IO_OP_ZONE_OPEN
         | UBLK_IO_OP_ZONE_CLOSE
         | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, q, tag, iod),
-        _ => {
-            return (-libc::EINVAL, 0);
-        }
+        _ => return (-libc::EINVAL, 0),
     }
 
     trace!(
-        "<=tag {:3} ublk op {:2}, lba {:6x}-{:3} zno {} done {:4}",
+        "<=tag {:3} ublk op {:2}, lba {:6x}-{:3} zno {} done {:4} sector {}",
         tag,
         op,
         iod.start_sector,
         iod.nr_sectors,
         tgt.get_zone_no(iod.start_sector),
-        bytes >> 9
+        bytes >> 9,
+        sector
     );
 
     (bytes, sector)
