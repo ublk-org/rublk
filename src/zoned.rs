@@ -151,34 +151,6 @@ impl ZonedTgt {
         (data.nr_zones_exp_open, data.nr_zones_imp_open)
     }
 
-    fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> i32 {
-        match z.cond {
-            BLK_ZONE_COND_CLOSED => return 0,
-            BLK_ZONE_COND_IMP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_imp_open -= 1;
-            }
-            BLK_ZONE_COND_EXP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_exp_open -= 1;
-            }
-            //case BLK_ZONE_COND_EMPTY:
-            //case BLK_ZONE_COND_FULL:
-            _ => return -libc::EIO,
-        }
-
-        if z.wp == z.start {
-            z.cond = BLK_ZONE_COND_EMPTY;
-        } else {
-            z.cond = BLK_ZONE_COND_CLOSED;
-
-            let mut data = self.data.write().unwrap();
-            data.nr_zones_closed += 1;
-        }
-
-        0
-    }
-
     fn close_imp_open_zone(&self) {
         let mut zno = self.get_imp_close_zone_no();
         if zno >= self.nr_zones {
@@ -296,31 +268,66 @@ impl ZonedTgt {
         }
 
         //fixme: add zone check
-        match z.cond {
-            BLK_ZONE_COND_EXP_OPEN => {}
+        let res = match z.cond {
+            BLK_ZONE_COND_EXP_OPEN => return 0, //already open
             BLK_ZONE_COND_EMPTY => {
                 let ret = self.check_zone_resources(BLK_ZONE_COND_EMPTY);
-                if ret != 0 {
-                    return ret;
+                if ret == 0 {
+                    let mut data = self.data.write().unwrap();
+                    data.nr_zones_exp_open += 1;
                 }
+
+                ret
             }
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_imp_open -= 1;
+                data.nr_zones_exp_open += 1;
+                0
             }
             BLK_ZONE_COND_CLOSED => {
                 let ret = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
-                if ret != 0 {
-                    return ret;
+                if ret == 0 {
+                    let mut data = self.data.write().unwrap();
+                    data.nr_zones_closed -= 1;
+                    data.nr_zones_exp_open += 1;
                 }
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_closed -= 1;
+                ret
             }
-            _ => return -libc::EINVAL,
+            _ => -libc::EINVAL,
+        };
+
+        if res == 0 {
+            z.cond = BLK_ZONE_COND_EXP_OPEN;
         }
-        z.cond = BLK_ZONE_COND_EXP_OPEN;
-        let mut data = self.data.write().unwrap();
-        data.nr_zones_exp_open += 1;
+        res
+    }
+
+    fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> i32 {
+        match z.cond {
+            BLK_ZONE_COND_CLOSED => return 0,
+            BLK_ZONE_COND_IMP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_imp_open -= 1;
+            }
+            BLK_ZONE_COND_EXP_OPEN => {
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_exp_open -= 1;
+            }
+            //case BLK_ZONE_COND_EMPTY:
+            //case BLK_ZONE_COND_FULL:
+            _ => return -libc::EIO,
+        }
+
+        if z.wp == z.start {
+            z.cond = BLK_ZONE_COND_EMPTY;
+        } else {
+            z.cond = BLK_ZONE_COND_CLOSED;
+
+            let mut data = self.data.write().unwrap();
+            data.nr_zones_closed += 1;
+        }
+
         0
     }
 
@@ -335,44 +342,41 @@ impl ZonedTgt {
     }
 
     fn zone_finish(&self, sector: u64) -> i32 {
-        let mut ret = 0;
         let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return -libc::EPIPE;
         }
 
-        match z.cond {
+        let ret = match z.cond {
             // finish operation on full is not an error
-            BLK_ZONE_COND_FULL => return ret,
-            BLK_ZONE_COND_EMPTY => {
-                ret = self.check_zone_resources(BLK_ZONE_COND_EMPTY);
-                if ret != 0 {
-                    return ret;
-                }
-            }
+            BLK_ZONE_COND_FULL => 0,
+            BLK_ZONE_COND_EMPTY => self.check_zone_resources(BLK_ZONE_COND_EMPTY),
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_imp_open -= 1;
+                0
             }
-
             BLK_ZONE_COND_EXP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_exp_open -= 1;
+                0
             }
             BLK_ZONE_COND_CLOSED => {
-                ret = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
-                if ret != 0 {
-                    return ret;
+                let res = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
+                if res == 0 {
+                    let mut data = self.data.write().unwrap();
+                    data.nr_zones_closed -= 1;
                 }
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_closed -= 1;
+                res
             }
-            _ => ret = libc::EIO,
-        }
+            _ => -libc::EIO,
+        };
 
-        z.cond = BLK_ZONE_COND_FULL;
-        z.wp = z.start + z.len as u64;
+        if ret == 0 {
+            z.cond = BLK_ZONE_COND_FULL;
+            z.wp = z.start + z.len as u64;
+        }
 
         ret
     }
