@@ -151,7 +151,7 @@ impl ZonedTgt {
         (data.nr_zones_exp_open, data.nr_zones_imp_open)
     }
 
-    fn close_imp_open_zone(&self) {
+    fn close_imp_open_zone(&self) -> anyhow::Result<()> {
         let mut zno = self.get_imp_close_zone_no();
         if zno >= self.nr_zones {
             zno = self.zone_nr_conv;
@@ -170,71 +170,69 @@ impl ZonedTgt {
             }
 
             if z.cond == BLK_ZONE_COND_IMP_OPEN {
-                self.__close_zone(&mut z);
+                self.__close_zone(&mut z)?;
                 self.set_imp_close_zone_no(zno);
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
-    fn check_active(&self) -> i32 {
+    fn check_active(&self) -> anyhow::Result<i32> {
         if self.zone_max_active == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let data = self.data.read().unwrap();
         if data.nr_zones_exp_open + data.nr_zones_imp_open + data.nr_zones_closed
             < self.zone_max_active
         {
-            return 0;
+            return Ok(0);
         }
 
-        -libc::EBUSY
+        Err(anyhow::anyhow!("check active busy"))
     }
 
-    fn check_open(&self) -> i32 {
+    fn check_open(&self) -> anyhow::Result<i32> {
         if self.zone_max_open == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let (exp_open, imp_open) = self.get_open_zones();
 
         if exp_open + imp_open < self.zone_max_open {
-            return 0;
+            return Ok(0);
         }
 
-        if imp_open > 0 && self.check_active() == 0 {
-            self.close_imp_open_zone();
-            return 0;
+        if imp_open > 0 {
+            self.check_active()?;
+            self.close_imp_open_zone()?;
+            return Ok(0);
         }
 
-        -libc::EBUSY
+        Err(anyhow::anyhow!("check open busy"))
     }
 
-    fn check_zone_resources(&self, cond: libublk::sys::blk_zone_cond) -> i32 {
+    fn check_zone_resources(&self, cond: libublk::sys::blk_zone_cond) -> anyhow::Result<i32> {
         match cond {
             BLK_ZONE_COND_EMPTY => {
-                let ret = self.check_active();
-                if ret != 0 {
-                    ret
-                } else {
-                    self.check_open()
-                }
+                self.check_active()?;
+                self.check_open()
             }
             BLK_ZONE_COND_CLOSED => self.check_open(),
-            _ => -libc::EIO,
+            _ => Err(anyhow::anyhow!("check zone resource, wrong cond {}", cond)),
         }
     }
 
-    fn zone_reset(&self, sector: u64) -> i32 {
+    fn zone_reset(&self, sector: u64) -> anyhow::Result<i32> {
         let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
-            return -libc::EPIPE;
+            return Err(anyhow::anyhow!("reset conventional zone"));
         }
 
         match z.cond {
-            BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return 0,
+            BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return Ok(0),
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_imp_open -= 1;
@@ -248,7 +246,7 @@ impl ZonedTgt {
                 data.nr_zones_closed -= 1;
             }
             BLK_ZONE_COND_FULL => {}
-            _ => return -libc::EINVAL,
+            _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_reset", z.cond)),
         }
 
         let start = z.start;
@@ -257,55 +255,45 @@ impl ZonedTgt {
 
         self.discard_zone(self.get_zone_no(sector));
 
-        0
+        Ok(0)
     }
 
-    fn zone_open(&self, sector: u64) -> i32 {
+    fn zone_open(&self, sector: u64) -> anyhow::Result<i32> {
         let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
-            return -libc::EPIPE;
+            return Err(anyhow::anyhow!("open conventional zone"));
         }
 
         //fixme: add zone check
-        let res = match z.cond {
-            BLK_ZONE_COND_EXP_OPEN => return 0, //already open
+        match z.cond {
+            BLK_ZONE_COND_EXP_OPEN => return Ok(0), //already open
             BLK_ZONE_COND_EMPTY => {
-                let ret = self.check_zone_resources(BLK_ZONE_COND_EMPTY);
-                if ret == 0 {
-                    let mut data = self.data.write().unwrap();
-                    data.nr_zones_exp_open += 1;
-                }
-
-                ret
+                self.check_zone_resources(BLK_ZONE_COND_EMPTY)?;
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_exp_open += 1;
             }
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_imp_open -= 1;
                 data.nr_zones_exp_open += 1;
-                0
             }
             BLK_ZONE_COND_CLOSED => {
-                let ret = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
-                if ret == 0 {
-                    let mut data = self.data.write().unwrap();
-                    data.nr_zones_closed -= 1;
-                    data.nr_zones_exp_open += 1;
-                }
-                ret
+                self.check_zone_resources(BLK_ZONE_COND_CLOSED)?;
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_closed -= 1;
+                data.nr_zones_exp_open += 1;
             }
-            _ => -libc::EINVAL,
+            _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_open", z.cond)),
         };
 
-        if res == 0 {
-            z.cond = BLK_ZONE_COND_EXP_OPEN;
-        }
-        res
+        z.cond = BLK_ZONE_COND_EXP_OPEN;
+        Ok(0)
     }
 
-    fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> i32 {
+    fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> anyhow::Result<i32> {
         match z.cond {
-            BLK_ZONE_COND_CLOSED => return 0,
+            BLK_ZONE_COND_CLOSED => return Ok(0),
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_imp_open -= 1;
@@ -316,7 +304,7 @@ impl ZonedTgt {
             }
             //case BLK_ZONE_COND_EMPTY:
             //case BLK_ZONE_COND_FULL:
-            _ => return -libc::EIO,
+            _ => return Err(anyhow::anyhow!("bad zone cond {} in __close_zone", z.cond)),
         }
 
         if z.wp == z.start {
@@ -328,57 +316,52 @@ impl ZonedTgt {
             data.nr_zones_closed += 1;
         }
 
-        0
+        Ok(0)
     }
 
-    fn zone_close(&self, sector: u64) -> i32 {
+    fn zone_close(&self, sector: u64) -> anyhow::Result<i32> {
         let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
-            return -libc::EPIPE;
+            return Err(anyhow::anyhow!("close conventional zone"));
         }
 
         self.__close_zone(&mut z)
     }
 
-    fn zone_finish(&self, sector: u64) -> i32 {
+    fn zone_finish(&self, sector: u64) -> anyhow::Result<i32> {
         let mut z = self.get_zone_mut(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
-            return -libc::EPIPE;
+            return Err(anyhow::anyhow!("finish conventional zone"));
         }
 
-        let ret = match z.cond {
+        match z.cond {
             // finish operation on full is not an error
-            BLK_ZONE_COND_FULL => 0,
-            BLK_ZONE_COND_EMPTY => self.check_zone_resources(BLK_ZONE_COND_EMPTY),
+            BLK_ZONE_COND_FULL => {}
+            BLK_ZONE_COND_EMPTY => {
+                self.check_zone_resources(BLK_ZONE_COND_EMPTY)?;
+            }
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_imp_open -= 1;
-                0
             }
             BLK_ZONE_COND_EXP_OPEN => {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_exp_open -= 1;
-                0
             }
             BLK_ZONE_COND_CLOSED => {
-                let res = self.check_zone_resources(BLK_ZONE_COND_CLOSED);
-                if res == 0 {
-                    let mut data = self.data.write().unwrap();
-                    data.nr_zones_closed -= 1;
-                }
-                res
+                self.check_zone_resources(BLK_ZONE_COND_CLOSED)?;
+                let mut data = self.data.write().unwrap();
+                data.nr_zones_closed -= 1;
             }
-            _ => -libc::EIO,
+            _ => return Err(anyhow::anyhow!("bad zone cond {}", z.cond)),
         };
 
-        if ret == 0 {
-            z.cond = BLK_ZONE_COND_FULL;
-            z.wp = z.start + z.len as u64;
-        }
+        z.cond = BLK_ZONE_COND_FULL;
+        z.wp = z.start + z.len as u64;
 
-        ret
+        Ok(0)
     }
 
     fn discard_zone(&self, zon: u32) {
@@ -394,7 +377,12 @@ impl ZonedTgt {
     }
 }
 
-fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io_desc) -> isize {
+fn handle_report_zones(
+    tgt: &ZonedTgt,
+    q: &UblkQueue,
+    tag: u16,
+    iod: &ublksrv_io_desc,
+) -> anyhow::Result<i32> {
     let zsects = (tgt.zone_size >> 9) as u32;
     let zones = iod.nr_sectors; //union
     let zno = iod.start_sector / (zsects as u64);
@@ -420,7 +408,7 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
     }
 
     let dsize = off - buf_addr as u64;
-    unsafe {
+    let res = unsafe {
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
         libc::pwrite(
@@ -429,22 +417,33 @@ fn handle_report_zones(tgt: &ZonedTgt, q: &UblkQueue, tag: u16, iod: &ublksrv_io
             dsize.try_into().unwrap(),
             offset.try_into().unwrap(),
         )
+    };
+    if res < 0 {
+        Err(anyhow::anyhow!("pwrite on ublkc failure {}", res))
+    } else {
+        Ok(res as i32)
     }
 }
 
-fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc) -> i32 {
+fn handle_mgmt(
+    tgt: &ZonedTgt,
+    _q: &UblkQueue,
+    _tag: u16,
+    iod: &ublksrv_io_desc,
+) -> anyhow::Result<i32> {
     if (iod.op_flags & 0xff) == UBLK_IO_OP_ZONE_RESET_ALL {
         let mut off = 0;
         while off < tgt.size {
-            tgt.zone_reset(off >> 9);
+            tgt.zone_reset(off >> 9)?;
             off += tgt.zone_size;
         }
-        return 0;
+
+        return Ok(0);
     }
 
     let (cond, _, _, _) = tgt.get_zone_meta(iod.start_sector);
     if cond == BLK_ZONE_COND_READONLY || cond == BLK_ZONE_COND_OFFLINE {
-        return -libc::EPIPE;
+        return Err(anyhow::anyhow!("mgmt op on readonly or offline zone"));
     }
 
     match iod.op_flags & 0xff {
@@ -452,20 +451,25 @@ fn handle_mgmt(tgt: &ZonedTgt, _q: &UblkQueue, _tag: u16, iod: &ublksrv_io_desc)
         UBLK_IO_OP_ZONE_OPEN => tgt.zone_open(iod.start_sector),
         UBLK_IO_OP_ZONE_CLOSE => tgt.zone_close(iod.start_sector),
         UBLK_IO_OP_ZONE_FINISH => tgt.zone_finish(iod.start_sector),
-        _ => -libc::EINVAL,
+        _ => return Err(anyhow::anyhow!("unknow mgmt op")),
     }
 }
 
-async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_io_desc) -> i32 {
+async fn handle_read(
+    tgt: &ZonedTgt,
+    q: &UblkQueue<'_>,
+    tag: u16,
+    iod: &ublksrv_io_desc,
+) -> anyhow::Result<i32> {
     let (cond, _, _, _) = tgt.get_zone_meta(iod.start_sector);
     if cond == BLK_ZONE_COND_OFFLINE {
-        return -libc::EIO;
+        return Err(anyhow::anyhow!("read from offline zone"));
     }
 
     let bytes = (iod.nr_sectors << 9) as usize;
     let off = iod.start_sector << 9;
 
-    unsafe {
+    let res = unsafe {
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
         let mut addr = (tgt.start + off) as *mut libc::c_void;
         let fd = q.dev.tgt.fds[0];
@@ -481,6 +485,12 @@ async fn handle_read(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16, iod: &ublksrv_
             //write data to /dev/ublkcN from our ram directly
             libc::pwrite(fd, addr, bytes, offset.try_into().unwrap()) as i32
         }
+    };
+
+    if res < 0 {
+        Err(anyhow::anyhow!("handle_read failure {}", res))
+    } else {
+        Ok(res)
     }
 }
 
@@ -490,12 +500,12 @@ async fn handle_plain_write(
     tag: u16,
     start_sector: u64,
     nr_sectors: u32,
-) -> i32 {
+) -> anyhow::Result<i32> {
     let off = start_sector << 9;
     let bytes = (nr_sectors << 9) as usize;
     let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
-    unsafe {
+    let res = unsafe {
         //read data from /dev/ublkcN to our ram directly
         libc::pread(
             q.dev.tgt.fds[0],
@@ -503,6 +513,12 @@ async fn handle_plain_write(
             bytes,
             offset.try_into().unwrap(),
         ) as i32
+    };
+
+    if res < 0 {
+        Err(anyhow::anyhow!("wrong pread on ublkc {}", res))
+    } else {
+        Ok(res)
     }
 }
 
@@ -511,8 +527,8 @@ fn handle_flush(
     _q: &UblkQueue<'_>,
     _tag: u16,
     _iod: &libublk::sys::ublksrv_io_desc,
-) -> i32 {
-    return 0;
+) -> anyhow::Result<i32> {
+    Ok(0)
 }
 
 async fn handle_write(
@@ -521,47 +537,41 @@ async fn handle_write(
     tag: u16,
     iod: &libublk::sys::ublksrv_io_desc,
     append: bool,
-) -> (u64, i32) {
+) -> anyhow::Result<(u64, i32)> {
     let zno = tgt.get_zone_no(iod.start_sector);
 
     if zno < tgt.zone_nr_conv {
         if append {
-            return (u64::MAX, -libc::EIO);
+            return Err(anyhow::anyhow!("write append on conventional zone"));
         }
 
-        return (
-            u64::MAX,
-            handle_plain_write(tgt, q, tag, iod.start_sector, iod.nr_sectors).await,
-        );
+        let res = handle_plain_write(tgt, q, tag, iod.start_sector, iod.nr_sectors).await?;
+        return Ok((u64::MAX, res));
     }
 
     let (wp, zone_end, sector) = {
         let mut z = tgt.get_zone_mut(iod.start_sector);
-        let mut ret = -libc::EIO;
         let cond = z.cond;
 
         if cond == BLK_ZONE_COND_FULL
             || cond == BLK_ZONE_COND_READONLY
             || cond == BLK_ZONE_COND_OFFLINE
         {
-            return (u64::MAX, ret);
+            return Err(anyhow::anyhow!("write on full/ro/offline zone"));
         }
 
         let sector = z.wp;
         if !append && iod.start_sector != sector {
-            return (u64::MAX, ret);
+            return Err(anyhow::anyhow!("not write on write pointer"));
         }
 
         let zone_end = z.start + z.capacity as u64;
         if z.wp + iod.nr_sectors as u64 > zone_end {
-            return (u64::MAX, ret);
+            return Err(anyhow::anyhow!("write out of zone"));
         }
 
         if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
-            ret = tgt.check_zone_resources(cond);
-            if ret != 0 {
-                return (u64::MAX, ret);
-            }
+            tgt.check_zone_resources(cond)?;
 
             let mut data = tgt.data.write().unwrap();
             if cond == BLK_ZONE_COND_CLOSED {
@@ -580,8 +590,7 @@ async fn handle_write(
         (z.wp, zone_end, sector)
     };
 
-    let ret = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await;
-
+    let res = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await?;
     if wp == zone_end {
         let mut z = tgt.get_zone_mut(iod.start_sector);
 
@@ -598,10 +607,14 @@ async fn handle_write(
             z.cond = BLK_ZONE_COND_FULL;
         }
     }
-    (sector, ret)
+    Ok((sector, res))
 }
 
-async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u64) {
+async fn zoned_handle_io(
+    tgt: &ZonedTgt,
+    q: &UblkQueue<'_>,
+    tag: u16,
+) -> anyhow::Result<(i32, u64)> {
     let iod = q.get_iod(tag);
     let mut sector: u64 = 0;
     let bytes;
@@ -617,17 +630,17 @@ async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u
     );
 
     match op {
-        UBLK_IO_OP_FLUSH => bytes = handle_flush(tgt, q, tag, iod),
-        UBLK_IO_OP_READ => bytes = handle_read(tgt, q, tag, iod).await,
-        UBLK_IO_OP_WRITE => (_, bytes) = handle_write(tgt, q, tag, iod, false).await,
-        UBLK_IO_OP_ZONE_APPEND => (sector, bytes) = handle_write(tgt, q, tag, iod, true).await,
-        UBLK_IO_OP_REPORT_ZONES => bytes = handle_report_zones(tgt, q, tag, iod) as i32,
+        UBLK_IO_OP_FLUSH => bytes = handle_flush(tgt, q, tag, iod)?,
+        UBLK_IO_OP_READ => bytes = handle_read(tgt, q, tag, iod).await?,
+        UBLK_IO_OP_WRITE => (_, bytes) = handle_write(tgt, q, tag, iod, false).await?,
+        UBLK_IO_OP_ZONE_APPEND => (sector, bytes) = handle_write(tgt, q, tag, iod, true).await?,
+        UBLK_IO_OP_REPORT_ZONES => bytes = handle_report_zones(tgt, q, tag, iod)?,
         UBLK_IO_OP_ZONE_RESET
         | UBLK_IO_OP_ZONE_RESET_ALL
         | UBLK_IO_OP_ZONE_OPEN
         | UBLK_IO_OP_ZONE_CLOSE
-        | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, q, tag, iod),
-        _ => return (-libc::EINVAL, 0),
+        | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, q, tag, iod)?,
+        _ => return Err(anyhow::anyhow!("unknown ublk op")),
     }
 
     trace!(
@@ -641,7 +654,7 @@ async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue<'_>, tag: u16) -> (i32, u
         sector
     );
 
-    (bytes, sector)
+    Ok((bytes, sector))
 }
 
 #[derive(clap::Args, Debug)]
@@ -747,14 +760,24 @@ pub(crate) fn ublk_add_zoned(
                 let mut lba = 0_u64;
                 let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
                 let mut res = 0;
+
                 loop {
                     let cmd_res = q.submit_io_cmd(tag, cmd_op, lba as *mut u8, res).await;
                     if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                         break;
                     }
 
-                    (res, lba) = zoned_handle_io(&ztgt_io, &q, tag).await;
-                    cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                    match zoned_handle_io(&ztgt_io, &q, tag).await {
+                        Ok((r, l)) => {
+                            cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                            res = r;
+                            lba = l;
+                        }
+                        Err(e) => {
+                            eprintln!("handle io failre {:?}", e);
+                            break;
+                        }
+                    }
                 }
             }));
         }
