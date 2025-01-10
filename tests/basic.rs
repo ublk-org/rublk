@@ -60,6 +60,27 @@ mod integration {
         assert!(bs == exp_bs);
     }
 
+    fn dd_rw_file(dir: &String, write: bool, bs: u32, count: u32) {
+        let mut arg_list: Vec<String> = Vec::new();
+        let rw_file = if write {
+            format!("of={}/temp.img", &dir)
+        } else {
+            format!("if={}/temp.img", &dir)
+        };
+
+        arg_list.push(rw_file);
+        if write {
+            arg_list.push("if=/dev/zero".to_string());
+        } else {
+            arg_list.push("of=/dev/null".to_string());
+        }
+        arg_list.push(format!("bs={}", bs).to_string());
+        arg_list.push(format!("count={}", count).to_string());
+        let out = Command::new("dd").args(arg_list).output().unwrap();
+
+        assert!(out.status.success() == true);
+    }
+
     fn read_ublk_disk(ctrl: &UblkCtrl) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
@@ -411,6 +432,7 @@ mod integration {
             let ctrl = UblkCtrl::new_simple(id).unwrap();
             let bdev = ctrl.get_bdev_path();
             let tmp_dir = tempfile::TempDir::new().unwrap();
+            let tmp_str = tmp_dir.path().to_string_lossy().to_string();
 
             let res = Command::new("mkfs.btrfs")
                 .args(["-O", "zoned", &bdev])
@@ -420,13 +442,17 @@ mod integration {
             assert!(res.success());
 
             let res = Command::new("mount")
-                .args([&bdev, &tmp_dir.path().to_string_lossy().to_string()])
+                .args([&bdev, &tmp_str])
                 .stdout(std::process::Stdio::null())
                 .status()
                 .expect("Failed to execute mount");
             assert!(res.success());
+
+            dd_rw_file(&tmp_str, true, 8192, 16 * 1024);
+            dd_rw_file(&tmp_str, false, 8192, 16 * 1024);
+
             let res = Command::new("umount")
-                .args([&tmp_dir.path().to_string_lossy().to_string()])
+                .args([&tmp_str])
                 .stdout(std::process::Stdio::null())
                 .status()
                 .expect("Failed to execute umount");
