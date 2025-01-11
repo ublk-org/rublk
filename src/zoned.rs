@@ -42,7 +42,7 @@ struct TgtData {
 
 #[derive(Debug)]
 struct ZonedTgt {
-    size: u64,
+    _size: u64,
     start: u64,
 
     zone_size: u64,
@@ -87,7 +87,7 @@ impl ZonedTgt {
             .collect();
 
         ZonedTgt {
-            size,
+            _size: size,
             start: buf_addr,
             zone_size,
             _zone_capacity: zone_size,
@@ -373,8 +373,8 @@ impl ZonedTgt {
 
             libc::madvise(
                 (self.start + off) as *mut libc::c_void,
-                0,
-                self.zone_size as i32,
+                self.zone_size.try_into().unwrap(),
+                libc::MADV_DONTNEED,
             );
         }
     }
@@ -435,10 +435,8 @@ fn handle_mgmt(
     iod: &ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
     if (iod.op_flags & 0xff) == UBLK_IO_OP_ZONE_RESET_ALL {
-        let mut off = 0;
-        while off < tgt.size {
-            tgt.zone_reset(off >> 9)?;
-            off += tgt.zone_size;
+        for zno in tgt.zone_nr_conv..tgt.nr_zones {
+            tgt.zone_reset((zno as u64) * (tgt.zone_size >> 9))?;
         }
 
         return Ok(0);
@@ -708,8 +706,8 @@ pub(crate) fn ublk_add_zoned(
         None => return Err(anyhow::anyhow!("invalid parameter")),
     };
 
-    if size < zone_size {
-        return Err(anyhow::anyhow!("size is less than zone size\n"));
+    if size < zone_size || (size % zone_size) != 0 {
+        return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
     }
 
     if u64::from((conv_zones as u64) * zone_size) >= size {
