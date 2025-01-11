@@ -157,22 +157,25 @@ impl ZonedTgt {
             zno = self.zone_nr_conv;
         }
 
-        let total = self.zone_nr_conv + self.nr_zones;
-
-        for _ in self.zone_nr_conv..total {
+        for _ in self.zone_nr_conv..self.nr_zones {
             let _zno = zno as usize;
-            let mut z = self.zones[_zno].write().unwrap();
 
             zno += 1;
-
             if zno >= self.nr_zones {
                 zno = self.zone_nr_conv;
             }
 
-            if z.cond == BLK_ZONE_COND_IMP_OPEN {
-                self.__close_zone(&mut z)?;
-                self.set_imp_close_zone_no(zno);
-                return Ok(());
+            // the current zone may be locked already, so have
+            // to use try_lock
+            match self.zones[_zno].try_write() {
+                Ok(mut z) => {
+                    if z.cond == BLK_ZONE_COND_IMP_OPEN {
+                        self.__close_zone(&mut z)?;
+                        self.set_imp_close_zone_no(zno);
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
