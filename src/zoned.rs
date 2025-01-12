@@ -21,6 +21,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+#[derive(Debug, thiserror::Error)]
+enum ZIOError<'a> {
+    #[error("zone_max_open limit is reached in {0}")]
+    MaxOpenOverflow(&'a str),
+
+    #[error("zone_max_active limit is reached in {0}")]
+    MaxActiveOverflow(&'a str),
+}
+
 #[derive(Debug, Default)]
 struct ZoneState {
     cond: libublk::sys::blk_zone_cond,
@@ -75,7 +84,7 @@ struct ZonedTgt {
 
 impl ZonedTgt {
     #[allow(clippy::uninit_vec)]
-    fn new(size: u64, zone_size: u64, conv_zones: usize) -> ZonedTgt {
+    fn new(size: u64, zone_size: u64, conv_zones: usize, mo_zones: u32, ma_zones: u32) -> ZonedTgt {
         let _buf = IoBuf::<u8>::new(size as usize);
         let buf_addr = _buf.as_mut_ptr() as u64;
         let zone_cap = zone_size >> 9;
@@ -107,8 +116,8 @@ impl ZonedTgt {
             start: buf_addr,
             zone_size,
             _zone_capacity: zone_size,
-            zone_max_open: 0,
-            zone_max_active: 0,
+            zone_max_open: mo_zones,
+            zone_max_active: ma_zones,
             nr_zones: nr_zones as u32,
             data: RwLock::new(TgtData {
                 ..Default::default()
@@ -202,8 +211,7 @@ impl ZonedTgt {
         {
             return Ok(0);
         }
-
-        Err(anyhow::anyhow!("check active busy"))
+        anyhow::bail!(ZIOError::MaxActiveOverflow("check active busy"));
     }
 
     fn check_open(&self) -> anyhow::Result<i32> {
@@ -212,7 +220,6 @@ impl ZonedTgt {
         }
 
         let (exp_open, imp_open) = self.get_open_zones();
-
         if exp_open + imp_open < self.zone_max_open {
             return Ok(0);
         }
@@ -222,8 +229,7 @@ impl ZonedTgt {
             self.close_imp_open_zone()?;
             return Ok(0);
         }
-
-        Err(anyhow::anyhow!("check open busy"))
+        anyhow::bail!(ZIOError::MaxOpenOverflow("check open busy"));
     }
 
     fn check_zone_resources(&self, cond: libublk::sys::blk_zone_cond) -> anyhow::Result<i32> {
@@ -699,6 +705,14 @@ pub(crate) struct ZonedAddArgs {
     /// How many conventioanl zones starting from sector 0
     #[clap(long, default_value_t = 2)]
     conv_zones: u32,
+
+    /// Max open zones allowed
+    #[clap(long, default_value_t = 0)]
+    max_open_zones: u32,
+
+    /// Max active zones allowed
+    #[clap(long, default_value_t = 0)]
+    max_active_zones: u32,
 }
 
 pub(crate) fn ublk_add_zoned(
@@ -707,7 +721,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (size, zone_size, conv_zones) = match opt {
+    let (size, zone_size, conv_zones, mo_zones, ma_zones) = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
                 return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
@@ -720,6 +734,8 @@ pub(crate) fn ublk_add_zoned(
                     ((o.size as u64) << 20),
                     ((o.zone_size as u64) << 20),
                     o.conv_zones as usize,
+                    o.max_open_zones,
+                    o.max_active_zones,
                 )
             }
         }
@@ -739,8 +755,8 @@ pub(crate) fn ublk_add_zoned(
         dev.tgt.params.types |= libublk::sys::UBLK_PARAM_TYPE_ZONED;
         dev.tgt.params.basic.chunk_sectors = (zone_size >> 9) as u32;
         dev.tgt.params.zoned = libublk::sys::ublk_param_zoned {
-            max_open_zones: 0,
-            max_active_zones: 0,
+            max_open_zones: mo_zones,
+            max_active_zones: ma_zones,
             max_zone_append_sectors: (zone_size >> 9) as u32,
             ..Default::default()
         };
@@ -753,7 +769,9 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(size, zone_size, conv_zones));
+    let zoned_tgt = Arc::new(ZonedTgt::new(
+        size, zone_size, conv_zones, mo_zones, ma_zones,
+    ));
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
@@ -790,15 +808,23 @@ pub(crate) fn ublk_add_zoned(
 
                     match zoned_handle_io(&ztgt_io, &q, tag).await {
                         Ok((r, l)) => {
-                            cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                             res = r;
                             lba = l;
                         }
                         Err(e) => {
-                            eprintln!("handle io failre {:?}", e);
-                            break;
+                            lba = 0;
+                            if let Ok(ze) = e.downcast::<ZIOError>() {
+                                match ze {
+                                    ZIOError::MaxOpenOverflow(_) => res = -libc::ETOOMANYREFS,
+                                    ZIOError::MaxActiveOverflow(_) => res = -libc::EOVERFLOW,
+                                };
+                            } else {
+                                eprintln!("handle io failre");
+                                break;
+                            }
                         }
                     }
+                    cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                 }
             }));
         }
