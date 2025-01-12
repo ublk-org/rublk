@@ -65,44 +65,69 @@ struct TgtData {
     imp_close_zone_no: u32,
 }
 
-#[derive(Debug)]
-struct ZonedTgt {
-    _size: u64,
-    start: u64,
-
+#[derive(Debug, Default, Clone)]
+struct TgtCfg {
+    size: u64,
     zone_size: u64,
     _zone_capacity: u64,
     zone_nr_conv: u32,
     zone_max_open: u32,
     zone_max_active: u32,
-    nr_zones: u32,
+}
 
+impl TgtCfg {
+    fn new(s: u64, zs: u64, conv: u32, m_open: u32, m_act: u32) -> Self {
+        TgtCfg {
+            size: s,
+            zone_size: zs,
+            _zone_capacity: zs,
+            zone_nr_conv: conv,
+            zone_max_open: m_open,
+            zone_max_active: m_act,
+        }
+    }
+    fn from_argument(a: &ZonedAddArgs) -> Self {
+        Self::new(
+            (a.size as u64) << 20,
+            (a.zone_size as u64) << 20,
+            a.conv_zones,
+            a.max_open_zones,
+            a.max_active_zones,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ZonedTgt {
+    start: u64,
+    nr_zones: u32,
     zones: Vec<Zone>,
     data: RwLock<TgtData>,
     _buf: IoBuf<u8>,
+    cfg: TgtCfg,
 }
 
 impl ZonedTgt {
     #[allow(clippy::uninit_vec)]
-    fn new(size: u64, zone_size: u64, conv_zones: usize, mo_zones: u32, ma_zones: u32) -> ZonedTgt {
-        let _buf = IoBuf::<u8>::new(size as usize);
+    fn new(cfg: TgtCfg) -> ZonedTgt {
+        let _buf = IoBuf::<u8>::new(cfg.size as usize);
         let buf_addr = _buf.as_mut_ptr() as u64;
-        let zone_cap = zone_size >> 9;
-        let nr_zones = size / zone_size;
+        let zone_cap = cfg.zone_size >> 9;
+        let nr_zones = cfg.size / cfg.zone_size;
 
         let zones: Vec<Zone> = (0..nr_zones as usize)
             .map(|i| Zone {
                 capacity: zone_cap as u32,
-                len: (zone_size >> 9) as u32,
-                r#type: if i < conv_zones {
+                len: (cfg.zone_size >> 9) as u32,
+                r#type: if i < cfg.zone_nr_conv as usize {
                     BLK_ZONE_TYPE_CONVENTIONAL
                 } else {
                     BLK_ZONE_TYPE_SEQWRITE_REQ
                 },
-                start: (i as u64) * (zone_size >> 9),
+                start: (i as u64) * (cfg.zone_size >> 9),
                 stat: RwLock::new(ZoneState {
-                    wp: (i as u64) * (zone_size >> 9),
-                    cond: if i < conv_zones {
+                    wp: (i as u64) * (cfg.zone_size >> 9),
+                    cond: if i < cfg.zone_nr_conv as usize {
                         BLK_ZONE_COND_NOT_WP
                     } else {
                         BLK_ZONE_COND_EMPTY
@@ -112,25 +137,20 @@ impl ZonedTgt {
             .collect();
 
         ZonedTgt {
-            _size: size,
             start: buf_addr,
-            zone_size,
-            _zone_capacity: zone_size,
-            zone_max_open: mo_zones,
-            zone_max_active: ma_zones,
             nr_zones: nr_zones as u32,
             data: RwLock::new(TgtData {
                 ..Default::default()
             }),
-            zone_nr_conv: conv_zones.try_into().unwrap(),
             zones,
             _buf,
+            cfg,
         }
     }
 
     #[inline(always)]
     fn get_zone_no(&self, sector: u64) -> u32 {
-        let zsects = (self.zone_size >> 9) as u32;
+        let zsects = (self.cfg.zone_size >> 9) as u32;
 
         (sector / (zsects as u64)) as u32
     }
@@ -173,15 +193,15 @@ impl ZonedTgt {
     fn close_imp_open_zone(&self) -> anyhow::Result<()> {
         let mut zno = self.get_imp_close_zone_no();
         if zno >= self.nr_zones {
-            zno = self.zone_nr_conv;
+            zno = self.cfg.zone_nr_conv;
         }
 
-        for _ in self.zone_nr_conv..self.nr_zones {
+        for _ in self.cfg.zone_nr_conv..self.nr_zones {
             let z = &self.zones[zno as usize];
 
             zno += 1;
             if zno >= self.nr_zones {
-                zno = self.zone_nr_conv;
+                zno = self.cfg.zone_nr_conv;
             }
 
             // the current zone may be locked already, so have
@@ -201,13 +221,13 @@ impl ZonedTgt {
     }
 
     fn check_active(&self) -> anyhow::Result<i32> {
-        if self.zone_max_active == 0 {
+        if self.cfg.zone_max_active == 0 {
             return Ok(0);
         }
 
         let data = self.data.read().unwrap();
         if data.nr_zones_exp_open + data.nr_zones_imp_open + data.nr_zones_closed
-            < self.zone_max_active
+            < self.cfg.zone_max_active
         {
             return Ok(0);
         }
@@ -215,12 +235,12 @@ impl ZonedTgt {
     }
 
     fn check_open(&self) -> anyhow::Result<i32> {
-        if self.zone_max_open == 0 {
+        if self.cfg.zone_max_open == 0 {
             return Ok(0);
         }
 
         let (exp_open, imp_open) = self.get_open_zones();
-        if exp_open + imp_open < self.zone_max_open {
+        if exp_open + imp_open < self.cfg.zone_max_open {
             return Ok(0);
         }
 
@@ -393,11 +413,11 @@ impl ZonedTgt {
 
     fn discard_zone(&self, zon: u32) {
         unsafe {
-            let off = zon as u64 * self.zone_size;
+            let off = zon as u64 * self.cfg.zone_size;
 
             libc::madvise(
                 (self.start + off) as *mut libc::c_void,
-                self.zone_size.try_into().unwrap(),
+                self.cfg.zone_size.try_into().unwrap(),
                 libc::MADV_DONTNEED,
             );
         }
@@ -410,7 +430,7 @@ fn handle_report_zones(
     tag: u16,
     iod: &ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
-    let zsects = (tgt.zone_size >> 9) as u32;
+    let zsects = (tgt.cfg.zone_size >> 9) as u32;
     let zones = iod.nr_sectors; //union
     let zno = iod.start_sector / (zsects as u64);
     let blkz_sz = core::mem::size_of::<libublk::sys::blk_zone>() as u32;
@@ -460,8 +480,8 @@ fn handle_mgmt(
     iod: &ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
     if (iod.op_flags & 0xff) == UBLK_IO_OP_ZONE_RESET_ALL {
-        for zno in tgt.zone_nr_conv..tgt.nr_zones {
-            tgt.zone_reset((zno as u64) * (tgt.zone_size >> 9))?;
+        for zno in tgt.cfg.zone_nr_conv..tgt.nr_zones {
+            tgt.zone_reset((zno as u64) * (tgt.cfg.zone_size >> 9))?;
         }
 
         return Ok(0);
@@ -567,7 +587,7 @@ async fn handle_write(
     let zno = tgt.get_zone_no(iod.start_sector);
     let z = tgt.get_zone(iod.start_sector);
 
-    if zno < tgt.zone_nr_conv {
+    if zno < tgt.cfg.zone_nr_conv {
         if append {
             return Err(anyhow::anyhow!("write append on conventional zone"));
         }
@@ -721,7 +741,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (size, zone_size, conv_zones, mo_zones, ma_zones) = match opt {
+    let cfg = match opt {
         Some(ref o) => {
             if o.gen_arg.user_recovery {
                 return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
@@ -730,34 +750,29 @@ pub(crate) fn ublk_add_zoned(
             if o.path.is_some() {
                 return Err(anyhow::anyhow!("only support ramdisk now\n"));
             } else {
-                (
-                    ((o.size as u64) << 20),
-                    ((o.zone_size as u64) << 20),
-                    o.conv_zones as usize,
-                    o.max_open_zones,
-                    o.max_active_zones,
-                )
+                TgtCfg::from_argument(o)
             }
         }
         None => return Err(anyhow::anyhow!("invalid parameter")),
     };
 
-    if size < zone_size || (size % zone_size) != 0 {
+    if cfg.size < cfg.zone_size || (cfg.size % cfg.zone_size) != 0 {
         return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
     }
 
-    if u64::from((conv_zones as u64) * zone_size) >= size {
+    if u64::from((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
         return Err(anyhow::anyhow!("Too many conventioanl zones"));
     }
 
+    let cfg_i = cfg.clone();
     let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(size);
+        dev.set_default_params(cfg_i.size);
         dev.tgt.params.types |= libublk::sys::UBLK_PARAM_TYPE_ZONED;
-        dev.tgt.params.basic.chunk_sectors = (zone_size >> 9) as u32;
+        dev.tgt.params.basic.chunk_sectors = (cfg_i.zone_size >> 9) as u32;
         dev.tgt.params.zoned = libublk::sys::ublk_param_zoned {
-            max_open_zones: mo_zones,
-            max_active_zones: ma_zones,
-            max_zone_append_sectors: (zone_size >> 9) as u32,
+            max_open_zones: cfg_i.zone_max_open,
+            max_active_zones: cfg_i.zone_max_active,
+            max_zone_append_sectors: (cfg_i.zone_size >> 9) as u32,
             ..Default::default()
         };
 
@@ -769,9 +784,7 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(
-        size, zone_size, conv_zones, mo_zones, ma_zones,
-    ));
+    let zoned_tgt = Arc::new(ZonedTgt::new(cfg));
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
