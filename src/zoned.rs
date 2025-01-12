@@ -22,14 +22,30 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 #[derive(Debug, Default)]
+struct ZoneState {
+    cond: libublk::sys::blk_zone_cond,
+    wp: u64,
+}
+
+#[derive(Debug, Default)]
 struct Zone {
     r#type: libublk::sys::blk_zone_type,
-    cond: libublk::sys::blk_zone_cond,
     start: u64,
     len: u32,
     capacity: u32,
+    stat: RwLock<ZoneState>,
+}
 
-    wp: u64,
+impl Zone {
+    #[inline(always)]
+    fn get_stat_mut(&self) -> std::sync::RwLockWriteGuard<'_, ZoneState> {
+        self.stat.write().unwrap()
+    }
+
+    #[inline(always)]
+    fn get_stat(&self) -> std::sync::RwLockReadGuard<'_, ZoneState> {
+        self.stat.read().unwrap()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -52,37 +68,37 @@ struct ZonedTgt {
     zone_max_active: u32,
     nr_zones: u32,
 
-    zones: Vec<RwLock<Zone>>,
+    zones: Vec<Zone>,
     data: RwLock<TgtData>,
     _buf: IoBuf<u8>,
 }
 
 impl ZonedTgt {
     #[allow(clippy::uninit_vec)]
-    fn new(size: u64, zone_size: u64, conv_zones: u32) -> ZonedTgt {
+    fn new(size: u64, zone_size: u64, conv_zones: usize) -> ZonedTgt {
         let _buf = IoBuf::<u8>::new(size as usize);
         let buf_addr = _buf.as_mut_ptr() as u64;
         let zone_cap = zone_size >> 9;
         let nr_zones = size / zone_size;
 
-        let zones: Vec<RwLock<Zone>> = (0..nr_zones as usize)
-            .map(|i| {
-                RwLock::new(Zone {
-                    capacity: zone_cap as u32,
-                    len: (zone_size >> 9) as u32,
-                    r#type: if i < conv_zones.try_into().unwrap() {
-                        BLK_ZONE_TYPE_CONVENTIONAL
-                    } else {
-                        BLK_ZONE_TYPE_SEQWRITE_REQ
-                    },
-                    cond: if i < conv_zones.try_into().unwrap() {
+        let zones: Vec<Zone> = (0..nr_zones as usize)
+            .map(|i| Zone {
+                capacity: zone_cap as u32,
+                len: (zone_size >> 9) as u32,
+                r#type: if i < conv_zones {
+                    BLK_ZONE_TYPE_CONVENTIONAL
+                } else {
+                    BLK_ZONE_TYPE_SEQWRITE_REQ
+                },
+                start: (i as u64) * (zone_size >> 9),
+                stat: RwLock::new(ZoneState {
+                    wp: (i as u64) * (zone_size >> 9),
+                    cond: if i < conv_zones {
                         BLK_ZONE_COND_NOT_WP
                     } else {
                         BLK_ZONE_COND_EMPTY
                     },
-                    start: (i as u64) * (zone_size >> 9),
-                    wp: (i as u64) * (zone_size >> 9),
-                })
+                }),
             })
             .collect();
 
@@ -97,7 +113,7 @@ impl ZonedTgt {
             data: RwLock::new(TgtData {
                 ..Default::default()
             }),
-            zone_nr_conv: conv_zones,
+            zone_nr_conv: conv_zones.try_into().unwrap(),
             zones,
             _buf,
         }
@@ -111,17 +127,18 @@ impl ZonedTgt {
     }
 
     #[inline(always)]
-    fn get_zone_mut(&self, sector: u64) -> std::sync::RwLockWriteGuard<'_, Zone> {
-        let zno = self.get_zone_no(sector) as usize;
-        self.zones[zno].write().unwrap()
+    fn get_zone(&self, sector: u64) -> &Zone {
+        let zno = self.get_zone_no(sector);
+
+        &self.zones[zno as usize]
     }
 
     #[inline(always)]
     fn get_zone_cond(&self, sector: u64) -> libublk::sys::blk_zone_cond {
-        let zno = self.get_zone_no(sector) as usize;
-        let z = self.zones[zno].read().unwrap();
+        let z = self.get_zone(sector);
+        let zs = z.get_stat();
 
-        z.cond
+        zs.cond
     }
 
     #[inline(always)]
@@ -151,7 +168,7 @@ impl ZonedTgt {
         }
 
         for _ in self.zone_nr_conv..self.nr_zones {
-            let _zno = zno as usize;
+            let z = &self.zones[zno as usize];
 
             zno += 1;
             if zno >= self.nr_zones {
@@ -160,10 +177,10 @@ impl ZonedTgt {
 
             // the current zone may be locked already, so have
             // to use try_lock
-            match self.zones[_zno].try_write() {
-                Ok(mut z) => {
-                    if z.cond == BLK_ZONE_COND_IMP_OPEN {
-                        self.__close_zone(&mut z)?;
+            match z.stat.try_write() {
+                Ok(mut zs) => {
+                    if zs.cond == BLK_ZONE_COND_IMP_OPEN {
+                        self.__close_zone(&z, &mut zs)?;
                         self.set_imp_close_zone_no(zno);
                         return Ok(());
                     }
@@ -221,13 +238,14 @@ impl ZonedTgt {
     }
 
     fn zone_reset(&self, sector: u64) -> anyhow::Result<i32> {
-        let mut z = self.get_zone_mut(sector);
+        let z = self.get_zone(sector);
+        let mut zs = z.get_stat_mut();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return Err(anyhow::anyhow!("reset conventional zone"));
         }
 
-        match z.cond {
+        match zs.cond {
             BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return Ok(0),
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
@@ -242,12 +260,12 @@ impl ZonedTgt {
                 data.nr_zones_closed -= 1;
             }
             BLK_ZONE_COND_FULL => {}
-            _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_reset", z.cond)),
+            _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_reset", zs.cond)),
         }
 
         let start = z.start;
-        z.cond = BLK_ZONE_COND_EMPTY;
-        z.wp = start;
+        zs.cond = BLK_ZONE_COND_EMPTY;
+        zs.wp = start;
 
         self.discard_zone(self.get_zone_no(sector));
 
@@ -255,14 +273,15 @@ impl ZonedTgt {
     }
 
     fn zone_open(&self, sector: u64) -> anyhow::Result<i32> {
-        let mut z = self.get_zone_mut(sector);
+        let z = self.get_zone(sector);
+        let mut zs = z.get_stat_mut();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return Err(anyhow::anyhow!("open conventional zone"));
         }
 
         //fixme: add zone check
-        match z.cond {
+        match zs.cond {
             BLK_ZONE_COND_EXP_OPEN => return Ok(0), //already open
             BLK_ZONE_COND_EMPTY => {
                 self.check_zone_resources(BLK_ZONE_COND_EMPTY)?;
@@ -280,15 +299,19 @@ impl ZonedTgt {
                 data.nr_zones_closed -= 1;
                 data.nr_zones_exp_open += 1;
             }
-            _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_open", z.cond)),
+            _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_open", zs.cond)),
         };
 
-        z.cond = BLK_ZONE_COND_EXP_OPEN;
+        zs.cond = BLK_ZONE_COND_EXP_OPEN;
         Ok(0)
     }
 
-    fn __close_zone(&self, z: &mut std::sync::RwLockWriteGuard<'_, Zone>) -> anyhow::Result<i32> {
-        match z.cond {
+    fn __close_zone(
+        &self,
+        z: &Zone,
+        zs: &mut std::sync::RwLockWriteGuard<'_, ZoneState>,
+    ) -> anyhow::Result<i32> {
+        match zs.cond {
             BLK_ZONE_COND_CLOSED => return Ok(0),
             BLK_ZONE_COND_IMP_OPEN => {
                 let mut data = self.data.write().unwrap();
@@ -300,13 +323,13 @@ impl ZonedTgt {
             }
             //case BLK_ZONE_COND_EMPTY:
             //case BLK_ZONE_COND_FULL:
-            _ => return Err(anyhow::anyhow!("bad zone cond {} in __close_zone", z.cond)),
+            _ => return Err(anyhow::anyhow!("bad zone cond {} in __close_zone", zs.cond)),
         }
 
-        if z.wp == z.start {
-            z.cond = BLK_ZONE_COND_EMPTY;
+        if zs.wp == z.start {
+            zs.cond = BLK_ZONE_COND_EMPTY;
         } else {
-            z.cond = BLK_ZONE_COND_CLOSED;
+            zs.cond = BLK_ZONE_COND_CLOSED;
 
             let mut data = self.data.write().unwrap();
             data.nr_zones_closed += 1;
@@ -316,23 +339,25 @@ impl ZonedTgt {
     }
 
     fn zone_close(&self, sector: u64) -> anyhow::Result<i32> {
-        let mut z = self.get_zone_mut(sector);
+        let z = self.get_zone(sector);
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return Err(anyhow::anyhow!("close conventional zone"));
         }
 
-        self.__close_zone(&mut z)
+        let mut zs = z.get_stat_mut();
+        self.__close_zone(&z, &mut zs)
     }
 
     fn zone_finish(&self, sector: u64) -> anyhow::Result<i32> {
-        let mut z = self.get_zone_mut(sector);
+        let z = self.get_zone(sector);
+        let mut zs = z.get_stat_mut();
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return Err(anyhow::anyhow!("finish conventional zone"));
         }
 
-        match z.cond {
+        match zs.cond {
             // finish operation on full is not an error
             BLK_ZONE_COND_FULL => {}
             BLK_ZONE_COND_EMPTY => {
@@ -351,11 +376,11 @@ impl ZonedTgt {
                 let mut data = self.data.write().unwrap();
                 data.nr_zones_closed -= 1;
             }
-            _ => return Err(anyhow::anyhow!("bad zone cond {}", z.cond)),
+            _ => return Err(anyhow::anyhow!("bad zone cond {}", zs.cond)),
         };
 
-        z.cond = BLK_ZONE_COND_FULL;
-        z.wp = z.start + z.len as u64;
+        zs.cond = BLK_ZONE_COND_FULL;
+        zs.wp = z.start + z.len as u64;
 
         Ok(0)
     }
@@ -391,14 +416,15 @@ fn handle_report_zones(
 
     for i in zno..(zno + zones as u64) {
         let zone = unsafe { &mut *(off as *mut libublk::sys::blk_zone) };
-        let z = tgt.zones[i as usize].read().unwrap();
+        let z = &tgt.zones[i as usize];
+        let zs = z.get_stat();
 
         zone.capacity = z.capacity as u64;
         zone.len = z.len as u64;
         zone.start = z.start;
-        zone.wp = z.wp;
+        zone.wp = zs.wp;
         zone.type_ = z.r#type as u8;
-        zone.cond = z.cond as u8;
+        zone.cond = zs.cond as u8;
 
         off += blkz_sz as u64;
     }
@@ -533,6 +559,7 @@ async fn handle_write(
     append: bool,
 ) -> anyhow::Result<(u64, i32)> {
     let zno = tgt.get_zone_no(iod.start_sector);
+    let z = tgt.get_zone(iod.start_sector);
 
     if zno < tgt.zone_nr_conv {
         if append {
@@ -543,9 +570,10 @@ async fn handle_write(
         return Ok((u64::MAX, res));
     }
 
-    let (wp, zone_end, sector) = {
-        let mut z = tgt.get_zone_mut(iod.start_sector);
-        let cond = z.cond;
+    let zone_end = z.start + z.capacity as u64;
+    let (wp, sector) = {
+        let mut zs = z.get_stat_mut();
+        let cond = zs.cond;
 
         if cond == BLK_ZONE_COND_FULL
             || cond == BLK_ZONE_COND_READONLY
@@ -554,13 +582,12 @@ async fn handle_write(
             return Err(anyhow::anyhow!("write on full/ro/offline zone"));
         }
 
-        let sector = z.wp;
+        let sector = zs.wp;
         if !append && iod.start_sector != sector {
             return Err(anyhow::anyhow!("not write on write pointer"));
         }
 
-        let zone_end = z.start + z.capacity as u64;
-        if z.wp + iod.nr_sectors as u64 > zone_end {
+        if zs.wp + iod.nr_sectors as u64 > zone_end {
             return Err(anyhow::anyhow!("write out of zone"));
         }
 
@@ -576,29 +603,29 @@ async fn handle_write(
             }
 
             if cond != BLK_ZONE_COND_EXP_OPEN {
-                z.cond = BLK_ZONE_COND_IMP_OPEN;
+                zs.cond = BLK_ZONE_COND_IMP_OPEN;
             }
         }
-        z.wp += iod.nr_sectors as u64;
+        zs.wp += iod.nr_sectors as u64;
 
-        (z.wp, zone_end, sector)
+        (zs.wp, sector)
     };
 
     let res = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await?;
     if wp == zone_end {
-        let mut z = tgt.get_zone_mut(iod.start_sector);
+        let mut zs = z.get_stat_mut();
 
-        if z.cond != BLK_ZONE_COND_FULL {
-            if z.cond == BLK_ZONE_COND_EXP_OPEN {
+        if zs.cond != BLK_ZONE_COND_FULL {
+            if zs.cond == BLK_ZONE_COND_EXP_OPEN {
                 let mut data = tgt.data.write().unwrap();
 
                 data.nr_zones_exp_open -= 1;
-            } else if z.cond == BLK_ZONE_COND_IMP_OPEN {
+            } else if zs.cond == BLK_ZONE_COND_IMP_OPEN {
                 let mut data = tgt.data.write().unwrap();
 
                 data.nr_zones_imp_open -= 1;
             }
-            z.cond = BLK_ZONE_COND_FULL;
+            zs.cond = BLK_ZONE_COND_FULL;
         }
     }
     Ok((sector, res))
@@ -692,7 +719,7 @@ pub(crate) fn ublk_add_zoned(
                 (
                     ((o.size as u64) << 20),
                     ((o.zone_size as u64) << 20),
-                    o.conv_zones,
+                    o.conv_zones as usize,
                 )
             }
         }
