@@ -117,18 +117,11 @@ impl ZonedTgt {
     }
 
     #[inline(always)]
-    fn __get_zone_meta(&self, zno: u32) -> (libublk::sys::blk_zone_cond, u64, u32, u64) {
-        let z = self.zones[zno as usize].read().unwrap();
-
-        (z.cond, z.start, z.len, z.wp)
-    }
-
-    #[inline(always)]
-    fn get_zone_meta(&self, sector: u64) -> (libublk::sys::blk_zone_cond, u64, u32, u64) {
+    fn get_zone_cond(&self, sector: u64) -> libublk::sys::blk_zone_cond {
         let zno = self.get_zone_no(sector) as usize;
         let z = self.zones[zno].read().unwrap();
 
-        (z.cond, z.start, z.len, z.wp)
+        z.cond
     }
 
     #[inline(always)]
@@ -442,7 +435,7 @@ fn handle_mgmt(
         return Ok(0);
     }
 
-    let (cond, _, _, _) = tgt.get_zone_meta(iod.start_sector);
+    let cond = tgt.get_zone_cond(iod.start_sector);
     if cond == BLK_ZONE_COND_READONLY || cond == BLK_ZONE_COND_OFFLINE {
         return Err(anyhow::anyhow!("mgmt op on readonly or offline zone"));
     }
@@ -462,7 +455,7 @@ async fn handle_read(
     tag: u16,
     iod: &ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
-    let (cond, _, _, _) = tgt.get_zone_meta(iod.start_sector);
+    let cond = tgt.get_zone_cond(iod.start_sector);
     if cond == BLK_ZONE_COND_OFFLINE {
         return Err(anyhow::anyhow!("read from offline zone"));
     }
