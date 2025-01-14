@@ -171,9 +171,34 @@ struct ZonedTgt {
     _buf: Option<IoBuf<u8>>,
     zfiles: Vec<File>,
     cfg: TgtCfg,
+    base_file: Option<File>,
+}
+
+impl Drop for ZonedTgt {
+    fn drop(&mut self) {
+        self.unlock_base();
+    }
 }
 
 impl ZonedTgt {
+    fn lock_base(&mut self) -> anyhow::Result<()> {
+        let base = self.cfg.base.clone();
+        if let Some(ref dir) = base {
+            let h = OpenOptions::new().read(true).open(dir)?;
+            let res = unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if res != 0 {
+                anyhow::bail!("fail to lock {}", dir.display());
+            }
+            self.base_file = Some(h);
+        }
+        Ok(())
+    }
+    fn unlock_base(&self) {
+        if let Some(ref h) = self.base_file {
+            unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
     fn install_zone_files(&mut self, new_dev: bool) -> anyhow::Result<()> {
         for i in 0..self.nr_zones as usize {
             let path = self.back_file_path(i.try_into().unwrap())?;
@@ -278,9 +303,11 @@ impl ZonedTgt {
             _buf,
             zfiles: Vec::new(),
             cfg,
+            base_file: None,
         };
 
         if !ram_backed {
+            dev.lock_base()?;
             dev.install_zone_files(new_dev)?;
             for zno in 0..dev.nr_zones as usize {
                 if new_dev {
