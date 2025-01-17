@@ -15,6 +15,8 @@ use libublk::sys::{
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 
+use anyhow::bail;
+use bitflags::bitflags;
 use io_uring::{opcode, types};
 use libc::{c_void, memset, pread, pwrite};
 use log::trace;
@@ -23,8 +25,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock, RwLockReadGuard as RLGuard, RwLockWriteGuard as WLGuard};
+
+bitflags! {
+    #[derive(Default)]
+    struct ZoneFlags: u32 {
+        const SEQ_ERROR = 0b00000001;
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum ZIOError<'a> {
@@ -33,15 +41,37 @@ enum ZIOError<'a> {
 
     #[error("zone_max_active limit is reached in {0}")]
     MaxActiveOverflow(&'a str),
+
+    #[error("update seq zone failed")]
+    UpdateSeq(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ZoneState {
+    flags: ZoneFlags,
     cond: libublk::sys::blk_zone_cond,
     wp: u64,
 }
 
-#[derive(Debug, Default)]
+impl ZoneState {
+    #[inline(always)]
+    fn set_seq_err(&mut self, msg: String) -> anyhow::Error {
+        self.flags.insert(ZoneFlags::SEQ_ERROR);
+        ZIOError::UpdateSeq(msg).into()
+    }
+
+    #[inline(always)]
+    fn is_seq_err(&self) -> bool {
+        self.flags.intersects(ZoneFlags::SEQ_ERROR)
+    }
+
+    #[inline(always)]
+    fn clear_seq_err(&mut self) {
+        self.flags.remove(ZoneFlags::SEQ_ERROR);
+    }
+}
+
+#[derive(Default)]
 struct Zone {
     r#type: libublk::sys::blk_zone_type,
     start: u64,
@@ -52,12 +82,12 @@ struct Zone {
 
 impl Zone {
     #[inline(always)]
-    fn get_stat_mut(&self) -> std::sync::RwLockWriteGuard<'_, ZoneState> {
+    fn get_stat_mut(&self) -> WLGuard<'_, ZoneState> {
         self.stat.write().unwrap()
     }
 
     #[inline(always)]
-    fn get_stat(&self) -> std::sync::RwLockReadGuard<'_, ZoneState> {
+    fn get_stat(&self) -> RLGuard<'_, ZoneState> {
         self.stat.read().unwrap()
     }
 
@@ -133,7 +163,6 @@ impl TgtCfg {
     }
 }
 
-#[derive(Debug)]
 struct ZonedTgt {
     start: u64,
     nr_zones: u32,
@@ -169,13 +198,16 @@ impl ZonedTgt {
         }
     }
 
-    fn update_seq_zone(&mut self, zno: u32) -> anyhow::Result<()> {
-        let secs = self.back_file_size(zno)? >> 9;
-        let z = &self.zones[zno as usize];
-        let mut zs = z.get_stat_mut();
-
+    fn __update_seq_zone(&self, z: &Zone, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<()> {
+        let zno = self.get_zone_no(z.start);
+        let secs = match self.back_file_size(zno) {
+            Ok(s) => s >> 9,
+            Err(e) => {
+                bail!(zs.set_seq_err(format!("read zone {} file size failed {:?}", zno, e)));
+            }
+        };
         if secs > (z.capacity as u64) {
-            anyhow::bail!("zone file size {:?} is too big", secs);
+            anyhow::bail!(ZIOError::UpdateSeq("file size 2big".to_string()));
         }
 
         if secs == 0 {
@@ -188,7 +220,15 @@ impl ZonedTgt {
             zs.cond = BLK_ZONE_COND_CLOSED;
             zs.wp = z.start + secs;
         }
+        zs.clear_seq_err();
         Ok(())
+    }
+
+    fn update_seq_zone(&self, zno: u32) -> anyhow::Result<()> {
+        let z = &self.zones[zno as usize];
+        let mut zs = z.get_stat_mut();
+
+        self.__update_seq_zone(&z, &mut zs)
     }
 
     #[allow(clippy::uninit_vec)]
@@ -223,6 +263,7 @@ impl ZonedTgt {
                     } else {
                         BLK_ZONE_COND_EMPTY
                     },
+                    flags: ZoneFlags::empty(),
                 }),
             })
             .collect();
@@ -445,11 +486,12 @@ impl ZonedTgt {
             _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_reset", zs.cond)),
         }
 
+        self.discard_zone(self.get_zone_no(sector), &mut zs)?;
+
         let start = z.start;
         zs.cond = BLK_ZONE_COND_EMPTY;
         zs.wp = start;
-
-        self.discard_zone(self.get_zone_no(sector))?;
+        zs.clear_seq_err();
 
         Ok(0)
     }
@@ -460,6 +502,10 @@ impl ZonedTgt {
 
         if z.r#type == BLK_ZONE_TYPE_CONVENTIONAL {
             return Err(anyhow::anyhow!("open conventional zone"));
+        }
+
+        if zs.is_seq_err() {
+            self.__update_seq_zone(&z, &mut zs)?;
         }
 
         //fixme: add zone check
@@ -488,11 +534,7 @@ impl ZonedTgt {
         Ok(0)
     }
 
-    fn __close_zone(
-        &self,
-        z: &Zone,
-        zs: &mut std::sync::RwLockWriteGuard<'_, ZoneState>,
-    ) -> anyhow::Result<i32> {
+    fn __close_zone(&self, z: &Zone, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<i32> {
         match zs.cond {
             BLK_ZONE_COND_CLOSED => return Ok(0),
             BLK_ZONE_COND_IMP_OPEN => {
@@ -528,6 +570,10 @@ impl ZonedTgt {
         }
 
         let mut zs = z.get_stat_mut();
+
+        if zs.is_seq_err() {
+            self.__update_seq_zone(&z, &mut zs)?;
+        }
         self.__close_zone(&z, &mut zs)
     }
 
@@ -561,19 +607,23 @@ impl ZonedTgt {
             _ => return Err(anyhow::anyhow!("bad zone cond {}", zs.cond)),
         };
 
+        if !self.ram_backed() {
+            let zno = self.get_zone_no(sector);
+            if let Err(e) = self.back_file_truncate(zno, self.cfg.zone_size) {
+                bail!(zs.set_seq_err(format!("truncate zone {} file, err {:?}", zno, e)));
+            }
+        }
         zs.cond = BLK_ZONE_COND_FULL;
         zs.wp = z.start + z.len as u64;
-        if !self.ram_backed() {
-            self.back_file_truncate(self.get_zone_no(sector), self.cfg.zone_size)?;
-        }
+        zs.clear_seq_err();
 
         Ok(0)
     }
 
-    fn discard_zone(&self, zon: u32) -> anyhow::Result<i32> {
+    fn discard_zone(&self, zno: u32, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<i32> {
         if self.ram_backed() {
             unsafe {
-                let off = zon as u64 * self.cfg.zone_size;
+                let off = zno as u64 * self.cfg.zone_size;
 
                 libc::madvise(
                     (self.start + off) as *mut libc::c_void,
@@ -582,7 +632,9 @@ impl ZonedTgt {
                 );
             }
         } else {
-            self.back_file_truncate(zon, 0)?;
+            if let Err(e) = self.back_file_truncate(zno, 0) {
+                bail!(zs.set_seq_err(format!("truncated zone {:?} file failed {:?}", zno, e)));
+            }
         }
         Ok(0)
     }
@@ -607,7 +659,11 @@ fn handle_report_zones(
     for i in zno..(zno + zones as u64) {
         let zone = unsafe { &mut *(off as *mut libublk::sys::blk_zone) };
         let z = &tgt.zones[i as usize];
-        let zs = z.get_stat();
+        let mut zs = z.get_stat_mut();
+
+        if zs.is_seq_err() {
+            tgt.__update_seq_zone(&z, &mut zs)?;
+        }
 
         zone.capacity = z.capacity as u64;
         zone.len = z.len as u64;
@@ -752,7 +808,7 @@ async fn handle_plain_write(
         // read data from ublk driver first
         let res = unsafe { pread(fd, buf_addr, bytes, offset.try_into().unwrap()) };
         if res < 0 {
-            return Err(anyhow::anyhow!("pread on ublkc failure {}", res));
+            return Ok(res as i32);
         }
 
         // handle the write
@@ -770,11 +826,7 @@ async fn handle_plain_write(
         }
     };
 
-    if res < 0 {
-        Err(anyhow::anyhow!("failure to handle plain write {}", res))
-    } else {
-        Ok(res)
-    }
+    Ok(res as i32)
 }
 
 fn handle_flush(
@@ -835,6 +887,10 @@ async fn handle_write(
             return Err(anyhow::anyhow!("write out of zone"));
         }
 
+        if zs.is_seq_err() {
+            tgt.__update_seq_zone(&z, &mut zs)?;
+        }
+
         if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
             tgt.check_zone_resources(cond)?;
 
@@ -872,6 +928,12 @@ async fn handle_write(
             zs.cond = BLK_ZONE_COND_FULL;
         }
     }
+
+    if res < 0 {
+        let mut zs = z.get_stat_mut();
+        bail!(zs.set_seq_err(format!("append fail: {} {}", zno, res)));
+    }
+
     Ok((sector, res))
 }
 
@@ -1079,6 +1141,7 @@ pub(crate) fn ublk_add_zoned(
                                 match ze {
                                     ZIOError::MaxOpenOverflow(_) => res = -libc::ETOOMANYREFS,
                                     ZIOError::MaxActiveOverflow(_) => res = -libc::EOVERFLOW,
+                                    ZIOError::UpdateSeq(_) => res = -libc::EIO,
                                 };
                             } else {
                                 eprintln!("handle io failre");
