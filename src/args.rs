@@ -20,8 +20,9 @@ pub(crate) struct GenAddArgs {
     pub depth: u32,
 
     /// io buffer size, has to be aligned with PAGE_SIZE
-    #[clap(long, short = 'b', default_value_t = 524288)]
-    pub io_buf_size: u32,
+    /// and common suffixes supported ([B|KiB|MiB|GiB])
+    #[clap(long, short = 'b', default_value = "524288")]
+    pub io_buf_size: String,
 
     /// enable user recovery
     #[clap(long, short = 'r', default_value_t = false)]
@@ -78,7 +79,7 @@ impl GenAddArgs {
     }
 }
 
-fn is_power2_of(input: u32, base: u32) -> bool {
+fn is_power2_of(input: u64, base: u64) -> bool {
     assert!((base & (base - 1)) == 0);
 
     let quotient = input / base;
@@ -151,7 +152,7 @@ impl GenAddArgs {
         }
 
         if let Some(pbs) = self.physical_block_size {
-            if !is_power2_of(pbs, 512) {
+            if !is_power2_of(pbs as u64, 512) {
                 anyhow::bail!("invalid physical block size");
             }
 
@@ -162,8 +163,9 @@ impl GenAddArgs {
             }
         }
 
-        if !is_power2_of(self.io_buf_size, 4096) {
-            anyhow::bail!("invalid io buf size");
+        let buf_size = parse_size::parse_size(self.io_buf_size.clone())?;
+        if !is_power2_of(buf_size, 4096) || buf_size > u32::MAX.into() {
+            anyhow::bail!("invalid io buf size {}", buf_size);
         }
 
         Ok(libublk::ctrl::UblkCtrlBuilder::default()
@@ -174,7 +176,7 @@ impl GenAddArgs {
             .ctrl_flags(ctrl_flags.into())
             .ctrl_target_flags(gen_flags)
             .dev_flags(dev_flags)
-            .io_buf_bytes(self.io_buf_size)
+            .io_buf_bytes(buf_size as u32)
             .build()
             .unwrap())
     }
