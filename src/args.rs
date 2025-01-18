@@ -3,7 +3,6 @@ use clap::{Args, Subcommand};
 use ilog::IntLog;
 use libublk::{ctrl::UblkCtrl, io::UblkDev, UblkFlags};
 use std::cell::RefCell;
-use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -120,7 +119,7 @@ impl GenAddArgs {
         &self,
         name: &'static str,
         dev_flags: UblkFlags,
-    ) -> Result<UblkCtrl, std::io::Error> {
+    ) -> anyhow::Result<UblkCtrl> {
         let mut ctrl_flags = if self.user_recovery {
             libublk::sys::UBLK_F_USER_RECOVERY
         } else {
@@ -147,30 +146,24 @@ impl GenAddArgs {
         match self.logical_block_size {
             None | Some(512) | Some(1024) | Some(2048) | Some(4096) => {}
             _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "invalid logical block size",
-                ))
+                anyhow::bail!("invalid logical block size");
             }
         }
 
         if let Some(pbs) = self.physical_block_size {
             if !is_power2_of(pbs, 512) {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "invalid physical block size",
-                ));
+                anyhow::bail!("invalid physical block size");
             }
 
             if let Some(lbs) = self.logical_block_size {
                 if lbs > pbs {
-                    return Err(Error::new(ErrorKind::InvalidInput, "invalid block size"));
+                    anyhow::bail!("invalid block size");
                 }
             }
         }
 
         if !is_power2_of(self.io_buf_size, 4096) {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid io buf size"));
+            anyhow::bail!("invalid io buf size");
         }
 
         Ok(libublk::ctrl::UblkCtrlBuilder::default()
