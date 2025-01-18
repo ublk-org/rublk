@@ -86,14 +86,13 @@ impl TgtCfg {
             zone_max_active: m_act,
         }
     }
-    fn from_argument(a: &ZonedAddArgs) -> Self {
-        Self::new(
-            (a.size as u64) << 20,
-            (a.zone_size as u64) << 20,
-            a.conv_zones,
-            a.max_open_zones,
-            a.max_active_zones,
-        )
+    fn from_argument(a: &ZonedAddArgs) -> anyhow::Result<Self> {
+        let cfg = parse_size::Config::new().with_default_factor(1_048_576);
+        let s = cfg.parse_size(a.size.clone())?;
+        let zs = cfg.parse_size(a.zone_size.clone())?;
+        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, a.max_active_zones);
+
+        Ok(tcfg)
     }
 }
 
@@ -714,13 +713,15 @@ pub(crate) struct ZonedAddArgs {
     #[clap(long, default_value = None)]
     path: Option<PathBuf>,
 
-    /// How many megabytes(MB) of the whole zoned device
-    #[clap(long, default_value_t = 1024)]
-    size: u32,
+    ///Size of the whole zoned device, default unit is MiB,
+    ///with common suffixes supported ([B|KiB|KB|MiB|MB|GiB|GB|TiB|TB])
+    #[clap(long, default_value = "1024MiB")]
+    size: String,
 
-    ///zone size, unit is megabytes(MB)
-    #[clap(long, default_value_t = 256)]
-    zone_size: u32,
+    ///zone size, default unit is MiB, with common suffixes supported
+    ///([B|KiB|MiB|GiB]), has to be aligned with logical block size
+    #[clap(long, default_value = "256MiB")]
+    zone_size: String,
 
     /// How many conventioanl zones starting from sector 0
     #[clap(long, default_value_t = 2)]
@@ -750,13 +751,13 @@ pub(crate) fn ublk_add_zoned(
             if o.path.is_some() {
                 return Err(anyhow::anyhow!("only support ramdisk now\n"));
             } else {
-                TgtCfg::from_argument(o)
+                TgtCfg::from_argument(o)?
             }
         }
         None => return Err(anyhow::anyhow!("invalid parameter")),
     };
 
-    if cfg.size < cfg.zone_size || (cfg.size % cfg.zone_size) != 0 {
+    if cfg.size < cfg.zone_size || (cfg.size % cfg.zone_size) != 0 || (cfg.zone_size % 512) != 0 {
         return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
     }
 
