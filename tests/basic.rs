@@ -249,17 +249,20 @@ mod integration {
         }
     }
 
-    fn __test_ublk_add_del_zoned<F>(bs: u32, tf: F, dir: Option<&String>)
+    fn __test_ublk_add_del_zoned<F>(bs: u32, queues: u32, tf: F, dir: Option<&String>)
     where
         F: Fn(i32, u32, usize),
     {
         match UblkCtrl::get_features() {
             Some(f) => {
                 if (f & sys::UBLK_F_ZONED as u64) != 0 {
-                    let bs_str = format!("{}", bs).to_string();
+                    let bs_str = format!("{}", bs);
+                    let queues_str = format!("{}", queues);
                     let mut cmdline = [
                         "add",
                         "zoned",
+                        "-q",
+                        &queues_str,
                         "--zone-size",
                         "4",
                         "--logical-block-size",
@@ -267,12 +270,9 @@ mod integration {
                     ]
                     .to_vec();
 
-                    match dir {
-                        Some(d) => {
-                            cmdline.push("--path");
-                            cmdline.push(d);
-                        }
-                        _ => {}
+                    if let Some(d) = dir {
+                        cmdline.push("--path");
+                        cmdline.push(d);
                     };
 
                     let id = run_rublk_add_dev(cmdline);
@@ -297,8 +297,8 @@ mod integration {
                         read_ublk_disk(&ctrl);
                         check_block_size(&ctrl, bs);
                     };
-                    __test_ublk_add_del_zoned(512, tf, None);
-                    __test_ublk_add_del_zoned(4096, tf, None);
+                    __test_ublk_add_del_zoned(512, 1, tf, None);
+                    __test_ublk_add_del_zoned(4096, 1, tf, None);
                 }
             }
             None => {}
@@ -469,12 +469,12 @@ mod integration {
             assert!(res.success());
         };
 
-        __test_ublk_add_del_zoned(4096, tf, None);
+        __test_ublk_add_del_zoned(4096, 1, tf, None);
 
         let path_dir = tempfile::TempDir::new().unwrap();
         let path_str = path_dir.path().to_string_lossy().to_string();
 
-        __test_ublk_add_del_zoned(4096, tf, Some(&path_str));
-        __test_ublk_add_del_zoned(4096, tf, Some(&path_str));
+        __test_ublk_add_del_zoned(4096, 1, tf, Some(&path_str));
+        __test_ublk_add_del_zoned(4096, 2, tf, Some(&path_str));
     }
 }
