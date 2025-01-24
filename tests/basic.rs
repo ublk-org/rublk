@@ -6,16 +6,65 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn has_mkfs_btrfs() -> bool {
-        match Command::new("mkfs.btrfs")
-            .arg("--version") // Try running the binary with a harmless argument
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+    fn has_mkfs_ext4() -> bool {
+        match Command::new("mkfs.ext4")
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
         {
             Ok(res) => res.success(),
             _ => false,
         }
+    }
+    fn has_mkfs_btrfs() -> bool {
+        match Command::new("mkfs.btrfs")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(res) => res.success(),
+            _ => false,
+        }
+    }
+
+    fn mkfs(ctrl: &UblkCtrl, fs: &str, args: Vec<&str>) {
+        let bdev = ctrl.get_bdev_path();
+        let cmd = "mkfs.".to_string() + fs;
+
+        let res = Command::new(cmd.clone())
+            .args(args)
+            .args([&bdev])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect(&cmd);
+        assert!(res.success());
+    }
+
+    fn mount_fs_and_io<F>(ctrl: &UblkCtrl, dir: &tempfile::TempDir, f: F)
+    where
+        F: Fn(&tempfile::TempDir),
+    {
+        let dstr = dir.path().to_string_lossy().to_string();
+        let bdev = ctrl.get_bdev_path();
+
+        let res = Command::new("mount")
+            .args([&bdev, &dstr])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("Failed to execute mount");
+        assert!(res.success());
+
+        f(&dir);
+
+        let res = Command::new("umount")
+            .args([&dstr])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("Failed to execute umount");
+        assert!(res.success());
     }
 
     fn support_ublk() -> bool {
@@ -26,22 +75,16 @@ mod integration {
         return true;
     }
 
-    fn format_and_mount(ctrl: &UblkCtrl) {
-        let dev_path = ctrl.get_bdev_path();
-
-        let ext4_options = block_utils::Filesystem::Ext4 {
-            inode_size: 512,
-            stride: Some(2),
-            stripe_width: None,
-            reserved_blocks_percentage: 10,
-        };
-        block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
-
+    fn ext4_format_and_mount(ctrl: &UblkCtrl) {
         let tmp_dir = tempfile::TempDir::new().unwrap();
-        let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
 
-        block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
-        block_utils::unmount_device(tmp_dir.path()).unwrap();
+        if has_mkfs_ext4() {
+            mkfs(&ctrl, "ext4", ["-F"].to_vec());
+            mount_fs_and_io(&ctrl, &tmp_dir, |dir| {
+                let tstr = dir.path().to_string_lossy().to_string();
+                dd_rw_file(&tstr, true, 4096, 128);
+            });
+        }
     }
 
     fn check_ro(ctrl: &UblkCtrl, exp_ro: bool) {
@@ -416,7 +459,7 @@ mod integration {
         }
         __test_ublk_add_del_loop(4096, true, |id, _bs, _file_size| {
             let ctrl = UblkCtrl::new_simple(id).unwrap();
-            format_and_mount(&ctrl);
+            ext4_format_and_mount(&ctrl);
         });
     }
 
@@ -427,7 +470,7 @@ mod integration {
         }
         __test_ublk_add_del_qcow2(4096, |id, _bs, _file_size| {
             let ctrl = UblkCtrl::new_simple(id).unwrap();
-            format_and_mount(&ctrl);
+            ext4_format_and_mount(&ctrl);
         });
     }
 
@@ -443,33 +486,15 @@ mod integration {
 
         let tf = |id: i32, _bs: u32, _file_size: usize| {
             let ctrl = UblkCtrl::new_simple(id).unwrap();
-            let bdev = ctrl.get_bdev_path();
             let tmp_dir = tempfile::TempDir::new().unwrap();
-            let tmp_str = tmp_dir.path().to_string_lossy().to_string();
 
-            let res = Command::new("mkfs.btrfs")
-                .args(["-O", "zoned", "-f", &bdev])
-                .stdout(std::process::Stdio::null())
-                .status()
-                .expect("Failed to execute mkfs.btrfs");
-            assert!(res.success());
+            mkfs(&ctrl, "btrfs", ["-O", "zoned", "-f"].to_vec());
+            mount_fs_and_io(&ctrl, &tmp_dir, |dir| {
+                let tstr = dir.path().to_string_lossy().to_string();
 
-            let res = Command::new("mount")
-                .args([&bdev, &tmp_str])
-                .stdout(std::process::Stdio::null())
-                .status()
-                .expect("Failed to execute mount");
-            assert!(res.success());
-
-            dd_rw_file(&tmp_str, true, 8192, 16 * 1024);
-            dd_rw_file(&tmp_str, false, 8192, 16 * 1024);
-
-            let res = Command::new("umount")
-                .args([&tmp_str])
-                .stdout(std::process::Stdio::null())
-                .status()
-                .expect("Failed to execute umount");
-            assert!(res.success());
+                dd_rw_file(&tstr, true, 8192, 16 * 1024);
+                dd_rw_file(&tstr, false, 8192, 16 * 1024);
+            });
         };
 
         __test_ublk_add_del_zoned(4096, 1, tf, None);
