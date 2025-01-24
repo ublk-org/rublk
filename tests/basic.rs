@@ -215,12 +215,15 @@ mod integration {
         id
     }
 
-    fn run_rublk_del_dev(id: i32) {
+    fn run_rublk_del_dev(id: i32, async_del: bool) {
         let id_str = id.to_string();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let para = ["del", "-n", &id_str].to_vec();
-        let _ = run_rublk_cmd(para, 0);
+        let mut para = ["del", "-n", &id_str].to_vec();
+        if async_del {
+            para.push("--async");
+        }
+        let _ = run_rublk_cmd(para.to_vec(), 0);
     }
 
     fn __test_ublk_add_del_null(bs: u32, aa: bool) {
@@ -234,7 +237,7 @@ mod integration {
 
         read_ublk_disk(&ctrl);
         check_block_size(&ctrl, bs);
-        run_rublk_del_dev(id);
+        run_rublk_del_dev(id, aa);
     }
     #[test]
     fn test_ublk_add_del_null() {
@@ -277,7 +280,7 @@ mod integration {
 
                     let id = run_rublk_add_dev(cmdline);
                     tf(id, bs, 4 << 20);
-                    run_rublk_del_dev(id);
+                    run_rublk_del_dev(id, false);
                 }
             }
             _ => {}
@@ -328,7 +331,7 @@ mod integration {
 
         f(id, bs, file_size.try_into().unwrap());
 
-        run_rublk_del_dev(id);
+        run_rublk_del_dev(id, false);
     }
     #[test]
     fn test_ublk_add_del_loop() {
@@ -350,7 +353,7 @@ mod integration {
         let id = run_rublk_add_dev(cmds.to_vec());
         let ctrl = UblkCtrl::new_simple(id).unwrap();
         check_ro(&ctrl, exp_ro);
-        run_rublk_del_dev(id);
+        run_rublk_del_dev(id, false);
     }
     #[test]
     fn test_ublk_null_read_only() {
@@ -390,7 +393,7 @@ mod integration {
 
         f(id, bs, file_size);
 
-        run_rublk_del_dev(id);
+        run_rublk_del_dev(id, false);
     }
     #[test]
     fn test_ublk_add_del_qcow2() {

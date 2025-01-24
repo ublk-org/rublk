@@ -317,11 +317,14 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-fn __ublk_del(id: i32) -> anyhow::Result<i32> {
+fn __ublk_del(id: i32, async_del: bool) -> anyhow::Result<i32> {
     let ctrl = UblkCtrl::new_simple(id)?;
 
     let _ = ctrl.kill_dev();
-    let _ = ctrl.del_dev();
+    let _ = match async_del {
+        false => ctrl.del_dev(),
+        true => ctrl.del_dev_async(),
+    };
 
     let run_path = ctrl.run_path();
     let json_path = std::path::Path::new(&run_path);
@@ -334,7 +337,7 @@ fn ublk_del(opt: args::DelArgs) -> anyhow::Result<i32> {
     log::trace!("ublk del {} {}", opt.number, opt.all);
 
     if !opt.all {
-        __ublk_del(opt.number)?;
+        __ublk_del(opt.number, opt.r#async)?;
 
         return Ok(0);
     }
@@ -346,7 +349,7 @@ fn ublk_del(opt: args::DelArgs) -> anyhow::Result<i32> {
                 if let Some(file_stem) = f.file_stem() {
                     if let Some(stem) = file_stem.to_str() {
                         if let Ok(num) = stem.parse::<i32>() {
-                            __ublk_del(num)?;
+                            __ublk_del(num, opt.r#async)?;
                         }
                     }
                 }

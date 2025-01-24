@@ -191,6 +191,11 @@ pub(crate) struct DelArgs {
     /// remove all ublk devices
     #[clap(long, short = 'a', default_value_t = false)]
     pub all: bool,
+
+    /// remove device in async way. The same device id may not be
+    /// reused after returning from async deletion
+    #[clap(long, default_value_t = false)]
+    pub r#async: bool,
 }
 
 #[derive(Args)]
