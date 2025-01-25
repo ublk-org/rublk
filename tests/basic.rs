@@ -29,6 +29,30 @@ mod integration {
         }
     }
 
+    fn support_zoned() -> bool {
+        match UblkCtrl::get_features() {
+            Some(f) => {
+                if (f & sys::UBLK_F_ZONED as u64) == 0 {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        match libublk::ctrl::UblkCtrlBuilder::default()
+            .name("zoned_test")
+            .depth(4)
+            .nr_queues(1)
+            .id(-1)
+            .ctrl_flags((libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_ZONED).into())
+            .dev_flags(libublk::UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .io_buf_bytes(512 * 1024)
+            .build()
+        {
+            Ok(_) => true,
+            _ => false,
+        }
+    }
+
     fn mkfs(ctrl: &UblkCtrl, fs: &str, args: Vec<&str>) {
         let bdev = ctrl.get_bdev_path();
         let cmd = "mkfs.".to_string() + fs;
@@ -298,43 +322,39 @@ mod integration {
     where
         F: Fn(&UblkCtrl, u32, usize),
     {
-        match UblkCtrl::get_features() {
-            Some(f) => {
-                if (f & sys::UBLK_F_ZONED as u64) != 0 {
-                    let bs_str = format!("{}", bs);
-                    let queues_str = format!("{}", queues);
-                    let mut cmdline = [
-                        "add",
-                        "zoned",
-                        "-q",
-                        &queues_str,
-                        "--zone-size",
-                        "4",
-                        "--logical-block-size",
-                        &bs_str,
-                    ]
-                    .to_vec();
+        let bs_str = format!("{}", bs);
+        let queues_str = format!("{}", queues);
+        let mut cmdline = [
+            "add",
+            "zoned",
+            "-q",
+            &queues_str,
+            "--zone-size",
+            "4",
+            "--logical-block-size",
+            &bs_str,
+        ]
+        .to_vec();
 
-                    if let Some(d) = dir {
-                        cmdline.push("--path");
-                        cmdline.push(d);
-                    };
-                    if r {
-                        cmdline.push("-r");
-                    }
-
-                    let ctrl = run_rublk_add_dev(cmdline);
-                    tf(&ctrl, bs, 4 << 20);
-                    run_rublk_del_dev(ctrl, false);
-                }
-            }
-            _ => {}
+        if let Some(d) = dir {
+            cmdline.push("--path");
+            cmdline.push(d);
+        };
+        if r {
+            cmdline.push("-r");
         }
+
+        let ctrl = run_rublk_add_dev(cmdline);
+        tf(&ctrl, bs, 4 << 20);
+        run_rublk_del_dev(ctrl, false);
     }
 
     #[test]
     fn test_ublk_add_del_zoned() {
         if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
             return;
         }
         let tf = |ctrl: &UblkCtrl, bs: u32, _file_size: usize| {
@@ -470,7 +490,9 @@ mod integration {
         if !support_ublk() {
             return;
         }
-
+        if !support_zoned() {
+            return;
+        }
         if !has_mkfs_btrfs() {
             return;
         }
@@ -537,6 +559,10 @@ mod integration {
     #[test]
     fn test_ublk_zoned_recover() {
         if !support_ublk() {
+            return;
+        }
+
+        if !support_zoned() {
             return;
         }
 
