@@ -163,6 +163,11 @@ impl TgtCfg {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ZoneJson {
+    path: PathBuf,
+}
+
 struct ZonedTgt {
     start: u64,
     nr_zones: u32,
@@ -1049,6 +1054,10 @@ pub(crate) struct ZonedAddArgs {
 
 fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
     if zo.path.is_none() {
+        if zo.gen_arg.user_recovery {
+            return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
+        }
+
         Ok((TgtCfg::from_argument(zo)?, true))
     } else {
         let path = zo.path.clone().ok_or(PathBuf::new()).expect("path failure");
@@ -1085,14 +1094,19 @@ pub(crate) fn ublk_add_zoned(
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
     let (cfg, is_new) = match opt {
-        Some(ref o) => {
-            if o.gen_arg.user_recovery {
-                return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
-            }
+        Some(ref o) => parse_zone_params(o)?,
+        None => match ctrl.get_target_data_from_json() {
+            Some(val) => {
+                let zoned = &val["zoned"];
+                let tgt_data: Result<ZoneJson, _> = serde_json::from_value(zoned.clone());
 
-            parse_zone_params(o)?
-        }
-        None => return Err(anyhow::anyhow!("invalid parameter")),
+                match tgt_data {
+                    Ok(t) => (TgtCfg::from_file(&t.path.join("superblock"))?, false),
+                    Err(_) => return Err(anyhow::anyhow!("wrong json data")),
+                }
+            }
+            None => return Err(anyhow::anyhow!("invalid parameter")),
+        },
     };
 
     if cfg.size < cfg.zone_size || (cfg.size % cfg.zone_size) != 0 || (cfg.zone_size % 512) != 0 {
@@ -1120,6 +1134,10 @@ pub(crate) fn ublk_add_zoned(
             o.gen_arg.apply_read_only(dev);
         }
 
+        if let Some(c) = cfg_i.base {
+            let val = serde_json::json!({"zoned": ZoneJson { path: c}});
+            dev.set_target_json(val);
+        }
         Ok(())
     };
 
