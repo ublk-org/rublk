@@ -1072,6 +1072,7 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
                 "{} {} {} {} {}",
                 s, zs, zo.conv_zones, zo.max_open_zones, zo.max_active_zones
             )?;
+            file.flush()?;
             Ok((cfg, true))
         }
     }
