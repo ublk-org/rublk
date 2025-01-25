@@ -235,7 +235,7 @@ mod integration {
         buf
     }
 
-    fn run_rublk_add_dev(s: Vec<&str>) -> i32 {
+    fn run_rublk_add_dev(s: Vec<&str>) -> UblkCtrl {
         let buf = run_rublk_cmd(s, 64);
         let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
 
@@ -255,10 +255,11 @@ mod integration {
         let dev_path = ctrl.get_bdev_path();
         assert!(Path::new(&dev_path).exists() == true);
 
-        id
+        ctrl
     }
 
-    fn run_rublk_del_dev(id: i32, async_del: bool) {
+    fn run_rublk_del_dev(ctrl: UblkCtrl, async_del: bool) {
+        let id = ctrl.dev_info().dev_id;
         let id_str = id.to_string();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -275,12 +276,10 @@ mod integration {
         if aa {
             cmd_line.push("-a");
         }
-        let id = run_rublk_add_dev(cmd_line);
-        let ctrl = UblkCtrl::new_simple(id).unwrap();
-
+        let ctrl = run_rublk_add_dev(cmd_line);
         read_ublk_disk(&ctrl);
         check_block_size(&ctrl, bs);
-        run_rublk_del_dev(id, aa);
+        run_rublk_del_dev(ctrl, aa);
     }
     #[test]
     fn test_ublk_add_del_null() {
@@ -297,7 +296,7 @@ mod integration {
 
     fn __test_ublk_add_del_zoned<F>(bs: u32, queues: u32, tf: F, dir: Option<&String>)
     where
-        F: Fn(i32, u32, usize),
+        F: Fn(&UblkCtrl, u32, usize),
     {
         match UblkCtrl::get_features() {
             Some(f) => {
@@ -321,9 +320,9 @@ mod integration {
                         cmdline.push(d);
                     };
 
-                    let id = run_rublk_add_dev(cmdline);
-                    tf(id, bs, 4 << 20);
-                    run_rublk_del_dev(id, false);
+                    let ctrl = run_rublk_add_dev(cmdline);
+                    tf(&ctrl, bs, 4 << 20);
+                    run_rublk_del_dev(ctrl, false);
                 }
             }
             _ => {}
@@ -338,10 +337,9 @@ mod integration {
         match UblkCtrl::get_features() {
             Some(f) => {
                 if f & (libublk::sys::UBLK_F_ZONED as u64) != 0 {
-                    let tf = |id: i32, bs: u32, _file_size: usize| {
-                        let ctrl = UblkCtrl::new_simple(id).unwrap();
-                        read_ublk_disk(&ctrl);
-                        check_block_size(&ctrl, bs);
+                    let tf = |ctrl: &UblkCtrl, bs: u32, _file_size: usize| {
+                        read_ublk_disk(ctrl);
+                        check_block_size(ctrl, bs);
                     };
                     __test_ublk_add_del_zoned(512, 1, tf, None);
                     __test_ublk_add_del_zoned(4096, 1, tf, None);
@@ -353,7 +351,7 @@ mod integration {
 
     fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, f: F)
     where
-        F: Fn(i32, u32, usize),
+        F: Fn(&UblkCtrl, u32, usize),
     {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024; // 1 MB
@@ -370,11 +368,9 @@ mod integration {
         if aa {
             cmd_line.push("-a");
         }
-        let id = run_rublk_add_dev(cmd_line);
-
-        f(id, bs, file_size.try_into().unwrap());
-
-        run_rublk_del_dev(id, false);
+        let ctrl = run_rublk_add_dev(cmd_line);
+        f(&ctrl, bs, file_size.try_into().unwrap());
+        run_rublk_del_dev(ctrl, false);
     }
     #[test]
     fn test_ublk_add_del_loop() {
@@ -382,10 +378,9 @@ mod integration {
             return;
         }
 
-        let tf = |id: i32, bs: u32, _file_size: usize| {
-            let ctrl = UblkCtrl::new_simple(id).unwrap();
-            read_ublk_disk(&ctrl);
-            check_block_size(&ctrl, bs);
+        let tf = |ctrl: &UblkCtrl, bs: u32, _file_size: usize| {
+            read_ublk_disk(ctrl);
+            check_block_size(ctrl, bs);
         };
 
         __test_ublk_add_del_loop(4096, false, tf);
@@ -393,10 +388,9 @@ mod integration {
     }
 
     fn __test_ublk_null_read_only(cmds: &[&str], exp_ro: bool) {
-        let id = run_rublk_add_dev(cmds.to_vec());
-        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        let ctrl = run_rublk_add_dev(cmds.to_vec());
         check_ro(&ctrl, exp_ro);
-        run_rublk_del_dev(id, false);
+        run_rublk_del_dev(ctrl, false);
     }
     #[test]
     fn test_ublk_null_read_only() {
@@ -410,7 +404,7 @@ mod integration {
 
     fn __test_ublk_add_del_qcow2<F>(bs: u32, f: F)
     where
-        F: Fn(i32, u32, usize),
+        F: Fn(&UblkCtrl, u32, usize),
     {
         let tmp_file = tempfile::NamedTempFile::new().unwrap();
         let file_size = 32 * 1024 * 1024;
@@ -422,7 +416,7 @@ mod integration {
             _ => panic!(),
         };
 
-        let id = run_rublk_add_dev(
+        let ctrl = run_rublk_add_dev(
             [
                 "add",
                 "qcow2",
@@ -433,22 +427,18 @@ mod integration {
             ]
             .to_vec(),
         );
-
-        f(id, bs, file_size);
-
-        run_rublk_del_dev(id, false);
+        f(&ctrl, bs, file_size);
+        run_rublk_del_dev(ctrl, false);
     }
     #[test]
     fn test_ublk_add_del_qcow2() {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_qcow2(4096, |id, bs, file_size| {
-            let ctrl = UblkCtrl::new_simple(id).unwrap();
-
-            read_ublk_disk(&ctrl);
-            write_ublk_disk(&ctrl, bs, file_size);
-            check_block_size(&ctrl, bs);
+        __test_ublk_add_del_qcow2(4096, |ctrl, bs, file_size| {
+            read_ublk_disk(ctrl);
+            write_ublk_disk(ctrl, bs, file_size);
+            check_block_size(ctrl, bs);
         });
     }
 
@@ -457,9 +447,8 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_loop(4096, true, |id, _bs, _file_size| {
-            let ctrl = UblkCtrl::new_simple(id).unwrap();
-            ext4_format_and_mount(&ctrl);
+        __test_ublk_add_del_loop(4096, true, |ctrl, _bs, _file_size| {
+            ext4_format_and_mount(ctrl);
         });
     }
 
@@ -468,9 +457,8 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_qcow2(4096, |id, _bs, _file_size| {
-            let ctrl = UblkCtrl::new_simple(id).unwrap();
-            ext4_format_and_mount(&ctrl);
+        __test_ublk_add_del_qcow2(4096, |ctrl, _bs, _file_size| {
+            ext4_format_and_mount(ctrl);
         });
     }
 
@@ -484,12 +472,11 @@ mod integration {
             return;
         }
 
-        let tf = |id: i32, _bs: u32, _file_size: usize| {
-            let ctrl = UblkCtrl::new_simple(id).unwrap();
+        let tf = |ctrl: &UblkCtrl, _bs: u32, _file_size: usize| {
             let tmp_dir = tempfile::TempDir::new().unwrap();
 
-            mkfs(&ctrl, "btrfs", ["-O", "zoned", "-f"].to_vec());
-            mount_fs_and_io(&ctrl, &tmp_dir, |dir| {
+            mkfs(ctrl, "btrfs", ["-O", "zoned", "-f"].to_vec());
+            mount_fs_and_io(ctrl, &tmp_dir, |dir| {
                 let tstr = dir.path().to_string_lossy().to_string();
 
                 dd_rw_file(&tstr, true, 8192, 16 * 1024);
