@@ -33,13 +33,13 @@ jobs:
         sudo systemctl enable --now systemd-networkd
 
     - name: "cache: os packages"
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/mkosi.cache
         key: fedora-cache-v1
 
     - name: "acquire: rublk"
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: "build: fedora image"
       working-directory: ci
