@@ -334,19 +334,12 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        match UblkCtrl::get_features() {
-            Some(f) => {
-                if f & (libublk::sys::UBLK_F_ZONED as u64) != 0 {
-                    let tf = |ctrl: &UblkCtrl, bs: u32, _file_size: usize| {
-                        read_ublk_disk(ctrl);
-                        check_block_size(ctrl, bs);
-                    };
-                    __test_ublk_add_del_zoned(512, 1, tf, None);
-                    __test_ublk_add_del_zoned(4096, 1, tf, None);
-                }
-            }
-            None => {}
-        }
+        let tf = |ctrl: &UblkCtrl, bs: u32, _file_size: usize| {
+            read_ublk_disk(ctrl);
+            check_block_size(ctrl, bs);
+        };
+        __test_ublk_add_del_zoned(512, 1, tf, None);
+        __test_ublk_add_del_zoned(4096, 1, tf, None);
     }
 
     fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, f: F)
