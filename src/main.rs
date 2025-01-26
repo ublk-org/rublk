@@ -320,10 +320,10 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> anyhow::Result<i32> {
 fn __ublk_del(id: i32, async_del: bool) -> anyhow::Result<i32> {
     let ctrl = UblkCtrl::new_simple(id)?;
 
-    let _ = ctrl.kill_dev();
-    let _ = match async_del {
-        false => ctrl.del_dev(),
-        true => ctrl.del_dev_async(),
+    ctrl.kill_dev()?;
+    match async_del {
+        false => ctrl.del_dev()?,
+        true => ctrl.del_dev_async()?,
     };
 
     let run_path = ctrl.run_path();
