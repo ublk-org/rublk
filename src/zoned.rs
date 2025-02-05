@@ -17,7 +17,7 @@ use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 
 use anyhow::bail;
 use bitflags::bitflags;
-use io_uring::{opcode, types};
+use io_uring::{opcode, squeue, types};
 use libc::{c_void, memset, pread, pwrite};
 use log::trace;
 use std::fs::{File, OpenOptions};
@@ -804,7 +804,8 @@ async fn handle_read(
         //read to temp buffer from backed-file
         let sqe = opcode::Read::new(types::Fd(zfd), buf_addr as *mut u8, bytes as u32)
             .offset(zf_offset)
-            .build();
+            .build()
+            .flags(squeue::Flags::ASYNC);
         let res = q.ublk_submit_sqe(sqe).await;
         if res < 0 {
             return Err(anyhow::anyhow!("io uring read failure {}", res));
@@ -846,7 +847,8 @@ async fn handle_plain_write(
         // handle the write
         let sqe = opcode::Write::new(types::Fd(zfd), buf_addr as *const u8, bytes as u32)
             .offset(zf_offset)
-            .build();
+            .build()
+            .flags(squeue::Flags::ASYNC);
         q.ublk_submit_sqe(sqe).await
     } else {
         let off = start_sector << 9;
