@@ -419,6 +419,12 @@ impl ZonedTgt {
         }
     }
 
+    fn back_file_preallocate(&self, sector: u64) {
+        let fd = self.get_zone_fd(sector);
+        let zsize = self.cfg.zone_size.try_into().unwrap();
+        unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, zsize) };
+    }
+
     fn close_imp_open_zone(&self) -> anyhow::Result<()> {
         let mut zno = self.get_imp_close_zone_no();
         if zno >= self.nr_zones {
@@ -938,6 +944,12 @@ async fn handle_write(
                 zs.cond = BLK_ZONE_COND_IMP_OPEN;
             }
         }
+
+        // preallocate space for this zone
+        if !tgt.ram_backed() && zs.wp == z.start {
+            tgt.back_file_preallocate(sector);
+        }
+
         zs.wp += iod.nr_sectors as u64;
 
         (zs.wp, sector)
