@@ -79,7 +79,23 @@ impl GenAddArgs {
     }
 }
 
-fn is_power2_of(input: u64, base: u64) -> bool {
+use std::convert::TryFrom;
+
+pub fn round_up<T>(x: T, y: T) -> T
+where
+    T: Copy + Into<u64> + TryFrom<u64>, // support u32, u64 and try conversion back
+{
+    let x: u64 = x.into();
+    let y: u64 = y.into();
+    assert!(y & (y - 1) == 0, "y isn't power_of_2");
+    let result = (x + y - 1) & !(y - 1);
+
+    T::try_from(result).unwrap_or_else(|_| {
+        panic!("Overflow occurred during conversion from u64 to the original type");
+    })
+}
+
+pub fn is_power2_of(input: u64, base: u64) -> bool {
     assert!((base & (base - 1)) == 0);
 
     let quotient = input / base;
