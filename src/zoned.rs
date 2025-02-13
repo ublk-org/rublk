@@ -109,6 +109,7 @@ struct TgtData {
 struct TgtCfg {
     size: u64,
     zone_size: u64,
+    pre_alloc_size: u64,
     _zone_capacity: u64,
     zone_nr_conv: u32,
     zone_max_open: u32,
@@ -117,7 +118,16 @@ struct TgtCfg {
 }
 
 impl TgtCfg {
-    fn new(s: u32, zs: u32, conv: u32, m_open: u32, m_act: u32, b: Option<PathBuf>) -> Self {
+    const DEF_ZONE_PRE_ALLOC_MB: u32 = 256;
+    fn new(
+        s: u32,
+        zs: u32,
+        conv: u32,
+        m_open: u32,
+        m_act: u32,
+        b: Option<PathBuf>,
+        p: u32,
+    ) -> Self {
         TgtCfg {
             size: (s as u64) << 20,
             zone_size: (zs as u64) << 20,
@@ -126,6 +136,7 @@ impl TgtCfg {
             zone_max_open: m_open,
             zone_max_active: m_act,
             base: b,
+            pre_alloc_size: (p as u64) << 20,
         }
     }
     fn from_argument(a: &ZonedAddArgs) -> anyhow::Result<Self> {
@@ -144,11 +155,15 @@ impl TgtCfg {
         let zs = (cfg.parse_size(a.zone_size.clone())? >> 20)
             .try_into()
             .unwrap();
-        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, a.max_active_zones, p);
+        let za = (cfg.parse_size(a.pre_alloc_size.clone())? >> 20)
+            .try_into()
+            .unwrap();
+        let ma_zones = a.max_active_zones;
+        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, ma_zones, p, za);
 
         Ok(tcfg)
     }
-    fn from_file(p: &PathBuf) -> anyhow::Result<Self> {
+    fn from_file(p: &PathBuf, zo: Option<&ZonedAddArgs>) -> anyhow::Result<Self> {
         let first_line = BufReader::new(File::open(p)?).lines().next();
         if let Some(Ok(l)) = first_line {
             let n: Vec<u32> = l
@@ -156,7 +171,16 @@ impl TgtCfg {
                 .map(|s| s.parse().expect("fail"))
                 .collect();
             let base = p.parent().expect("no parent?").to_path_buf();
-            let c = TgtCfg::new(n[0], n[1], n[2], n[3], n[4], Some(base));
+            let za = match zo {
+                Some(a) => {
+                    let cfg = parse_size::Config::new().with_default_factor(1_048_576);
+                    (cfg.parse_size(a.pre_alloc_size.clone())? >> 20)
+                        .try_into()
+                        .unwrap()
+                }
+                _ => Self::DEF_ZONE_PRE_ALLOC_MB,
+            };
+            let c = TgtCfg::new(n[0], n[1], n[2], n[3], n[4], Some(base), za);
             return Ok(c);
         }
         anyhow::bail!("faile to create TgtCfg from file")
@@ -419,10 +443,28 @@ impl ZonedTgt {
         }
     }
 
-    fn back_file_preallocate(&self, sector: u64) {
+    fn back_file_preallocate(&self, sector: u64, nr_sects: u32) {
         let fd = self.get_zone_fd(sector);
-        let zsize = self.cfg.zone_size.try_into().unwrap();
-        unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, zsize) };
+        let zsize = self.cfg.zone_size;
+        let za_size = self.cfg.pre_alloc_size;
+        let start = (sector << 9) & (zsize - 1);
+        let end = start + ((nr_sects << 9) as u64);
+        let za_start = super::args::round_up(start, za_size);
+        let za_end = super::args::round_up(end, za_size);
+
+        if za_start == za_end {
+            return;
+        }
+
+        let sz = za_end - za_start;
+        unsafe {
+            libc::fallocate(
+                fd,
+                libc::FALLOC_FL_KEEP_SIZE,
+                za_start.try_into().unwrap(),
+                sz.try_into().unwrap(),
+            )
+        };
     }
 
     fn close_imp_open_zone(&self) -> anyhow::Result<()> {
@@ -946,8 +988,8 @@ async fn handle_write(
         }
 
         // preallocate space for this zone
-        if !tgt.ram_backed() && zs.wp == z.start {
-            tgt.back_file_preallocate(sector);
+        if !tgt.ram_backed() {
+            tgt.back_file_preallocate(sector, iod.nr_sectors);
         }
 
         zs.wp += iod.nr_sectors as u64;
@@ -1051,6 +1093,12 @@ pub(crate) struct ZonedAddArgs {
     #[clap(long, default_value = "256MiB")]
     zone_size: String,
 
+    ///how many bytes preallocated before appending data to zone, default unit
+    ///is MiB, with common suffixes supported([B|KiB|MiB|GiB]), can't be bigger
+    ///than zone size and has to be power2
+    #[clap(long, default_value = "256MiB")]
+    pre_alloc_size: String,
+
     /// How many conventioanl zones starting from sector 0
     #[clap(long, default_value_t = 2)]
     conv_zones: u32,
@@ -1080,7 +1128,7 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
         }
         let zf = path.join("superblock");
         if zf.exists() {
-            Ok((TgtCfg::from_file(&zf)?, false))
+            Ok((TgtCfg::from_file(&zf, Some(zo))?, false))
         } else {
             //create superblock file with passed parameter
             let cfg = TgtCfg::from_argument(zo)?;
@@ -1113,7 +1161,7 @@ pub(crate) fn ublk_add_zoned(
                 let tgt_data: Result<ZoneJson, _> = serde_json::from_value(zoned.clone());
 
                 match tgt_data {
-                    Ok(t) => (TgtCfg::from_file(&t.path.join("superblock"))?, false),
+                    Ok(t) => (TgtCfg::from_file(&t.path.join("superblock"), None)?, false),
                     Err(_) => return Err(anyhow::anyhow!("wrong json data")),
                 }
             }
@@ -1127,6 +1175,10 @@ pub(crate) fn ublk_add_zoned(
 
     if u64::from((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
         return Err(anyhow::anyhow!("Too many conventioanl zones"));
+    }
+
+    if cfg.pre_alloc_size > cfg.zone_size && !super::args::is_power2_of(cfg.pre_alloc_size, 4096) {
+        bail!(anyhow::anyhow!("bad pre_alloc_size"));
     }
 
     let cfg_i = cfg.clone();
