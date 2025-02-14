@@ -110,7 +110,7 @@ struct TgtCfg {
     size: u64,
     zone_size: u64,
     pre_alloc_size: u64,
-    _zone_capacity: u64,
+    zone_capacity: u64,
     zone_nr_conv: u32,
     zone_max_open: u32,
     zone_max_active: u32,
@@ -131,7 +131,7 @@ impl TgtCfg {
         TgtCfg {
             size: (s as u64) << 20,
             zone_size: (zs as u64) << 20,
-            _zone_capacity: (zs as u64) << 20,
+            zone_capacity: (zs as u64) << 20,
             zone_nr_conv: conv,
             zone_max_open: m_open,
             zone_max_active: m_act,
@@ -297,7 +297,7 @@ impl ZonedTgt {
             None => 0,
             Some(ref val) => val.as_mut_ptr() as u64,
         };
-        let zone_cap = cfg.zone_size >> 9;
+        let zone_cap = cfg.zone_capacity >> 9;
         let nr_zones = cfg.size / cfg.zone_size;
 
         let zones: Vec<Zone> = (0..nr_zones as usize)
