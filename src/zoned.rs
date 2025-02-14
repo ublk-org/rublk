@@ -1075,28 +1075,38 @@ pub(crate) struct ZonedAddArgs {
     #[command(flatten)]
     pub gen_arg: super::args::GenAddArgs,
 
-    ///work directory of file-backed Zoned, if `superblock` file exists,
-    ///parse parameters from this file and setup zoned; otherwise, create
-    ///it and store current parameters to this file
-    ///
-    /// Default: ram backed zoned
-    #[clap(long, default_value = None)]
+    #[clap(long,
+        default_value = None,
+        help = "work directory of file-backed Zoned, if `superblock` file exists,\n\
+        parse parameters from this file and setup zoned; otherwise, create\n\
+        it and store current parameters to this file.\n\
+        Default: None(ram backed zoned)"
+        )]
     path: Option<PathBuf>,
 
-    ///Size of the whole zoned device, default unit is MiB,
-    ///with common suffixes supported ([B|KiB|KB|MiB|MB|GiB|GB|TiB|TB])
-    #[clap(long, default_value = "1024MiB")]
+    #[clap(
+        long,
+        default_value = "1024MiB",
+        help = "Size of the whole zoned device, default unit is MiB, with common\n\
+        suffixes supported ([B|KiB|KB|MiB|MB|GiB|GB|TiB|TB])"
+    )]
     size: String,
 
-    ///zone size, default unit is MiB, with common suffixes supported
-    ///([B|KiB|MiB|GiB]), has to be aligned with logical block size
-    #[clap(long, default_value = "256MiB")]
+    #[clap(
+        long,
+        default_value = "256MiB",
+        help = "zone size, default unit is MiB, with common suffixes supported\n\
+        ([B|KiB|MiB|GiB]), has to be aligned with logical block size"
+    )]
     zone_size: String,
 
-    ///how many bytes preallocated before appending data to zone, default unit
-    ///is MiB, with common suffixes supported([B|KiB|MiB|GiB]), can't be bigger
-    ///than zone size and has to be power2
-    #[clap(long, default_value = "256MiB")]
+    #[clap(
+        long,
+        default_value = "256MiB",
+        help = "how many bytes preallocated before appending data to zone, default\n\
+        unit is MiB, with common suffixes supported([B|KiB|MiB|GiB]), can't be\n\
+        bigger than zone size and has to be power2_of"
+    )]
     pre_alloc_size: String,
 
     /// How many conventioanl zones starting from sector 0

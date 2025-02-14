@@ -19,9 +19,13 @@ pub(crate) struct GenAddArgs {
     #[clap(long, short = 'd', default_value_t = 128)]
     pub depth: u32,
 
-    /// io buffer size, has to be aligned with PAGE_SIZE
-    /// and common suffixes supported ([B|KiB|MiB|GiB])
-    #[clap(long, short = 'b', default_value = "524288")]
+    #[clap(
+        long,
+        short = 'b',
+        default_value = "524288",
+        help = "io buffer size, has to be aligned with PAGE_SIZE\n\
+        and common suffixes supported ([B|KiB|MiB|GiB])"
+    )]
     pub io_buf_size: String,
 
     /// enable user recovery
