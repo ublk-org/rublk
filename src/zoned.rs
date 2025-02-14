@@ -105,7 +105,7 @@ struct TgtData {
     imp_close_zone_no: u32,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 struct TgtCfg {
     size: u64,
     zone_size: u64,
@@ -163,6 +163,53 @@ impl TgtCfg {
 
         Ok(tcfg)
     }
+
+    fn get_pre_alloc_size(zo: Option<&ZonedAddArgs>) -> anyhow::Result<u32> {
+        let za = match zo {
+            Some(a) => {
+                let cfg = parse_size::Config::new().with_default_factor(1_048_576);
+                (cfg.parse_size(a.pre_alloc_size.clone())? >> 20)
+                    .try_into()
+                    .unwrap()
+            }
+            _ => Self::DEF_ZONE_PRE_ALLOC_MB,
+        };
+        Ok(za)
+    }
+
+    fn save_file_json(&self, p: &PathBuf) -> anyhow::Result<()> {
+        let json_string = serde_json::to_string_pretty(self)?;
+        let mut f = OpenOptions::new().create(true).write(true).open(p)?;
+        f.write_all(json_string.as_bytes())?;
+        let _ = f.flush();
+        Ok(())
+    }
+
+    fn is_parent_of(parent: &PathBuf, child: &PathBuf) -> bool {
+        match child.parent() {
+            Some(parent_dir) => parent_dir == parent,
+            None => false,
+        }
+    }
+
+    fn from_file_json(p: &PathBuf, zo: Option<&ZonedAddArgs>) -> anyhow::Result<Self> {
+        let f = OpenOptions::new().read(true).open(p)?;
+        let reader = BufReader::new(f);
+        let mut cfg: Self = serde_json::from_reader(reader)?;
+
+        let exp = match cfg.base {
+            Some(ref base) => Self::is_parent_of(base, p),
+            None => false,
+        };
+
+        if !exp {
+            bail!("base isn't match with --path {}", p.display());
+        }
+
+        // pre-alloc-size can be overrided from command line
+        cfg.pre_alloc_size = (Self::get_pre_alloc_size(zo)? as u64) << 20;
+        Ok(cfg)
+    }
     fn from_file(p: &PathBuf, zo: Option<&ZonedAddArgs>) -> anyhow::Result<Self> {
         let first_line = BufReader::new(File::open(p)?).lines().next();
         if let Some(Ok(l)) = first_line {
@@ -171,15 +218,7 @@ impl TgtCfg {
                 .map(|s| s.parse().expect("fail"))
                 .collect();
             let base = p.parent().expect("no parent?").to_path_buf();
-            let za = match zo {
-                Some(a) => {
-                    let cfg = parse_size::Config::new().with_default_factor(1_048_576);
-                    (cfg.parse_size(a.pre_alloc_size.clone())? >> 20)
-                        .try_into()
-                        .unwrap()
-                }
-                _ => Self::DEF_ZONE_PRE_ALLOC_MB,
-            };
+            let za = Self::get_pre_alloc_size(zo)?;
             let c = TgtCfg::new(n[0], n[1], n[2], n[3], n[4], Some(base), za);
             return Ok(c);
         }
@@ -1137,22 +1176,20 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
             return Err(anyhow::anyhow!("base dir doesn't exist"));
         }
         let zf = path.join("superblock");
-        if zf.exists() {
-            Ok((TgtCfg::from_file(&zf, Some(zo))?, false))
+        let zfj = path.join("superblock.json");
+        if zfj.exists() {
+            Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false))
         } else {
-            //create superblock file with passed parameter
-            let cfg = TgtCfg::from_argument(zo)?;
-            let mut file = File::create(zf)?;
-            let zs = cfg.zone_size >> 20;
-            let s = cfg.size >> 20;
-
-            writeln!(
-                file,
-                "{} {} {} {} {}",
-                s, zs, zo.conv_zones, zo.max_open_zones, zo.max_active_zones
-            )?;
-            file.flush()?;
-            Ok((cfg, true))
+            if zf.exists() {
+                let c = TgtCfg::from_file(&zf, Some(zo))?;
+                c.save_file_json(&zfj)?;
+                std::fs::remove_file(zf)?;
+                Ok((c, false))
+            } else {
+                let c = TgtCfg::from_argument(zo)?;
+                c.save_file_json(&zfj)?;
+                Ok((c, true))
+            }
         }
     }
 }
@@ -1171,7 +1208,10 @@ pub(crate) fn ublk_add_zoned(
                 let tgt_data: Result<ZoneJson, _> = serde_json::from_value(zoned.clone());
 
                 match tgt_data {
-                    Ok(t) => (TgtCfg::from_file(&t.path.join("superblock"), None)?, false),
+                    Ok(t) => {
+                        let p = t.path.join("superblock.json");
+                        (TgtCfg::from_file_json(&p, None)?, false)
+                    }
                     Err(_) => return Err(anyhow::anyhow!("wrong json data")),
                 }
             }
