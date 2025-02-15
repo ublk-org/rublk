@@ -333,6 +333,8 @@ mod integration {
             "4",
             "--logical-block-size",
             &bs_str,
+            "--conv-zones",
+            "0",
         ]
         .to_vec();
 
