@@ -482,8 +482,8 @@ impl ZonedTgt {
         }
     }
 
-    fn back_file_preallocate(&self, sector: u64, nr_sects: u32) {
-        let fd = self.get_zone_fd(sector);
+    async fn back_file_preallocate(&self, q: &UblkQueue<'_>, sector: u64, nr_sects: u32) {
+        let zfd = self.get_zone_fd(sector);
         let zsize = self.cfg.zone_size;
         let za_size = self.cfg.pre_alloc_size;
         let start = (sector << 9) & (zsize - 1);
@@ -496,14 +496,11 @@ impl ZonedTgt {
         }
 
         let sz = za_end - za_start;
-        unsafe {
-            libc::fallocate(
-                fd,
-                libc::FALLOC_FL_KEEP_SIZE,
-                za_start.try_into().unwrap(),
-                sz.try_into().unwrap(),
-            )
-        };
+        let sqe = opcode::Fallocate::new(types::Fd(zfd), sz)
+            .offset(za_start)
+            .mode(libc::FALLOC_FL_KEEP_SIZE)
+            .build();
+        let _ = q.ublk_submit_sqe(sqe).await;
     }
 
     fn close_imp_open_zone(&self) -> anyhow::Result<()> {
@@ -1026,15 +1023,15 @@ async fn handle_write(
             }
         }
 
-        // preallocate space for this zone
-        if !tgt.ram_backed() {
-            tgt.back_file_preallocate(sector, iod.nr_sectors);
-        }
-
         zs.wp += iod.nr_sectors as u64;
 
         (zs.wp, sector)
     };
+
+    // preallocate space for this zone
+    if !tgt.ram_backed() {
+        tgt.back_file_preallocate(q, sector, iod.nr_sectors).await;
+    }
 
     let res = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await?;
     if wp == zone_end {
