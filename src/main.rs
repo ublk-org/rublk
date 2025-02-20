@@ -281,8 +281,7 @@ fn ublk_recover(opt: args::UblkArgs) -> anyhow::Result<i32> {
     }
 }
 
-const NR_FEATURES: usize = 9;
-const FEATURES_TABLE: [&str; NR_FEATURES] = [
+const FEATURES_TABLE: &[&str] = &[
     "ZERO_COPY",
     "COMP_IN_TASK",
     "NEED_GET_DATA",
@@ -304,7 +303,7 @@ fn ublk_features(_opt: args::UblkFeaturesArgs) -> anyhow::Result<i32> {
                     continue;
                 }
 
-                let feat = if i < NR_FEATURES {
+                let feat = if i < FEATURES_TABLE.len() {
                     FEATURES_TABLE[i]
                 } else {
                     "unknown"
