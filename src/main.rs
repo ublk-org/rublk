@@ -372,8 +372,8 @@ fn __ublk_list(id: i32) -> anyhow::Result<i32> {
 }
 
 fn ublk_list(opt: args::UblkArgs) -> anyhow::Result<i32> {
-    if opt.number > 0 {
-        let _ = __ublk_list(opt.number);
+    if opt.number >= 0 {
+        __ublk_list(opt.number)?;
         return Ok(0);
     }
 
@@ -384,7 +384,7 @@ fn ublk_list(opt: args::UblkArgs) -> anyhow::Result<i32> {
                 if let Some(file_stem) = f.file_stem() {
                     if let Some(stem) = file_stem.to_str() {
                         if let Ok(num) = stem.parse::<i32>() {
-                            let _ = __ublk_list(num);
+                            __ublk_list(num)?;
                         }
                     }
                 }
