@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct CompressAddArgs {
@@ -54,6 +54,15 @@ struct ReadJob {
 }
 
 struct ReadCompletion {
+    tag: u16,
+    result: Result<i32, i32>,
+}
+
+struct FlushJob {
+    tag: u16,
+}
+
+struct FlushCompletion {
     tag: u16,
     result: Result<i32, i32>,
 }
@@ -127,51 +136,28 @@ fn submit_poll_sqe(q: &UblkQueue, efd: i32, tag: u16, op: u32) {
     q.ublk_submit_sqe_sync(sqe).unwrap();
 }
 
-fn handle_flush_command(
-    q: &UblkQueue,
-    tag: u16,
-    pending_tags: &Arc<Mutex<Vec<u16>>>,
-    db: &Arc<DB>,
-    efd: i32,
-) {
-    let mut tags = pending_tags.lock().unwrap();
-    tags.push(tag);
-
-    if tags.len() == 1 {
-        let db_clone = db.clone();
-        submit_poll_sqe(q, efd, FLUSH_POLL_TAG, libublk::sys::UBLK_IO_OP_FLUSH);
-        std::thread::spawn(move || {
-            if let Err(e) = db_clone.flush() {
-                log::error!("Background rocksdb flush error: {}", e);
-            }
-            let data = 1u64;
-            nix::unistd::write(efd, &data.to_le_bytes()).unwrap();
-        });
-    }
-}
-
 fn handle_flush_completion(
     q: &UblkQueue,
-    pending_tags: &Arc<Mutex<Vec<u16>>>,
     efd: i32,
     bufs_ptr: *mut IoBuf<u8>,
+    completion_rx: &Receiver<FlushCompletion>,
 ) {
-    let mut tags = pending_tags.lock().unwrap();
-    if tags.is_empty() {
-        return;
-    }
-
     let mut buf = [0u8; 8];
     nix::unistd::read(efd, &mut buf).unwrap();
 
-    for tag in tags.iter() {
+    while let Ok(completion) = completion_rx.try_recv() {
+        let result = match completion.result {
+            Ok(r) => UblkIORes::Result(r),
+            Err(e) => UblkIORes::Result(e),
+        };
+        let tag = completion.tag;
         let buf_addr = unsafe {
-            let io_buf: &mut IoBuf<u8> = &mut *bufs_ptr.add(*tag as usize);
+            let io_buf: &mut IoBuf<u8> = &mut *bufs_ptr.add(tag as usize);
             io_buf.as_mut().as_mut_ptr()
         };
-        q.complete_io_cmd(*tag, buf_addr, Ok(UblkIORes::Result(0)));
+        q.complete_io_cmd(tag, buf_addr, Ok(result));
     }
-    tags.clear();
+    submit_poll_sqe(q, efd, FLUSH_POLL_TAG, libublk::sys::UBLK_IO_OP_FLUSH);
 }
 
 fn handle_read_completion(
@@ -200,18 +186,25 @@ fn handle_read_completion(
 fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
     let mut bufs = dev.alloc_queue_io_bufs();
     let bufs_ptr = bufs.as_mut_ptr();
-    let pending_flush_tags = Arc::new(Mutex::new(Vec::<u16>::new()));
     let flush_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
     let read_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
     let max_buf_len = dev.dev_info.max_io_buf_bytes as usize;
 
-    let (job_tx, job_rx): (Sender<ReadJob>, Receiver<ReadJob>) = channel();
-    let (completion_tx, completion_rx): (Sender<ReadCompletion>, Receiver<ReadCompletion>) =
-        channel();
+    let (read_job_tx, read_job_rx): (Sender<ReadJob>, Receiver<ReadJob>) = channel();
+    let (read_completion_tx, read_completion_rx): (
+        Sender<ReadCompletion>,
+        Receiver<ReadCompletion>,
+    ) = channel();
+
+    let (flush_job_tx, flush_job_rx): (Sender<FlushJob>, Receiver<FlushJob>) = channel();
+    let (flush_completion_tx, flush_completion_rx): (
+        Sender<FlushCompletion>,
+        Receiver<FlushCompletion>,
+    ) = channel();
 
     let db_clone = db.clone();
     std::thread::spawn(move || {
-        for job in job_rx {
+        for job in read_job_rx {
             let buf_slice = unsafe {
                 std::slice::from_raw_parts_mut(
                     job.buf_addr as *mut u8,
@@ -219,7 +212,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
                 )
             };
             let res = handle_read(&db_clone, job.start_sector, job.nr_sectors, buf_slice);
-            completion_tx
+            read_completion_tx
                 .send(ReadCompletion {
                     tag: job.tag,
                     result: res,
@@ -229,25 +222,49 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
         }
     });
 
+    let db_clone2 = db.clone();
+    std::thread::spawn(move || {
+        for job in flush_job_rx {
+            let res = if let Err(e) = db_clone2.flush() {
+                log::error!("Background rocksdb flush error: {}", e);
+                Err(-libc::EIO)
+            } else {
+                Ok(0)
+            };
+            flush_completion_tx
+                .send(FlushCompletion {
+                    tag: job.tag,
+                    result: res,
+                })
+                .unwrap();
+            nix::unistd::write(flush_efd, &1u64.to_le_bytes()).unwrap();
+        }
+    });
+
     let q = UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
         .submit_fetch_commands(Some(&bufs));
     submit_poll_sqe(&q, read_efd, READ_POLL_TAG, libublk::sys::UBLK_IO_OP_READ);
+    submit_poll_sqe(
+        &q,
+        flush_efd,
+        FLUSH_POLL_TAG,
+        libublk::sys::UBLK_IO_OP_FLUSH,
+    );
 
     let io_handler = {
-        let pending_flush_tags_clone = pending_flush_tags.clone();
         let db_clone = db.clone();
 
         move |q: &UblkQueue, tag: u16, io_ctx: &UblkIOCtx| {
             if io_ctx.is_tgt_io() {
                 match UblkIOCtx::user_data_to_op(io_ctx.user_data()) {
                     libublk::sys::UBLK_IO_OP_FLUSH => {
-                        handle_flush_completion(q, &pending_flush_tags_clone, flush_efd, bufs_ptr);
+                        handle_flush_completion(q, flush_efd, bufs_ptr, &flush_completion_rx);
                         return;
                     }
                     libublk::sys::UBLK_IO_OP_READ => {
-                        handle_read_completion(q, &completion_rx, read_efd, bufs_ptr);
+                        handle_read_completion(q, &read_completion_rx, read_efd, bufs_ptr);
                         return;
                     }
                     _ => {}
@@ -265,7 +282,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
 
             let res = match op {
                 libublk::sys::UBLK_IO_OP_READ => {
-                    job_tx
+                    read_job_tx
                         .send(ReadJob {
                             tag,
                             start_sector: iod.start_sector,
@@ -283,7 +300,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
                     handle_discard(&db_clone, cf, iod.start_sector, iod.nr_sectors)
                 }
                 libublk::sys::UBLK_IO_OP_FLUSH => {
-                    handle_flush_command(q, tag, &pending_flush_tags_clone, &db_clone, flush_efd);
+                    flush_job_tx.send(FlushJob { tag }).unwrap();
                     return;
                 }
                 _ => Err(-libc::EINVAL),
