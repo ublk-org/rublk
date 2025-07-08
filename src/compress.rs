@@ -4,13 +4,14 @@ use libublk::{
     io::{UblkDev, UblkIOCtx, UblkQueue},
     UblkIORes,
 };
-use rocksdb::{BlockBasedOptions, Cache, Options, SliceTransform, WriteBatch, WriteOptions, DB, DBCompressionType};
+use nix::sys::eventfd::{eventfd, EfdFlags};
+use rocksdb::{DBCompressionType, Options, SliceTransform, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct CompressAddArgs {
@@ -42,6 +43,8 @@ struct CompressJson {
     compression: String,
 }
 
+const FLUSH_POLL_TAG: u16 = u16::MAX;
+
 fn handle_read(db: &DB, start_sector: u64, nr_sectors: u32, buf: &mut [u8]) -> Result<i32, i32> {
     let keys: Vec<_> = (0..nr_sectors)
         .map(|i| (start_sector + i as u64).to_be_bytes())
@@ -55,7 +58,6 @@ fn handle_read(db: &DB, start_sector: u64, nr_sectors: u32, buf: &mut [u8]) -> R
                 sector_buf.copy_from_slice(value);
             }
             Ok(None) => {
-                // Not found, fill with zeros
                 for byte in sector_buf.iter_mut() {
                     *byte = 0;
                 }
@@ -77,6 +79,7 @@ fn handle_write(db: &DB, start_sector: u64, nr_sectors: u32, buf: &[u8]) -> Resu
         batch.put(&key, sector_buf);
     }
     let mut write_options = WriteOptions::new();
+    write_options.set_sync(false);
     write_options.disable_wal(true);
     if let Err(e) = db.write_opt(batch, &write_options) {
         log::error!("rocksdb write batch error: {}", e);
@@ -85,45 +88,115 @@ fn handle_write(db: &DB, start_sector: u64, nr_sectors: u32, buf: &[u8]) -> Resu
     Ok((nr_sectors << 9) as i32)
 }
 
-fn handle_flush(db: &DB) -> Result<i32, i32> {
-    if let Err(e) = db.flush() {
-        log::error!("rocksdb flush error: {}", e);
-        Err(-libc::EIO)
-    } else {
-        Ok(0)
+fn submit_flush_poll_sqe(q: &UblkQueue, efd: i32) {
+    let user_data =
+        UblkIOCtx::build_user_data(FLUSH_POLL_TAG, libublk::sys::UBLK_IO_OP_FLUSH, 0, true);
+    let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(efd), libc::POLLIN as _)
+        .build()
+        .user_data(user_data);
+    q.ublk_submit_sqe_sync(sqe).unwrap();
+}
+
+fn handle_flush_command(
+    q: &UblkQueue,
+    tag: u16,
+    pending_tags: &Arc<Mutex<Vec<u16>>>,
+    db: &Arc<DB>,
+    efd: i32,
+) {
+    let mut tags = pending_tags.lock().unwrap();
+    tags.push(tag);
+
+    if tags.len() == 1 {
+        let db_clone = db.clone();
+        submit_flush_poll_sqe(q, efd);
+        std::thread::spawn(move || {
+            if let Err(e) = db_clone.flush() {
+                log::error!("Background rocksdb flush error: {}", e);
+            }
+            let data = 1u64;
+            nix::unistd::write(efd, &data.to_le_bytes()).unwrap();
+        });
+    }
+}
+
+fn handle_flush_completion(
+    q: &UblkQueue,
+    pending_tags: &Arc<Mutex<Vec<u16>>>,
+    efd: i32,
+    bufs_ptr: *mut IoBuf<u8>,
+) {
+    {
+        let mut tags = pending_tags.lock().unwrap();
+        if tags.is_empty() {
+            return;
+        }
+
+        let mut buf = [0u8; 8];
+        nix::unistd::read(efd, &mut buf).unwrap();
+
+        for tag in tags.iter() {
+            let buf_addr = unsafe {
+                let io_buf: &mut IoBuf<u8> = &mut *bufs_ptr.add(*tag as usize);
+                io_buf.as_mut().as_mut_ptr()
+            };
+            q.complete_io_cmd(*tag, buf_addr, Ok(UblkIORes::Result(0)));
+        }
+        tags.clear();
     }
 }
 
 fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
     let mut bufs = dev.alloc_queue_io_bufs();
     let bufs_ptr = bufs.as_mut_ptr();
+    let pending_flush_tags = Arc::new(Mutex::new(Vec::<u16>::new()));
+    let efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
 
-    let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-        let iod = q.get_iod(tag);
-        let op = iod.op_flags & 0xff;
-        
-        let buf = unsafe {
-            let io_buf: &mut IoBuf<u8> = &mut *bufs_ptr.add(tag as usize);
-            &mut io_buf.as_mut()[..(iod.nr_sectors << 9) as usize]
-        };
+    let io_handler = {
+        let pending_flush_tags_clone = pending_flush_tags.clone();
+        let db_clone = db.clone();
 
-        let res = match op {
-            libublk::sys::UBLK_IO_OP_READ => handle_read(db, iod.start_sector, iod.nr_sectors, buf),
-            libublk::sys::UBLK_IO_OP_WRITE => handle_write(db, iod.start_sector, iod.nr_sectors, buf),
-            libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(db),
-            _ => Err(-libc::EINVAL),
-        };
+        move |q: &UblkQueue, tag: u16, io_ctx: &UblkIOCtx| {
+            if io_ctx.is_tgt_io()
+                && UblkIOCtx::user_data_to_op(io_ctx.user_data()) == libublk::sys::UBLK_IO_OP_FLUSH
+            {
+                handle_flush_completion(q, &pending_flush_tags_clone, efd, bufs_ptr);
+                return;
+            }
 
-        let result = match res {
-            Ok(r) => UblkIORes::Result(r),
-            Err(e) => UblkIORes::Result(e),
-        };
-        q.complete_io_cmd(tag, buf.as_mut_ptr(), Ok(result));
+            let iod = q.get_iod(tag);
+            let op = iod.op_flags & 0xff;
+
+            let buf = unsafe {
+                let io_buf: &mut IoBuf<u8> = &mut *bufs_ptr.add(tag as usize);
+                &mut io_buf.as_mut()[..(iod.nr_sectors << 9) as usize]
+            };
+
+            if op == libublk::sys::UBLK_IO_OP_FLUSH {
+                handle_flush_command(q, tag, &pending_flush_tags_clone, &db_clone, efd);
+                return;
+            }
+
+            let res = match op {
+                libublk::sys::UBLK_IO_OP_READ => {
+                    handle_read(&db_clone, iod.start_sector, iod.nr_sectors, buf)
+                }
+                libublk::sys::UBLK_IO_OP_WRITE => {
+                    handle_write(&db_clone, iod.start_sector, iod.nr_sectors, buf)
+                }
+                _ => Err(-libc::EINVAL),
+            };
+
+            let result = match res {
+                Ok(r) => UblkIORes::Result(r),
+                Err(e) => UblkIORes::Result(e),
+            };
+            q.complete_io_cmd(tag, buf.as_mut_ptr(), Ok(result));
+        }
     };
 
-    let queue = UblkQueue::new(qid, dev).unwrap();
-    
-    queue
+    UblkQueue::new(qid, dev)
+        .unwrap()
         .regiser_io_bufs(Some(&bufs))
         .submit_fetch_commands(Some(&bufs))
         .wait_and_handle_io(io_handler);
@@ -154,17 +227,29 @@ pub(crate) fn ublk_add_compress(
             let config: CompressJson = serde_json::from_reader(file)?;
             (config.size, config.compression)
         } else {
-            let size_str = o.size.as_ref().ok_or_else(|| anyhow::anyhow!("--size is required for new device"))?;
+            let size_str = o
+                .size
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--size is required for new device"))?;
             let size = parse_size::parse_size(size_str)?;
             let compression = o.compression.clone();
-            let config = CompressJson { size, dir: dir.clone(), compression: compression.clone() };
-            let mut file = OpenOptions::new().create(true).write(true).open(&json_path)?;
+            let config = CompressJson {
+                size,
+                dir: dir.clone(),
+                compression: compression.clone(),
+            };
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&json_path)?;
             file.write_all(serde_json::to_string_pretty(&config)?.as_bytes())?;
             (size, compression)
         };
         (dir, size, compression, Some(o))
     } else {
-        let val = ctrl.get_target_data_from_json().ok_or_else(|| anyhow::anyhow!("no json data for recovery"))?;
+        let val = ctrl
+            .get_target_data_from_json()
+            .ok_or_else(|| anyhow::anyhow!("no json data for recovery"))?;
         let dir_str = val["compress"]["dir"].as_str().unwrap().to_string();
         let dir = PathBuf::from(dir_str);
         let json_path = dir.join("ublk_compress.json");
@@ -184,9 +269,9 @@ pub(crate) fn ublk_add_compress(
     db_opts.set_max_write_buffer_number(4);
     db_opts.set_max_background_jobs(4);
 
-    let cache = Cache::new_lru_cache(256 * 1024 * 1024);
-    let mut block_based_opts = BlockBasedOptions::default();
+    let mut block_based_opts = rocksdb::BlockBasedOptions::default();
     block_based_opts.set_block_size(16 * 1024);
+    let cache = rocksdb::Cache::new_lru_cache(256 * 1024 * 1024);
     block_based_opts.set_block_cache(&cache);
     block_based_opts.set_bloom_filter(10.0, false);
     db_opts.set_block_based_table_factory(&block_based_opts);
@@ -197,6 +282,7 @@ pub(crate) fn ublk_add_compress(
 
     let db = DB::open(&db_opts, &db_path).unwrap();
     let db_arc = Arc::new(db);
+    let db_for_handler = db_arc.clone();
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
@@ -210,15 +296,18 @@ pub(crate) fn ublk_add_compress(
         Ok(())
     };
 
-    let q_handler = move |qid, dev: &_| {
-        q_sync_fn(qid, dev, &db_arc.clone())
-    };
+    let q_handler = move |qid, dev: &_| q_sync_fn(qid, dev, &db_for_handler);
 
     let comm = comm_arc.clone();
-    ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
+    let run_result = ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
         comm.send_dev_id(dev.dev_info().dev_id).unwrap();
-    })
-    .unwrap();
+    });
+
+    log::info!("ublk device stopped, flushing RocksDB before exit...");
+    db_arc.flush()?;
+    log::info!("Final RocksDB flush successful.");
+
+    run_result.unwrap();
 
     Ok(0)
 }
