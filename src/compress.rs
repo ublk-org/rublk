@@ -218,7 +218,7 @@ pub(crate) fn ublk_add_compress(
     opt: Option<CompressAddArgs>,
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
-    let (dir, size, compression, args_opt) = if let Some(o) = opt {
+    let (db_path, size, compression, args_opt) = if let Some(o) = opt {
         let dir = o.gen_arg.build_abs_path(o.dir.clone());
         let json_path = dir.join("ublk_compress.json");
 
@@ -258,8 +258,6 @@ pub(crate) fn ublk_add_compress(
         (dir, config.size, config.compression, None)
     };
 
-    let db_path = dir.join("ublk_compress");
-
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.set_use_fsync(false);
@@ -289,7 +287,7 @@ pub(crate) fn ublk_add_compress(
         if let Some(ref args) = args_opt {
             args.gen_arg.apply_block_size(dev);
             args.gen_arg.apply_read_only(dev);
-            let val = serde_json::json!({"compress": { "dir": &dir }});
+            let val = serde_json::json!({"compress": { "dir": &db_path }});
             dev.set_target_json(val);
         }
         dev.tgt.params.basic.attrs |= libublk::sys::UBLK_ATTR_VOLATILE_CACHE;
