@@ -5,7 +5,9 @@ use libublk::{
     UblkIORes,
 };
 use nix::sys::eventfd::{eventfd, EfdFlags};
-use rocksdb::{DBCompressionType, Options, SliceTransform, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    ColumnFamily, DBCompressionType, Options, SliceTransform, WriteBatch, WriteOptions, DB,
+};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs::{File, OpenOptions};
@@ -88,6 +90,21 @@ fn handle_write(db: &DB, start_sector: u64, nr_sectors: u32, buf: &[u8]) -> Resu
     Ok((nr_sectors << 9) as i32)
 }
 
+fn handle_discard(
+    db: &DB,
+    cf: &ColumnFamily,
+    start_sector: u64,
+    nr_sectors: u32,
+) -> Result<i32, i32> {
+    let from = start_sector.to_be_bytes();
+    let to = (start_sector + nr_sectors as u64).to_be_bytes();
+    if let Err(e) = db.delete_range_cf(cf, &from, &to) {
+        log::error!("rocksdb discard (delete_range_cf) error: {}", e);
+        return Err(-libc::EIO);
+    }
+    Ok(0)
+}
+
 fn submit_flush_poll_sqe(q: &UblkQueue, efd: i32) {
     let user_data =
         UblkIOCtx::build_user_data(FLUSH_POLL_TAG, libublk::sys::UBLK_IO_OP_FLUSH, 0, true);
@@ -151,6 +168,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
     let bufs_ptr = bufs.as_mut_ptr();
     let pending_flush_tags = Arc::new(Mutex::new(Vec::<u16>::new()));
     let efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
+    let max_buf_len = dev.dev_info.max_io_buf_bytes as usize;
 
     let io_handler = {
         let pending_flush_tags_clone = pending_flush_tags.clone();
@@ -168,14 +186,10 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
             let op = iod.op_flags & 0xff;
 
             let buf = unsafe {
+                let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, max_buf_len);
                 let io_buf: &mut IoBuf<u8> = &mut *bufs_ptr.add(tag as usize);
-                &mut io_buf.as_mut()[..(iod.nr_sectors << 9) as usize]
+                &mut io_buf.as_mut()[..buf_len]
             };
-
-            if op == libublk::sys::UBLK_IO_OP_FLUSH {
-                handle_flush_command(q, tag, &pending_flush_tags_clone, &db_clone, efd);
-                return;
-            }
 
             let res = match op {
                 libublk::sys::UBLK_IO_OP_READ => {
@@ -183,6 +197,14 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
                 }
                 libublk::sys::UBLK_IO_OP_WRITE => {
                     handle_write(&db_clone, iod.start_sector, iod.nr_sectors, buf)
+                }
+                libublk::sys::UBLK_IO_OP_DISCARD => {
+                    let cf = db_clone.cf_handle("default").unwrap();
+                    handle_discard(&db_clone, cf, iod.start_sector, iod.nr_sectors)
+                }
+                libublk::sys::UBLK_IO_OP_FLUSH => {
+                    handle_flush_command(q, tag, &pending_flush_tags_clone, &db_clone, efd);
+                    return;
                 }
                 _ => Err(-libc::EINVAL),
             };
@@ -278,19 +300,40 @@ pub(crate) fn ublk_add_compress(
     db_opts.set_memtable_prefix_bloom_ratio(0.1);
     db_opts.set_optimize_filters_for_hits(true);
 
-    let db = DB::open(&db_opts, &db_path).unwrap();
-    let db_arc = Arc::new(db);
+    let cfs = vec!["default"];
+    let db_with_cfs = DB::open_cf(&db_opts, &db_path, &cfs).unwrap();
+    let db_arc = Arc::new(db_with_cfs);
     let db_for_handler = db_arc.clone();
 
     let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(size);
+        let tgt = &mut dev.tgt;
+        tgt.dev_size = size;
+        tgt.params = libublk::sys::ublk_params {
+            types: libublk::sys::UBLK_PARAM_TYPE_BASIC | libublk::sys::UBLK_PARAM_TYPE_DISCARD,
+            basic: libublk::sys::ublk_param_basic {
+                attrs: libublk::sys::UBLK_ATTR_VOLATILE_CACHE,
+                logical_bs_shift: 9,
+                physical_bs_shift: 12,
+                io_opt_shift: 12,
+                io_min_shift: 9,
+                max_sectors: dev.dev_info.max_io_buf_bytes >> 9,
+                dev_sectors: tgt.dev_size >> 9,
+                ..Default::default()
+            },
+            discard: libublk::sys::ublk_param_discard {
+                max_discard_sectors: u32::MAX >> 9,
+                max_discard_segments: 1,
+                discard_granularity: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         if let Some(ref args) = args_opt {
             args.gen_arg.apply_block_size(dev);
             args.gen_arg.apply_read_only(dev);
             let val = serde_json::json!({"compress": { "dir": &db_path }});
             dev.set_target_json(val);
         }
-        dev.tgt.params.basic.attrs |= libublk::sys::UBLK_ATTR_VOLATILE_CACHE;
         Ok(())
     };
 
