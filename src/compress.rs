@@ -491,9 +491,11 @@ pub(crate) fn ublk_add_compress(
         comm.send_dev_id(dev.dev_info().dev_id).unwrap();
     });
 
-    log::info!("ublk device stopped, flushing RocksDB before exit...");
-    db_arc.flush()?;
-    log::info!("Final RocksDB flush successful.");
+    if !read_only {
+        log::info!("ublk device stopped, flushing RocksDB before exit...");
+        db_arc.flush()?;
+        log::info!("Final RocksDB flush successful.");
+    }
 
     run_result.unwrap();
 
