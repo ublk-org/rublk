@@ -55,6 +55,7 @@ Commands:
   null   Add null target
   zoned  Add zoned target, supported since v6.6
   qcow2  Add qcow2 target
+  compress  Add RocksDB based compression target
   help   Print this message or the help of the given subcommand(s)
 
 Options:
