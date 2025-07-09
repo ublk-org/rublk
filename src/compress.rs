@@ -72,20 +72,29 @@ struct FlushCompletion {
 const FLUSH_POLL_TAG: u16 = u16::MAX;
 const READ_POLL_TAG: u16 = u16::MAX - 1;
 
-fn handle_read(db: &DB, start_sector: u64, nr_sectors: u32, buf: &mut [u8]) -> Result<i32, i32> {
-    let keys: Vec<_> = (0..nr_sectors)
-        .map(|i| (start_sector + i as u64).to_be_bytes())
+fn handle_read(
+    db: &DB,
+    start_sector: u64,
+    nr_sectors: u32,
+    buf: &mut [u8],
+    lbs: u32,
+) -> Result<i32, i32> {
+    let sectors_per_block = (lbs >> 9) as u64;
+    let nr_blocks = nr_sectors as usize / sectors_per_block as usize;
+
+    let keys: Vec<_> = (0..nr_blocks)
+        .map(|i| (start_sector + i as u64 * sectors_per_block).to_be_bytes())
         .collect();
     let results = db.multi_get(&keys);
 
     for (i, result) in results.iter().enumerate() {
-        let sector_buf = &mut buf[(i << 9) as usize..((i + 1) << 9) as usize];
+        let block_buf = &mut buf[(i * lbs as usize)..((i + 1) * lbs as usize)];
         match result {
             Ok(Some(value)) => {
-                sector_buf.copy_from_slice(value);
+                block_buf.copy_from_slice(value);
             }
             Ok(None) => {
-                for byte in sector_buf.iter_mut() {
+                for byte in block_buf.iter_mut() {
                     *byte = 0;
                 }
             }
@@ -98,12 +107,21 @@ fn handle_read(db: &DB, start_sector: u64, nr_sectors: u32, buf: &mut [u8]) -> R
     Ok((nr_sectors << 9) as i32)
 }
 
-fn handle_write(db: &DB, start_sector: u64, nr_sectors: u32, buf: &[u8]) -> Result<i32, i32> {
+fn handle_write(
+    db: &DB,
+    start_sector: u64,
+    nr_sectors: u32,
+    buf: &[u8],
+    lbs: u32,
+) -> Result<i32, i32> {
     let mut batch = WriteBatch::default();
-    for i in 0..nr_sectors {
-        let key = (start_sector + i as u64).to_be_bytes();
-        let sector_buf = &buf[(i << 9) as usize..((i + 1) << 9) as usize];
-        batch.put(&key, sector_buf);
+    let sectors_per_block = (lbs >> 9) as u64;
+    let nr_blocks = nr_sectors as usize / sectors_per_block as usize;
+
+    for i in 0..nr_blocks {
+        let key = (start_sector + i as u64 * sectors_per_block).to_be_bytes();
+        let block_buf = &buf[(i * lbs as usize)..((i + 1) * lbs as usize)];
+        batch.put(&key, block_buf);
     }
     let mut write_options = WriteOptions::new();
     write_options.set_sync(false);
@@ -120,6 +138,7 @@ fn handle_discard(
     cf: &ColumnFamily,
     start_sector: u64,
     nr_sectors: u32,
+    _lbs: u32,
 ) -> Result<i32, i32> {
     let from = start_sector.to_be_bytes();
     let to = (start_sector + nr_sectors as u64).to_be_bytes();
@@ -191,6 +210,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
     let flush_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
     let read_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
     let max_buf_len = dev.dev_info.max_io_buf_bytes as usize;
+    let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
 
     let (read_job_tx, read_job_rx): (Sender<ReadJob>, Receiver<ReadJob>) = channel();
     let (read_completion_tx, read_completion_rx): (
@@ -213,7 +233,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
                     (job.nr_sectors << 9) as usize,
                 )
             };
-            let res = handle_read(&db_clone, job.start_sector, job.nr_sectors, buf_slice);
+            let res = handle_read(&db_clone, job.start_sector, job.nr_sectors, buf_slice, lbs);
             read_completion_tx
                 .send(ReadCompletion {
                     tag: job.tag,
@@ -295,11 +315,11 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
                     return;
                 }
                 libublk::sys::UBLK_IO_OP_WRITE => {
-                    handle_write(&db_clone, iod.start_sector, iod.nr_sectors, buf)
+                    handle_write(&db_clone, iod.start_sector, iod.nr_sectors, buf, lbs)
                 }
                 libublk::sys::UBLK_IO_OP_DISCARD => {
                     let cf = db_clone.cf_handle("default").unwrap();
-                    handle_discard(&db_clone, cf, iod.start_sector, iod.nr_sectors)
+                    handle_discard(&db_clone, cf, iod.start_sector, iod.nr_sectors, lbs)
                 }
                 libublk::sys::UBLK_IO_OP_FLUSH => {
                     flush_job_tx.send(FlushJob { tag }).unwrap();
@@ -402,7 +422,8 @@ pub(crate) fn ublk_add_compress(
     db_opts.set_max_background_jobs(4);
 
     let mut block_based_opts = rocksdb::BlockBasedOptions::default();
-    block_based_opts.set_block_size(16 * 1024);
+    /* 32 logical block for one rocksdb block */
+    block_based_opts.set_block_size((32 * lbs).try_into().unwrap());
     let cache = rocksdb::Cache::new_lru_cache(256 * 1024 * 1024);
     block_based_opts.set_block_cache(&cache);
     block_based_opts.set_bloom_filter(10.0, false);
