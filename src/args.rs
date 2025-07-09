@@ -241,6 +241,9 @@ pub(crate) enum AddCommands {
 
     /// Add qcow2 target
     Qcow2(super::qcow2::Qcow2Args),
+
+    /// Add compress target
+    Compress(super::compress::CompressAddArgs),
 }
 
 #[derive(Subcommand)]

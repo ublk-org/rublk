@@ -9,11 +9,11 @@
 #     $BUILDDIR
 #
 
-install_rust_1_81_to_path() {
+install_rust_to_path() {
     local target_dir="$1"
 
     if [[ -z "$target_dir" ]]; then
-        echo "Usage: install_rust_1_81_to_path <target-directory>"
+        echo "Usage: install_rust_to_path <target-directory>"
         return 1
     fi
 
@@ -33,15 +33,15 @@ install_rust_1_81_to_path() {
     # Add the custom CARGO_HOME bin directory to PATH for this session
     export PATH="$CARGO_HOME/bin:$PATH"
 
-    # Install Rust 1.81
-    rustup install 1.81.0
+    # Install Rust 1.85
+    rustup install 1.85.0
 
-    # Set Rust 1.81 as the default version globally (in the custom path)
-    rustup default 1.81.0
+    # Set Rust 1.85 as the default version globally (in the custom path)
+    rustup default 1.85.0
 
     # Verify the installation
-    if "$CARGO_HOME/bin/rustc" --version | grep -q "1.81.0"; then
-        echo "Rust 1.81.0 has been installed successfully to $target_dir!"
+    if "$CARGO_HOME/bin/rustc" --version | grep -q "1.85.0"; then
+        echo "Rust 1.85.0 has been installed successfully to $target_dir!"
     else
         echo "Rust installation failed."
     fi
@@ -69,7 +69,7 @@ echo "systemctl restart systemd-networkd" >> $DESTDIR/root/.bash_profile
 echo "export PATH=/root/bin:\$PATH" >> $DESTDIR/root/.bash_profile
 chmod +x $DESTDIR/root/.bash_profile
 
-install_rust_1_81_to_path $DESTDIR/root/
+install_rust_to_path $DESTDIR/root/
 
 # Copy tests into the dest
 mkdir -p $DESTDIR/usr/share

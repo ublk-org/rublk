@@ -20,6 +20,7 @@ mod r#loop;
 mod null;
 mod qcow2;
 mod zoned;
+mod compress;
 
 #[derive(Parser)]
 #[command(version)]
@@ -177,6 +178,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
         AddCommands::Null(_opt) => ("null", &_opt.gen_arg),
         AddCommands::Zoned(_opt) => ("zoned", &_opt.gen_arg),
         AddCommands::Qcow2(_opt) => ("qcow2", &_opt.gen_arg),
+        AddCommands::Compress(_opt) => ("compress", &_opt.gen_arg),
     }
 }
 
@@ -189,6 +191,7 @@ fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> anyhow::Res
         AddCommands::Null(opt) => null::ublk_add_null(ctrl, Some(opt), comm),
         AddCommands::Zoned(opt) => zoned::ublk_add_zoned(ctrl, Some(opt), comm),
         AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt), comm),
+        AddCommands::Compress(opt) => compress::ublk_add_compress(ctrl, Some(opt), comm),
     }
 }
 
@@ -252,6 +255,7 @@ fn ublk_recover_work(opt: args::UblkArgs) -> anyhow::Result<i32> {
         "null" => null::ublk_add_null(ctrl, None, &comm),
         "zoned" => zoned::ublk_add_zoned(ctrl, None, &comm),
         "qcow2" => qcow2::ublk_add_qcow2(ctrl, None, &comm),
+        "compress" => compress::ublk_add_compress(ctrl, None, &comm),
         &_ => todo!(),
     }
 }
