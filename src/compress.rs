@@ -211,6 +211,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
     let read_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
     let max_buf_len = dev.dev_info.max_io_buf_bytes as usize;
     let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
+    let read_only = (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0;
 
     let (read_job_tx, read_job_rx): (Sender<ReadJob>, Receiver<ReadJob>) = channel();
     let (read_completion_tx, read_completion_rx): (
@@ -315,11 +316,19 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
                     return;
                 }
                 libublk::sys::UBLK_IO_OP_WRITE => {
-                    handle_write(&db_clone, iod.start_sector, iod.nr_sectors, buf, lbs)
+                    if read_only {
+                        Err(-libc::EACCES)
+                    } else {
+                        handle_write(&db_clone, iod.start_sector, iod.nr_sectors, buf, lbs)
+                    }
                 }
                 libublk::sys::UBLK_IO_OP_DISCARD => {
-                    let cf = db_clone.cf_handle("default").unwrap();
-                    handle_discard(&db_clone, cf, iod.start_sector, iod.nr_sectors, lbs)
+                    if read_only {
+                        Err(-libc::EACCES)
+                    } else {
+                        let cf = db_clone.cf_handle("default").unwrap();
+                        handle_discard(&db_clone, cf, iod.start_sector, iod.nr_sectors, lbs)
+                    }
                 }
                 libublk::sys::UBLK_IO_OP_FLUSH => {
                     flush_job_tx.send(FlushJob { tag }).unwrap();
@@ -434,8 +443,13 @@ pub(crate) fn ublk_add_compress(
     db_opts.set_optimize_filters_for_hits(true);
 
     let cfs = vec!["default"];
-    let db_with_cfs = DB::open_cf(&db_opts, &db_path, &cfs).unwrap();
-    let db_arc = Arc::new(db_with_cfs);
+    let read_only = args_opt.as_ref().map_or(false, |o| o.gen_arg.read_only);
+    let db = if read_only {
+        DB::open_cf_as_secondary(&db_opts, &db_path, &db_path, &cfs).unwrap()
+    } else {
+        DB::open_cf(&db_opts, &db_path, &cfs).unwrap()
+    };
+    let db_arc = Arc::new(db);
     let db_for_handler = db_arc.clone();
 
     let tgt_init = |dev: &mut UblkDev| {
