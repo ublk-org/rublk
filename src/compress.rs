@@ -44,6 +44,8 @@ struct CompressJson {
     dir: PathBuf,
     #[serde(default = "default_compression")]
     compression: String,
+    logical_block_size: u32,
+    physical_block_size: u32,
 }
 
 struct ReadJob {
@@ -333,14 +335,19 @@ pub(crate) fn ublk_add_compress(
     opt: Option<CompressAddArgs>,
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
-    let (db_path, size, compression, args_opt) = if let Some(o) = opt {
+    let (db_path, size, compression, lbs, pbs, args_opt) = if let Some(o) = opt {
         let dir = o.gen_arg.build_abs_path(o.dir.clone());
         let json_path = dir.join("ublk_compress.json");
 
-        let (size, compression) = if json_path.exists() {
+        let (size, compression, lbs, pbs) = if json_path.exists() {
             let file = File::open(&json_path)?;
             let config: CompressJson = serde_json::from_reader(file)?;
-            (config.size, config.compression)
+            (
+                config.size,
+                config.compression,
+                config.logical_block_size,
+                config.physical_block_size,
+            )
         } else {
             let size_str = o
                 .size
@@ -348,19 +355,24 @@ pub(crate) fn ublk_add_compress(
                 .ok_or_else(|| anyhow::anyhow!("--size is required for new device"))?;
             let size = parse_size::parse_size(size_str)?;
             let compression = o.compression.clone();
+            let lbs = o.gen_arg.logical_block_size.unwrap_or(512);
+            let pbs = o.gen_arg.physical_block_size.unwrap_or(4096);
+
             let config = CompressJson {
                 size,
                 dir: dir.clone(),
                 compression: compression.clone(),
+                logical_block_size: lbs,
+                physical_block_size: pbs,
             };
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(&json_path)?;
             file.write_all(serde_json::to_string_pretty(&config)?.as_bytes())?;
-            (size, compression)
+            (size, compression, lbs, pbs)
         };
-        (dir, size, compression, Some(o))
+        (dir, size, compression, lbs, pbs, Some(o))
     } else {
         let val = ctrl
             .get_target_data_from_json()
@@ -370,7 +382,14 @@ pub(crate) fn ublk_add_compress(
         let json_path = dir.join("ublk_compress.json");
         let file = File::open(json_path)?;
         let config: CompressJson = serde_json::from_reader(file)?;
-        (dir, config.size, config.compression, None)
+        (
+            dir,
+            config.size,
+            config.compression,
+            config.logical_block_size,
+            config.physical_block_size,
+            None,
+        )
     };
 
     let mut db_opts = Options::default();
@@ -401,14 +420,15 @@ pub(crate) fn ublk_add_compress(
     let tgt_init = |dev: &mut UblkDev| {
         let tgt = &mut dev.tgt;
         tgt.dev_size = size;
+        //todo: figure out correct block size
         tgt.params = libublk::sys::ublk_params {
             types: libublk::sys::UBLK_PARAM_TYPE_BASIC | libublk::sys::UBLK_PARAM_TYPE_DISCARD,
             basic: libublk::sys::ublk_param_basic {
                 attrs: libublk::sys::UBLK_ATTR_VOLATILE_CACHE,
-                logical_bs_shift: 9,
-                physical_bs_shift: 12,
-                io_opt_shift: 12,
-                io_min_shift: 9,
+                logical_bs_shift: lbs.trailing_zeros() as u8,
+                physical_bs_shift: pbs.trailing_zeros() as u8,
+                io_opt_shift: pbs.trailing_zeros() as u8,
+                io_min_shift: lbs.trailing_zeros() as u8,
                 max_sectors: dev.dev_info.max_io_buf_bytes >> 9,
                 dev_sectors: tgt.dev_size >> 9,
                 ..Default::default()
@@ -422,7 +442,6 @@ pub(crate) fn ublk_add_compress(
             ..Default::default()
         };
         if let Some(ref args) = args_opt {
-            args.gen_arg.apply_block_size(dev);
             args.gen_arg.apply_read_only(dev);
             let val = serde_json::json!({"compress": { "dir": &db_path }});
             dev.set_target_json(val);
