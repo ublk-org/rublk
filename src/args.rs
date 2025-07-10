@@ -5,7 +5,7 @@ use libublk::{ctrl::UblkCtrl, io::UblkDev, UblkFlags};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub(crate) struct GenAddArgs {
     /// device id, -1 means ublk driver assigns ID for us
     #[clap(long, short = 'n', default_value_t=-1)]

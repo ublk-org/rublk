@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 pub(crate) struct CompressAddArgs {
     #[command(flatten)]
     pub(crate) gen_arg: super::args::GenAddArgs,
@@ -359,12 +359,11 @@ fn parse_compression_type(s: &str) -> anyhow::Result<DBCompressionType> {
     }
 }
 
-pub(crate) fn ublk_add_compress(
-    ctrl: UblkCtrl,
-    opt: Option<CompressAddArgs>,
-    comm_arc: &Arc<crate::DevIdComm>,
-) -> anyhow::Result<i32> {
-    let (db_path, size, compression, lbs, pbs, args_opt) = if let Some(o) = opt {
+fn parse_and_load_config(
+    ctrl: &UblkCtrl,
+    opt: &Option<CompressAddArgs>,
+) -> anyhow::Result<(PathBuf, u64, String, u32, u32, Option<CompressAddArgs>)> {
+    if let Some(o) = opt {
         let dir = o.gen_arg.build_abs_path(o.dir.clone());
         let json_path = dir.join("ublk_compress.json");
 
@@ -401,7 +400,7 @@ pub(crate) fn ublk_add_compress(
             file.write_all(serde_json::to_string_pretty(&config)?.as_bytes())?;
             (size, compression, lbs, pbs)
         };
-        (dir, size, compression, lbs, pbs, Some(o))
+        Ok((dir, size, compression, lbs, pbs, Some(o.clone())))
     } else {
         let val = ctrl
             .get_target_data_from_json()
@@ -411,21 +410,28 @@ pub(crate) fn ublk_add_compress(
         let json_path = dir.join("ublk_compress.json");
         let file = File::open(json_path)?;
         let config: CompressJson = serde_json::from_reader(file)?;
-        (
+        Ok((
             dir,
             config.size,
             config.compression,
             config.logical_block_size,
             config.physical_block_size,
             None,
-        )
-    };
+        ))
+    }
+}
 
+fn setup_database(
+    db_path: &PathBuf,
+    compression: &str,
+    lbs: u32,
+    read_only: bool,
+) -> anyhow::Result<DB> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.set_use_fsync(false);
     db_opts.set_use_direct_io_for_flush_and_compaction(true);
-    db_opts.set_compression_type(parse_compression_type(&compression)?);
+    db_opts.set_compression_type(parse_compression_type(compression)?);
     db_opts.set_write_buffer_size(64 * 1024 * 1024);
     db_opts.set_max_write_buffer_number(4);
     db_opts.set_max_background_jobs(4);
@@ -443,12 +449,22 @@ pub(crate) fn ublk_add_compress(
     db_opts.set_optimize_filters_for_hits(true);
 
     let cfs = vec!["default"];
-    let read_only = args_opt.as_ref().map_or(false, |o| o.gen_arg.read_only);
     let db = if read_only {
-        DB::open_cf_as_secondary(&db_opts, &db_path, &db_path, &cfs).unwrap()
+        DB::open_cf_as_secondary(&db_opts, db_path, db_path, &cfs)?
     } else {
-        DB::open_cf(&db_opts, &db_path, &cfs).unwrap()
+        DB::open_cf(&db_opts, db_path, &cfs)?
     };
+    Ok(db)
+}
+
+pub(crate) fn ublk_add_compress(
+    ctrl: UblkCtrl,
+    opt: Option<CompressAddArgs>,
+    comm_arc: &Arc<crate::DevIdComm>,
+) -> anyhow::Result<i32> {
+    let (db_path, size, compression, lbs, pbs, args_opt) = parse_and_load_config(&ctrl, &opt)?;
+    let read_only = args_opt.as_ref().map_or(false, |o| o.gen_arg.read_only);
+    let db = setup_database(&db_path, &compression, lbs, read_only)?;
     let db_arc = Arc::new(db);
     let db_for_handler = db_arc.clone();
 
