@@ -629,4 +629,40 @@ mod integration {
             ext4_format_and_mount(ctrl);
         });
     }
+
+    fn __test_ublk_compress_type(comp_type: &str, res: &str) {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let pstr = tmp_dir.path().to_str().unwrap();
+
+        let cmd_line = vec![
+            "add",
+            "compress",
+            "--dir",
+            pstr,
+            "--size",
+            "8GiB",
+            "--compression",
+            comp_type,
+        ];
+
+        let ctrl = run_rublk_add_dev(cmd_line);
+
+        let log_path = tmp_dir.path().join("LOG");
+        let log_content = std::fs::read_to_string(log_path).unwrap();
+        let comp_str = format!("Options.compression: {}", res);
+        assert!(log_content.contains(&comp_str));
+
+        run_rublk_del_dev(ctrl, false);
+    }
+    #[test]
+    fn test_ublk_compress_type() {
+        if !support_ublk() {
+            return;
+        }
+        let comp_types = vec!["none", "lz4", "zstd", "snappy", "zlib"];
+        let comp_res = vec!["NoCompression", "LZ4", "ZSTD", "Snappy", "Zlib"];
+        for (i, t) in comp_types.iter().enumerate() {
+            __test_ublk_compress_type(&t, &comp_res[i]);
+        }
+    }
 }
