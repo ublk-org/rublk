@@ -6,7 +6,8 @@ use libublk::{
 };
 use nix::sys::eventfd::{eventfd, EfdFlags};
 use rocksdb::{
-    ColumnFamily, DBCompressionType, Options, SliceTransform, WriteBatch, WriteOptions, DB,
+    ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
+    WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -431,7 +432,9 @@ fn setup_database(
     db_opts.create_if_missing(true);
     db_opts.set_use_fsync(false);
     db_opts.set_use_direct_io_for_flush_and_compaction(true);
-    db_opts.set_compression_type(parse_compression_type(compression)?);
+    let compression_type = parse_compression_type(&compression)?;
+    db_opts.set_compression_type(compression_type);
+    db_opts.set_bottommost_compression_type(compression_type);
     db_opts.set_write_buffer_size(64 * 1024 * 1024);
     db_opts.set_max_write_buffer_number(4);
     db_opts.set_max_background_jobs(4);
@@ -448,11 +451,12 @@ fn setup_database(
     db_opts.set_memtable_prefix_bloom_ratio(0.1);
     db_opts.set_optimize_filters_for_hits(true);
 
-    let cfs = vec!["default"];
     let db = if read_only {
+        let cfs = vec!["default"];
         DB::open_cf_as_secondary(&db_opts, db_path, db_path, &cfs)?
     } else {
-        DB::open_cf(&db_opts, db_path, &cfs)?
+        let cf_descriptor = ColumnFamilyDescriptor::new("default", db_opts.clone());
+        DB::open_cf_descriptors(&db_opts, db_path, vec![cf_descriptor])?
     };
     Ok(db)
 }
