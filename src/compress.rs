@@ -144,14 +144,6 @@ fn handle_discard(
     Ok(0)
 }
 
-fn submit_poll_sqe(q: &UblkQueue, efd: i32, op: u32) {
-    let user_data = UblkIOCtx::build_user_data(POLL_TAG, op, 0, true);
-    let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(efd), libc::POLLIN as _)
-        .build()
-        .user_data(user_data);
-    q.ublk_submit_sqe_sync(sqe).unwrap();
-}
-
 struct OffloadHandler<'a, Job> {
     q: &'a UblkQueue<'a>,
     bufs_ptr: *mut IoBuf<u8>,
@@ -162,6 +154,34 @@ struct OffloadHandler<'a, Job> {
 }
 
 impl<'a, Job> OffloadHandler<'a, Job> {
+    fn new(
+        q: &'a UblkQueue<'a>,
+        bufs_ptr: *mut IoBuf<u8>,
+        efd: i32,
+        job_tx: Sender<Job>,
+        completion_rx: Receiver<Completion>,
+        poll_op: u32,
+    ) -> Self {
+        let handler = Self {
+            q,
+            bufs_ptr,
+            efd,
+            job_tx,
+            completion_rx,
+            poll_op,
+        };
+        handler.submit_poll_sqe();
+        handler
+    }
+
+    fn submit_poll_sqe(&self) {
+        let user_data = UblkIOCtx::build_user_data(POLL_TAG, self.poll_op, 0, true);
+        let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(self.efd), libc::POLLIN as _)
+            .build()
+            .user_data(user_data);
+        self.q.ublk_submit_sqe_sync(sqe).unwrap();
+    }
+
     fn handle_completion(&self) {
         let mut buf = [0u8; 8];
         nix::unistd::read(self.efd, &mut buf).unwrap();
@@ -178,7 +198,7 @@ impl<'a, Job> OffloadHandler<'a, Job> {
             };
             self.q.complete_io_cmd(tag, buf_addr, Ok(result));
         }
-        submit_poll_sqe(self.q, self.efd, self.poll_op);
+        self.submit_poll_sqe();
     }
 }
 
@@ -277,26 +297,23 @@ impl<'a> QueueHandler<'a> {
                 }
             });
 
-        submit_poll_sqe(q, read_efd, libublk::sys::UBLK_IO_OP_READ);
-        submit_poll_sqe(q, flush_efd, libublk::sys::UBLK_IO_OP_FLUSH);
-
-        let read_handler = OffloadHandler {
+        let read_handler = OffloadHandler::new(
             q,
             bufs_ptr,
-            efd: read_efd,
-            job_tx: read_job_tx,
-            completion_rx: read_completion_rx,
-            poll_op: libublk::sys::UBLK_IO_OP_READ,
-        };
+            read_efd,
+            read_job_tx,
+            read_completion_rx,
+            libublk::sys::UBLK_IO_OP_READ,
+        );
 
-        let flush_handler = OffloadHandler {
+        let flush_handler = OffloadHandler::new(
             q,
             bufs_ptr,
-            efd: flush_efd,
-            job_tx: flush_job_tx,
-            completion_rx: flush_completion_rx,
-            poll_op: libublk::sys::UBLK_IO_OP_FLUSH,
-        };
+            flush_efd,
+            flush_job_tx,
+            flush_completion_rx,
+            libublk::sys::UBLK_IO_OP_FLUSH,
+        );
 
         Self {
             q,
