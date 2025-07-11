@@ -3,16 +3,16 @@ pub mod handler;
 use libublk::io::UblkQueue;
 use std::sync::mpsc::{Receiver, Sender};
 
-pub trait OffloadTargetLogic: Send + Sync + 'static {
+pub trait OffloadTargetLogic {
     fn setup_read_worker(
         &self,
         efd: i32,
-    ) -> (Sender<handler::ReadJob>, Receiver<handler::Completion>);
+    ) -> (Sender<handler::OffloadJob>, Receiver<handler::Completion>);
 
     fn setup_flush_worker(
         &self,
         efd: i32,
-    ) -> (Sender<handler::FlushJob>, Receiver<handler::Completion>);
+    ) -> (Sender<handler::OffloadJob>, Receiver<handler::Completion>);
 
     fn handle_io(
         &self,

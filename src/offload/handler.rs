@@ -8,17 +8,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 pub const POLL_TAG: u16 = u16::MAX;
 
-#[derive(Debug)]
-pub struct ReadJob {
+#[derive(Debug, Default)]
+pub struct OffloadJob {
     pub tag: u16,
     pub start_sector: u64,
     pub nr_sectors: u32,
     pub buf_addr: u64,
-}
-
-#[derive(Debug)]
-pub struct FlushJob {
-    pub tag: u16,
 }
 
 #[derive(Debug)]
@@ -27,21 +22,21 @@ pub struct Completion {
     pub result: Result<i32, i32>,
 }
 
-pub struct OffloadHandler<'a, Job> {
+pub struct OffloadHandler<'a> {
     q: &'a UblkQueue<'a>,
     bufs_ptr: *mut IoBuf<u8>,
     efd: i32,
-    job_tx: Sender<Job>,
+    job_tx: Sender<OffloadJob>,
     completion_rx: Receiver<Completion>,
     poll_op: u32,
 }
 
-impl<'a, Job> OffloadHandler<'a, Job> {
+impl<'a> OffloadHandler<'a> {
     pub fn new(
         q: &'a UblkQueue<'a>,
         bufs_ptr: *mut IoBuf<u8>,
         efd: i32,
-        job_tx: Sender<Job>,
+        job_tx: Sender<OffloadJob>,
         completion_rx: Receiver<Completion>,
         poll_op: u32,
     ) -> Self {
@@ -83,21 +78,26 @@ impl<'a, Job> OffloadHandler<'a, Job> {
         }
         self.submit_poll_sqe();
     }
-}
 
-pub fn send_read_job(handler: &OffloadHandler<ReadJob>, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
-    handler.job_tx
-        .send(ReadJob {
-            tag,
-            start_sector: iod.start_sector,
-            nr_sectors: iod.nr_sectors,
-            buf_addr: buf.as_mut_ptr() as u64,
-        })
-        .unwrap();
-}
+    pub fn send_read_job(&self, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
+        self.job_tx
+            .send(OffloadJob {
+                tag,
+                start_sector: iod.start_sector,
+                nr_sectors: iod.nr_sectors,
+                buf_addr: buf.as_mut_ptr() as u64,
+            })
+            .unwrap();
+    }
 
-pub fn send_flush_job(handler: &OffloadHandler<FlushJob>, tag: u16) {
-    handler.job_tx.send(FlushJob { tag }).unwrap();
+    pub fn send_flush_job(&self, tag: u16) {
+        self.job_tx
+            .send(OffloadJob {
+                tag,
+                ..Default::default()
+            })
+            .unwrap();
+    }
 }
 
 pub struct QueueHandler<'a, T: super::OffloadTargetLogic> {
@@ -105,8 +105,8 @@ pub struct QueueHandler<'a, T: super::OffloadTargetLogic> {
     target_logic: &'a T,
     bufs_ptr: *mut IoBuf<u8>,
     max_buf_len: usize,
-    read_handler: OffloadHandler<'a, ReadJob>,
-    flush_handler: OffloadHandler<'a, FlushJob>,
+    read_handler: OffloadHandler<'a>,
+    flush_handler: OffloadHandler<'a>,
 }
 
 impl<'a, T: super::OffloadTargetLogic> QueueHandler<'a, T> {
@@ -172,11 +172,11 @@ impl<'a, T: super::OffloadTargetLogic> QueueHandler<'a, T> {
 
         let res = match op {
             libublk::sys::UBLK_IO_OP_READ => {
-                send_read_job(&self.read_handler, tag, iod, buf);
+                self.read_handler.send_read_job(tag, iod, buf);
                 return;
             }
             libublk::sys::UBLK_IO_OP_FLUSH => {
-                send_flush_job(&self.flush_handler, tag);
+                self.flush_handler.send_flush_job(tag);
                 return;
             }
             _ => self.target_logic.handle_io(self.q, tag, iod, buf),

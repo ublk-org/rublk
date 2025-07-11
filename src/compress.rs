@@ -1,5 +1,5 @@
 use crate::offload::{
-    handler::{setup_worker_thread, Completion, FlushJob, ReadJob},
+    handler::{setup_worker_thread, Completion, OffloadJob},
     OffloadTargetLogic,
 };
 use libublk::{
@@ -134,13 +134,10 @@ struct CompressTarget {
 }
 
 impl OffloadTargetLogic for CompressTarget {
-    fn setup_read_worker(
-        &self,
-        efd: i32,
-    ) -> (Sender<ReadJob>, Receiver<Completion>) {
+    fn setup_read_worker(&self, efd: i32) -> (Sender<OffloadJob>, Receiver<Completion>) {
         let db = self.db.clone();
         let lbs = self.lbs;
-        setup_worker_thread(efd, move |job: ReadJob| {
+        setup_worker_thread(efd, move |job: OffloadJob| {
             let buf_slice = unsafe {
                 std::slice::from_raw_parts_mut(
                     job.buf_addr as *mut u8,
@@ -155,12 +152,9 @@ impl OffloadTargetLogic for CompressTarget {
         })
     }
 
-    fn setup_flush_worker(
-        &self,
-        efd: i32,
-    ) -> (Sender<FlushJob>, Receiver<Completion>) {
+    fn setup_flush_worker(&self, efd: i32) -> (Sender<OffloadJob>, Receiver<Completion>) {
         let db = self.db.clone();
-        setup_worker_thread(efd, move |job: FlushJob| {
+        setup_worker_thread(efd, move |job: OffloadJob| {
             let res = if let Err(e) = db.flush() {
                 log::error!("Background rocksdb flush error: {}", e);
                 Err(-libc::EIO)
