@@ -56,16 +56,11 @@ struct ReadJob {
     buf_addr: u64,
 }
 
-struct ReadCompletion {
-    tag: u16,
-    result: Result<i32, i32>,
-}
-
 struct FlushJob {
     tag: u16,
 }
 
-struct FlushCompletion {
+struct Completion {
     tag: u16,
     result: Result<i32, i32>,
 }
@@ -168,19 +163,74 @@ struct QueueHandler<'a> {
     lbs: u32,
     read_only: bool,
     read_job_tx: Sender<ReadJob>,
-    read_completion_rx: Receiver<ReadCompletion>,
+    read_completion_rx: Receiver<Completion>,
     flush_job_tx: Sender<FlushJob>,
-    flush_completion_rx: Receiver<FlushCompletion>,
+    flush_completion_rx: Receiver<Completion>,
 }
 
 impl<'a> QueueHandler<'a> {
-    fn new(q: &'a UblkQueue<'a>, db: &'a Arc<DB>, bufs: &'a mut [IoBuf<u8>], dev: &'a UblkDev) -> Self {
+    fn setup_worker_thread<Job, C, F>(efd: i32, handler: F) -> (Sender<Job>, Receiver<C>)
+    where
+        Job: Send + 'static,
+        C: Send + 'static,
+        F: Fn(Job) -> C + Send + 'static,
+    {
+        let (job_tx, job_rx) = channel();
+        let (completion_tx, completion_rx) = channel();
+
+        std::thread::spawn(move || {
+            for job in job_rx {
+                let completion = handler(job);
+                if completion_tx.send(completion).is_err() {
+                    break;
+                }
+                nix::unistd::write(efd, &1u64.to_le_bytes()).unwrap();
+            }
+        });
+
+        (job_tx, completion_rx)
+    }
+
+    fn new(
+        q: &'a UblkQueue<'a>,
+        db: &'a Arc<DB>,
+        bufs: &'a mut [IoBuf<u8>],
+        dev: &'a UblkDev,
+    ) -> Self {
         let flush_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
         let read_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
         let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
 
-        let (read_job_tx, read_completion_rx) = setup_read_thread(db.clone(), read_efd, lbs);
-        let (flush_job_tx, flush_completion_rx) = setup_flush_thread(db.clone(), flush_efd);
+        let db_read = db.clone();
+        let (read_job_tx, read_completion_rx) =
+            Self::setup_worker_thread(read_efd, move |job: ReadJob| {
+                let buf_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        job.buf_addr as *mut u8,
+                        (job.nr_sectors << 9) as usize,
+                    )
+                };
+                let res = handle_read(&db_read, job.start_sector, job.nr_sectors, buf_slice, lbs);
+                Completion {
+                    tag: job.tag,
+                    result: res,
+                }
+            });
+
+        let db_flush = db.clone();
+        let (flush_job_tx, flush_completion_rx) =
+            Self::setup_worker_thread(flush_efd, move |job: FlushJob| {
+                let res = if let Err(e) = db_flush.flush() {
+                    log::error!("Background rocksdb flush error: {}", e);
+                    Err(-libc::EIO)
+                } else {
+                    Ok(0)
+                };
+                Completion {
+                    tag: job.tag,
+                    result: res,
+                }
+            });
 
         submit_poll_sqe(q, read_efd, READ_POLL_TAG, libublk::sys::UBLK_IO_OP_READ);
         submit_poll_sqe(q, flush_efd, FLUSH_POLL_TAG, libublk::sys::UBLK_IO_OP_FLUSH);
@@ -312,70 +362,6 @@ impl<'a> QueueHandler<'a> {
         };
         self.q.complete_io_cmd(tag, buf.as_mut_ptr(), Ok(result));
     }
-}
-
-fn setup_read_thread(
-    db: Arc<DB>,
-    read_efd: i32,
-    lbs: u32,
-) -> (Sender<ReadJob>, Receiver<ReadCompletion>) {
-    let (read_job_tx, read_job_rx): (Sender<ReadJob>, Receiver<ReadJob>) = channel();
-    let (read_completion_tx, read_completion_rx): (
-        Sender<ReadCompletion>,
-        Receiver<ReadCompletion>,
-    ) = channel();
-
-    std::thread::spawn(move || {
-        for job in read_job_rx {
-            let buf_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    job.buf_addr as *mut u8,
-                    (job.nr_sectors << 9) as usize,
-                )
-            };
-            let res = handle_read(&db, job.start_sector, job.nr_sectors, buf_slice, lbs);
-            read_completion_tx
-                .send(ReadCompletion {
-                    tag: job.tag,
-                    result: res,
-                })
-                .unwrap();
-            nix::unistd::write(read_efd, &1u64.to_le_bytes()).unwrap();
-        }
-    });
-
-    (read_job_tx, read_completion_rx)
-}
-
-fn setup_flush_thread(
-    db: Arc<DB>,
-    flush_efd: i32,
-) -> (Sender<FlushJob>, Receiver<FlushCompletion>) {
-    let (flush_job_tx, flush_job_rx): (Sender<FlushJob>, Receiver<FlushJob>) = channel();
-    let (flush_completion_tx, flush_completion_rx): (
-        Sender<FlushCompletion>,
-        Receiver<FlushCompletion>,
-    ) = channel();
-
-    std::thread::spawn(move || {
-        for job in flush_job_rx {
-            let res = if let Err(e) = db.flush() {
-                log::error!("Background rocksdb flush error: {}", e);
-                Err(-libc::EIO)
-            } else {
-                Ok(0)
-            };
-            flush_completion_tx
-                .send(FlushCompletion {
-                    tag: job.tag,
-                    result: res,
-                })
-                .unwrap();
-            nix::unistd::write(flush_efd, &1u64.to_le_bytes()).unwrap();
-        }
-    });
-
-    (flush_job_tx, flush_completion_rx)
 }
 
 fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
