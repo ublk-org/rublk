@@ -1,24 +1,15 @@
 pub mod handler;
 
-use libublk::io::UblkQueue;
-use std::sync::mpsc::{Receiver, Sender};
+use crate::offload::handler::QueueHandler;
+use libublk::io::UblkIOCtx;
 
-pub trait OffloadTargetLogic {
-    fn setup_read_worker(
-        &self,
-        efd: i32,
-    ) -> (Sender<handler::OffloadJob>, Receiver<handler::Completion>);
-
-    fn setup_flush_worker(
-        &self,
-        efd: i32,
-    ) -> (Sender<handler::OffloadJob>, Receiver<handler::Completion>);
+pub trait OffloadTargetLogic<'a> {
+    fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>);
 
     fn handle_io(
         &self,
-        q: &UblkQueue,
+        handler: &mut QueueHandler<'a, Self>,
         tag: u16,
-        iod: &libublk::sys::ublksrv_io_desc,
-        buf: &mut [u8],
+        io_ctx: &UblkIOCtx,
     ) -> Result<i32, i32>;
 }
