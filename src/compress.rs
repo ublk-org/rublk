@@ -152,15 +152,16 @@ fn submit_poll_sqe(q: &UblkQueue, efd: i32, op: u32) {
     q.ublk_submit_sqe_sync(sqe).unwrap();
 }
 
-struct OffloadHandler<'a> {
+struct OffloadHandler<'a, Job> {
     q: &'a UblkQueue<'a>,
     bufs_ptr: *mut IoBuf<u8>,
     efd: i32,
+    job_tx: Sender<Job>,
     completion_rx: Receiver<Completion>,
     poll_op: u32,
 }
 
-impl<'a> OffloadHandler<'a> {
+impl<'a, Job> OffloadHandler<'a, Job> {
     fn handle_completion(&self) {
         let mut buf = [0u8; 8];
         nix::unistd::read(self.efd, &mut buf).unwrap();
@@ -181,6 +182,25 @@ impl<'a> OffloadHandler<'a> {
     }
 }
 
+impl<'a> OffloadHandler<'a, ReadJob> {
+    fn send_job(&self, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
+        self.job_tx
+            .send(ReadJob {
+                tag,
+                start_sector: iod.start_sector,
+                nr_sectors: iod.nr_sectors,
+                buf_addr: buf.as_mut_ptr() as u64,
+            })
+            .unwrap();
+    }
+}
+
+impl<'a> OffloadHandler<'a, FlushJob> {
+    fn send_job(&self, tag: u16) {
+        self.job_tx.send(FlushJob { tag }).unwrap();
+    }
+}
+
 struct QueueHandler<'a> {
     q: &'a UblkQueue<'a>,
     db: &'a Arc<DB>,
@@ -188,10 +208,8 @@ struct QueueHandler<'a> {
     max_buf_len: usize,
     lbs: u32,
     read_only: bool,
-    read_job_tx: Sender<ReadJob>,
-    flush_job_tx: Sender<FlushJob>,
-    read_handler: OffloadHandler<'a>,
-    flush_handler: OffloadHandler<'a>,
+    read_handler: OffloadHandler<'a, ReadJob>,
+    flush_handler: OffloadHandler<'a, FlushJob>,
 }
 
 impl<'a> QueueHandler<'a> {
@@ -266,6 +284,7 @@ impl<'a> QueueHandler<'a> {
             q,
             bufs_ptr,
             efd: read_efd,
+            job_tx: read_job_tx,
             completion_rx: read_completion_rx,
             poll_op: libublk::sys::UBLK_IO_OP_READ,
         };
@@ -274,6 +293,7 @@ impl<'a> QueueHandler<'a> {
             q,
             bufs_ptr,
             efd: flush_efd,
+            job_tx: flush_job_tx,
             completion_rx: flush_completion_rx,
             poll_op: libublk::sys::UBLK_IO_OP_FLUSH,
         };
@@ -285,8 +305,6 @@ impl<'a> QueueHandler<'a> {
             max_buf_len: dev.dev_info.max_io_buf_bytes as usize,
             lbs,
             read_only: (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
-            read_job_tx,
-            flush_job_tx,
             read_handler,
             flush_handler,
         }
@@ -318,14 +336,7 @@ impl<'a> QueueHandler<'a> {
 
         let res = match op {
             libublk::sys::UBLK_IO_OP_READ => {
-                self.read_job_tx
-                    .send(ReadJob {
-                        tag,
-                        start_sector: iod.start_sector,
-                        nr_sectors: iod.nr_sectors,
-                        buf_addr: buf.as_mut_ptr() as u64,
-                    })
-                    .unwrap();
+                self.read_handler.send_job(tag, iod, buf);
                 return;
             }
             libublk::sys::UBLK_IO_OP_WRITE => {
@@ -344,7 +355,7 @@ impl<'a> QueueHandler<'a> {
                 }
             }
             libublk::sys::UBLK_IO_OP_FLUSH => {
-                self.flush_job_tx.send(FlushJob { tag }).unwrap();
+                self.flush_handler.send_job(tag);
                 return;
             }
             _ => Err(-libc::EINVAL),
