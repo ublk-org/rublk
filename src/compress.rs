@@ -65,8 +65,7 @@ struct Completion {
     result: Result<i32, i32>,
 }
 
-const FLUSH_POLL_TAG: u16 = u16::MAX;
-const READ_POLL_TAG: u16 = u16::MAX - 1;
+const POLL_TAG: u16 = u16::MAX;
 
 fn handle_read(
     db: &DB,
@@ -145,27 +144,54 @@ fn handle_discard(
     Ok(0)
 }
 
-fn submit_poll_sqe(q: &UblkQueue, efd: i32, tag: u16, op: u32) {
-    let user_data = UblkIOCtx::build_user_data(tag, op, 0, true);
+fn submit_poll_sqe(q: &UblkQueue, efd: i32, op: u32) {
+    let user_data = UblkIOCtx::build_user_data(POLL_TAG, op, 0, true);
     let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(efd), libc::POLLIN as _)
         .build()
         .user_data(user_data);
     q.ublk_submit_sqe_sync(sqe).unwrap();
 }
 
+struct OffloadHandler<'a> {
+    q: &'a UblkQueue<'a>,
+    bufs_ptr: *mut IoBuf<u8>,
+    efd: i32,
+    completion_rx: Receiver<Completion>,
+    poll_op: u32,
+}
+
+impl<'a> OffloadHandler<'a> {
+    fn handle_completion(&self) {
+        let mut buf = [0u8; 8];
+        nix::unistd::read(self.efd, &mut buf).unwrap();
+
+        while let Ok(completion) = self.completion_rx.try_recv() {
+            let result = match completion.result {
+                Ok(r) => UblkIORes::Result(r),
+                Err(e) => UblkIORes::Result(e),
+            };
+            let tag = completion.tag;
+            let buf_addr = unsafe {
+                let io_buf: &mut IoBuf<u8> = &mut *self.bufs_ptr.add(tag as usize);
+                io_buf.as_mut().as_mut_ptr()
+            };
+            self.q.complete_io_cmd(tag, buf_addr, Ok(result));
+        }
+        submit_poll_sqe(self.q, self.efd, self.poll_op);
+    }
+}
+
 struct QueueHandler<'a> {
     q: &'a UblkQueue<'a>,
     db: &'a Arc<DB>,
     bufs_ptr: *mut IoBuf<u8>,
-    flush_efd: i32,
-    read_efd: i32,
     max_buf_len: usize,
     lbs: u32,
     read_only: bool,
     read_job_tx: Sender<ReadJob>,
-    read_completion_rx: Receiver<Completion>,
     flush_job_tx: Sender<FlushJob>,
-    flush_completion_rx: Receiver<Completion>,
+    read_handler: OffloadHandler<'a>,
+    flush_handler: OffloadHandler<'a>,
 }
 
 impl<'a> QueueHandler<'a> {
@@ -200,6 +226,7 @@ impl<'a> QueueHandler<'a> {
         let flush_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
         let read_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
         let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
+        let bufs_ptr = bufs.as_mut_ptr();
 
         let db_read = db.clone();
         let (read_job_tx, read_completion_rx) =
@@ -232,81 +259,48 @@ impl<'a> QueueHandler<'a> {
                 }
             });
 
-        submit_poll_sqe(q, read_efd, READ_POLL_TAG, libublk::sys::UBLK_IO_OP_READ);
-        submit_poll_sqe(q, flush_efd, FLUSH_POLL_TAG, libublk::sys::UBLK_IO_OP_FLUSH);
+        submit_poll_sqe(q, read_efd, libublk::sys::UBLK_IO_OP_READ);
+        submit_poll_sqe(q, flush_efd, libublk::sys::UBLK_IO_OP_FLUSH);
+
+        let read_handler = OffloadHandler {
+            q,
+            bufs_ptr,
+            efd: read_efd,
+            completion_rx: read_completion_rx,
+            poll_op: libublk::sys::UBLK_IO_OP_READ,
+        };
+
+        let flush_handler = OffloadHandler {
+            q,
+            bufs_ptr,
+            efd: flush_efd,
+            completion_rx: flush_completion_rx,
+            poll_op: libublk::sys::UBLK_IO_OP_FLUSH,
+        };
 
         Self {
             q,
             db,
-            bufs_ptr: bufs.as_mut_ptr(),
-            flush_efd,
-            read_efd,
+            bufs_ptr,
             max_buf_len: dev.dev_info.max_io_buf_bytes as usize,
             lbs,
             read_only: (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
             read_job_tx,
-            read_completion_rx,
             flush_job_tx,
-            flush_completion_rx,
+            read_handler,
+            flush_handler,
         }
-    }
-
-    fn handle_flush_completion(&self) {
-        let mut buf = [0u8; 8];
-        nix::unistd::read(self.flush_efd, &mut buf).unwrap();
-
-        while let Ok(completion) = self.flush_completion_rx.try_recv() {
-            let result = match completion.result {
-                Ok(r) => UblkIORes::Result(r),
-                Err(e) => UblkIORes::Result(e),
-            };
-            let tag = completion.tag;
-            let buf_addr = unsafe {
-                let io_buf: &mut IoBuf<u8> = &mut *self.bufs_ptr.add(tag as usize);
-                io_buf.as_mut().as_mut_ptr()
-            };
-            self.q.complete_io_cmd(tag, buf_addr, Ok(result));
-        }
-        submit_poll_sqe(
-            self.q,
-            self.flush_efd,
-            FLUSH_POLL_TAG,
-            libublk::sys::UBLK_IO_OP_FLUSH,
-        );
-    }
-
-    fn handle_read_completion(&self) {
-        let mut efd_buf = [0u8; 8];
-        nix::unistd::read(self.read_efd, &mut efd_buf).unwrap();
-        while let Ok(completion) = self.read_completion_rx.try_recv() {
-            let result = match completion.result {
-                Ok(r) => UblkIORes::Result(r),
-                Err(e) => UblkIORes::Result(e),
-            };
-            let tag = completion.tag;
-            let buf_addr = unsafe {
-                let io_buf: &mut IoBuf<u8> = &mut *self.bufs_ptr.add(tag as usize);
-                io_buf.as_mut().as_mut_ptr()
-            };
-            self.q.complete_io_cmd(tag, buf_addr, Ok(result));
-        }
-        submit_poll_sqe(
-            self.q,
-            self.read_efd,
-            READ_POLL_TAG,
-            libublk::sys::UBLK_IO_OP_READ,
-        );
     }
 
     fn handle_io(&self, tag: u16, io_ctx: &UblkIOCtx) {
         if io_ctx.is_tgt_io() {
             match UblkIOCtx::user_data_to_op(io_ctx.user_data()) {
                 libublk::sys::UBLK_IO_OP_FLUSH => {
-                    self.handle_flush_completion();
+                    self.flush_handler.handle_completion();
                     return;
                 }
                 libublk::sys::UBLK_IO_OP_READ => {
-                    self.handle_read_completion();
+                    self.read_handler.handle_completion();
                     return;
                 }
                 _ => {}
