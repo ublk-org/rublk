@@ -1,6 +1,6 @@
 use crate::offload::{
     handler::{setup_worker_thread, Completion, OffloadHandler, OffloadJob, QueueHandler},
-    OffloadTargetLogic, OffloadType,
+    OffloadTargetLogic,
 };
 use libublk::{
     ctrl::UblkCtrl,
@@ -17,6 +17,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const OPL_HANDLER_IDX: u32 = 0;
 
 #[derive(clap::Args, Debug, Clone)]
 pub(crate) struct CompressAddArgs {
@@ -167,9 +169,8 @@ fn handle_offload_fn(
     }
 }
 
-impl<'a> CompressTarget {
-    fn setup_one_handler(&self, handler: &mut QueueHandler<'a, Self>, op_type: OffloadType) {
-        let idx = op_type as usize;
+impl<'a> OffloadTargetLogic<'a> for CompressTarget {
+    fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>) {
         let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
         let db = self.db.clone();
         let lbs = self.lbs;
@@ -177,20 +178,13 @@ impl<'a> CompressTarget {
             handle_offload_fn(&db, lbs, job)
         });
 
-        handler.offload_handlers[idx] = Some(OffloadHandler::new(
+        handler.offload_handlers[OPL_HANDLER_IDX as usize] = Some(OffloadHandler::new(
             handler.q,
-            idx as u32,
+            OPL_HANDLER_IDX,
             tx,
             rx,
             efd,
         ));
-    }
-}
-
-impl<'a> OffloadTargetLogic<'a> for CompressTarget {
-    fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>) {
-        self.setup_one_handler(handler, OffloadType::Read);
-        self.setup_one_handler(handler, OffloadType::Flush);
     }
 
     fn handle_io(
@@ -214,14 +208,8 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
         let buf = buf.unwrap();
 
         let res = match op as u32 {
-            libublk::sys::UBLK_IO_OP_READ => {
-                if let Some(Some(h)) = handler.offload_handlers.get(OffloadType::Read as usize) {
-                    h.send_job(op, tag, iod, buf);
-                }
-                return Ok(0);
-            }
-            libublk::sys::UBLK_IO_OP_FLUSH => {
-                if let Some(Some(h)) = handler.offload_handlers.get(OffloadType::Flush as usize) {
+            libublk::sys::UBLK_IO_OP_READ | libublk::sys::UBLK_IO_OP_FLUSH => {
+                if let Some(Some(h)) = handler.offload_handlers.get(OPL_HANDLER_IDX as usize) {
                     h.send_job(op, tag, iod, buf);
                 }
                 return Ok(0);
