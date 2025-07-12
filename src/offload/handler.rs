@@ -1,6 +1,5 @@
 use libublk::{
-    helpers::IoBuf,
-    io::{UblkDev, UblkIOCtx, UblkQueue},
+    io::{UblkIOCtx, UblkQueue},
     UblkIORes,
 };
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,11 +20,11 @@ pub struct OffloadJob {
 pub struct Completion {
     pub tag: u16,
     pub result: Result<i32, i32>,
+    pub buf_addr: u64,
 }
 
 pub struct OffloadHandler<'a> {
     q: &'a UblkQueue<'a>,
-    bufs_ptr: *mut IoBuf<u8>,
     efd: i32,
     job_tx: Sender<OffloadJob>,
     completion_rx: Receiver<Completion>,
@@ -34,7 +33,6 @@ pub struct OffloadHandler<'a> {
 impl<'a> OffloadHandler<'a> {
     pub fn new(
         q: &'a UblkQueue<'a>,
-        bufs_ptr: *mut IoBuf<u8>,
         handler_idx: u32,
         job_tx: Sender<OffloadJob>,
         completion_rx: Receiver<Completion>,
@@ -42,7 +40,6 @@ impl<'a> OffloadHandler<'a> {
     ) -> Self {
         let handler = Self {
             q,
-            bufs_ptr,
             efd,
             job_tx,
             completion_rx,
@@ -69,8 +66,8 @@ impl<'a> OffloadHandler<'a> {
                 Err(e) => UblkIORes::Result(e),
             };
             let tag = completion.tag;
-            let buf_addr = unsafe { (*self.bufs_ptr.add(tag as usize)).as_mut().as_mut_ptr() };
-            self.q.complete_io_cmd(tag, buf_addr, Ok(result));
+            self.q
+                .complete_io_cmd(tag, completion.buf_addr as *mut u8, Ok(result));
         }
         self.submit_poll_sqe(handler_idx);
     }
@@ -91,8 +88,6 @@ impl<'a> OffloadHandler<'a> {
 pub struct QueueHandler<'a, T: super::OffloadTargetLogic<'a> + ?Sized> {
     pub q: &'a UblkQueue<'a>,
     target_logic: &'a T,
-    pub bufs_ptr: *mut IoBuf<u8>,
-    pub max_buf_len: usize,
     pub offload_handlers: Vec<Option<OffloadHandler<'a>>>,
 }
 
@@ -100,10 +95,7 @@ impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
     pub fn new(
         q: &'a UblkQueue<'a>,
         target_logic: &'a T,
-        bufs: &'a mut [IoBuf<u8>],
-        dev: &'a UblkDev,
     ) -> Self {
-        let bufs_ptr = bufs.as_mut_ptr();
         let mut handlers = Vec::with_capacity(NR_OFFLOAD_HANDLERS);
         for _ in 0..NR_OFFLOAD_HANDLERS {
             handlers.push(None);
@@ -112,16 +104,14 @@ impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
         let mut s = Self {
             q,
             target_logic,
-            bufs_ptr,
-            max_buf_len: dev.dev_info.max_io_buf_bytes as usize,
             offload_handlers: handlers,
         };
         target_logic.setup_offload_handlers(&mut s);
         s
     }
 
-    pub fn handle_event(&mut self, tag: u16, io_ctx: &UblkIOCtx) {
-        self.target_logic.handle_io(self, tag, io_ctx).unwrap();
+    pub fn handle_event(&mut self, tag: u16, io_ctx: &UblkIOCtx, buf: Option<&mut [u8]>) {
+        self.target_logic.handle_io(self, tag, io_ctx, buf).unwrap();
     }
 }
 

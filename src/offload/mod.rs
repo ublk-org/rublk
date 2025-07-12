@@ -23,5 +23,6 @@ pub trait OffloadTargetLogic<'a> {
         handler: &mut QueueHandler<'a, Self>,
         tag: u16,
         io_ctx: &UblkIOCtx,
+        buf: Option<&mut [u8]>,
     ) -> Result<i32, i32>;
 }

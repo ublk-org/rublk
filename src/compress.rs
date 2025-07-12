@@ -163,6 +163,7 @@ fn handle_offload_fn(
     Completion {
         tag: job.tag,
         result: res,
+        buf_addr: job.buf_addr,
     }
 }
 
@@ -178,7 +179,6 @@ impl<'a> CompressTarget {
 
         handler.offload_handlers[idx] = Some(OffloadHandler::new(
             handler.q,
-            handler.bufs_ptr,
             idx as u32,
             tx,
             rx,
@@ -198,6 +198,7 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
         handler: &mut QueueHandler<'a, Self>,
         tag: u16,
         io_ctx: &UblkIOCtx,
+        buf: Option<&mut [u8]>,
     ) -> Result<i32, i32> {
         if io_ctx.is_tgt_io() && io_ctx.get_tag() as u16 == crate::offload::handler::POLL_TAG {
             let handler_idx = UblkIOCtx::user_data_to_op(io_ctx.user_data()) as usize;
@@ -210,11 +211,7 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
         let q = handler.q;
         let iod = q.get_iod(tag);
         let op = (iod.op_flags & 0xff) as u16;
-
-        let buf = unsafe {
-            let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, handler.max_buf_len);
-            &mut (*handler.bufs_ptr.add(tag as usize)).as_mut()[..buf_len]
-        };
+        let buf = buf.unwrap();
 
         let res = match op as u32 {
             libublk::sys::UBLK_IO_OP_READ => {
@@ -268,10 +265,19 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
         lbs: 1u32 << dev.tgt.params.basic.logical_bs_shift,
         read_only: (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
     };
-    let mut handler = crate::offload::handler::QueueHandler::new(&q, &target, &mut bufs, dev);
+    let mut handler = crate::offload::handler::QueueHandler::new(&q, &target);
+    let max_io_buf_bytes = dev.dev_info.max_io_buf_bytes as usize;
 
     let io_handler = |_q: &UblkQueue, tag: u16, io_ctx: &UblkIOCtx| {
-        handler.handle_event(tag, io_ctx);
+        if io_ctx.is_tgt_io() && tag == crate::offload::handler::POLL_TAG {
+            handler.handle_event(tag, io_ctx, None);
+        } else {
+            let iod = q.get_iod(tag);
+            let buf_len =
+                std::cmp::min((iod.nr_sectors << 9) as usize, max_io_buf_bytes);
+            let buf = &mut bufs[tag as usize].as_mut()[..buf_len];
+            handler.handle_event(tag, io_ctx, Some(buf));
+        }
     };
 
     q.wait_and_handle_io(io_handler);
