@@ -1,6 +1,6 @@
 use crate::offload::{
     handler::{setup_worker_thread, Completion, OffloadHandler, OffloadJob, QueueHandler},
-    OffloadTargetLogic,
+    OffloadTargetLogic, OffloadType,
 };
 use libublk::{
     ctrl::UblkCtrl,
@@ -17,9 +17,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-const READ_HANDLER_IDX: u32 = 0;
-const FLUSH_HANDLER_IDX: u32 = 1;
 
 #[derive(clap::Args, Debug, Clone)]
 pub(crate) struct CompressAddArgs {
@@ -170,7 +167,8 @@ fn handle_offload_fn(
 }
 
 impl<'a> CompressTarget {
-    fn setup_one_handler(&self, handler: &mut QueueHandler<'a, Self>, idx: u32) {
+    fn setup_one_handler(&self, handler: &mut QueueHandler<'a, Self>, op_type: OffloadType) {
+        let idx = op_type as usize;
         let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
         let db = self.db.clone();
         let lbs = self.lbs;
@@ -178,10 +176,10 @@ impl<'a> CompressTarget {
             handle_offload_fn(&db, lbs, job)
         });
 
-        handler.offload_handlers[idx as usize] = Some(OffloadHandler::new(
+        handler.offload_handlers[idx] = Some(OffloadHandler::new(
             handler.q,
             handler.bufs_ptr,
-            idx,
+            idx as u32,
             tx,
             rx,
             efd,
@@ -191,8 +189,8 @@ impl<'a> CompressTarget {
 
 impl<'a> OffloadTargetLogic<'a> for CompressTarget {
     fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>) {
-        self.setup_one_handler(handler, READ_HANDLER_IDX);
-        self.setup_one_handler(handler, FLUSH_HANDLER_IDX);
+        self.setup_one_handler(handler, OffloadType::Read);
+        self.setup_one_handler(handler, OffloadType::Flush);
     }
 
     fn handle_io(
@@ -203,7 +201,7 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
     ) -> Result<i32, i32> {
         if io_ctx.is_tgt_io() && io_ctx.get_tag() as u16 == crate::offload::handler::POLL_TAG {
             let handler_idx = UblkIOCtx::user_data_to_op(io_ctx.user_data()) as usize;
-            if let Some(h) = &mut handler.offload_handlers[handler_idx] {
+            if let Some(Some(h)) = handler.offload_handlers.get_mut(handler_idx) {
                 h.handle_completion(handler_idx as u32);
             }
             return Ok(0);
@@ -220,13 +218,13 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
 
         let res = match op as u32 {
             libublk::sys::UBLK_IO_OP_READ => {
-                if let Some(h) = &handler.offload_handlers[READ_HANDLER_IDX as usize] {
+                if let Some(Some(h)) = handler.offload_handlers.get(OffloadType::Read as usize) {
                     h.send_job(op, tag, iod, buf);
                 }
                 return Ok(0);
             }
             libublk::sys::UBLK_IO_OP_FLUSH => {
-                if let Some(h) = &handler.offload_handlers[FLUSH_HANDLER_IDX as usize] {
+                if let Some(Some(h)) = handler.offload_handlers.get(OffloadType::Flush as usize) {
                     h.send_job(op, tag, iod, buf);
                 }
                 return Ok(0);
