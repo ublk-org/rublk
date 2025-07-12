@@ -31,13 +31,17 @@ pub(crate) struct OffloadHandler<'a> {
 }
 
 impl<'a> OffloadHandler<'a> {
-    pub(crate) fn new(
+    pub(crate) fn new<F>(
         q: &'a UblkQueue<'a>,
         handler_idx: u32,
-        job_tx: Sender<OffloadJob>,
-        completion_rx: Receiver<Completion>,
-        efd: i32,
-    ) -> Self {
+        worker_fn: F,
+    ) -> Self
+    where
+        F: Fn(OffloadJob) -> Completion + Send + 'static,
+    {
+        let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
+        let (job_tx, completion_rx) = setup_worker_thread(efd, worker_fn);
+
         let handler = Self {
             q,
             efd,
@@ -115,7 +119,7 @@ impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
     }
 }
 
-pub(crate) fn setup_worker_thread<F>(efd: i32, handler: F) -> (Sender<OffloadJob>, Receiver<Completion>)
+fn setup_worker_thread<F>(efd: i32, handler: F) -> (Sender<OffloadJob>, Receiver<Completion>)
 where
     F: Fn(OffloadJob) -> Completion + Send + 'static,
 {

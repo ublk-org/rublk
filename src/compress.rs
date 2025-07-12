@@ -1,5 +1,5 @@
 use crate::offload::{
-    handler::{setup_worker_thread, Completion, OffloadHandler, OffloadJob, QueueHandler},
+    handler::{Completion, OffloadHandler, OffloadJob, QueueHandler},
     OffloadTargetLogic,
 };
 use libublk::{
@@ -171,19 +171,12 @@ fn handle_offload_fn(
 
 impl<'a> OffloadTargetLogic<'a> for CompressTarget {
     fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>) {
-        let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
         let db = self.db.clone();
         let lbs = self.lbs;
-        let (tx, rx) = setup_worker_thread(efd, move |job: OffloadJob| {
-            handle_offload_fn(&db, lbs, job)
-        });
-
         handler.offload_handlers[OPL_HANDLER_IDX as usize] = Some(OffloadHandler::new(
             handler.q,
             OPL_HANDLER_IDX,
-            tx,
-            rx,
-            efd,
+            move |job: OffloadJob| handle_offload_fn(&db, lbs, job),
         ));
     }
 
