@@ -1,10 +1,12 @@
+use crate::offload::{
+    handler::{Completion, OffloadHandler, OffloadJob, QueueHandler},
+    OffloadTargetLogic,
+};
 use libublk::{
     ctrl::UblkCtrl,
-    helpers::IoBuf,
     io::{UblkDev, UblkIOCtx, UblkQueue},
     UblkIORes,
 };
-use nix::sys::eventfd::{eventfd, EfdFlags};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
     WriteOptions, DB,
@@ -14,8 +16,9 @@ use serde_json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+
+const OPL_HANDLER_IDX: u32 = 0;
 
 #[derive(clap::Args, Debug, Clone)]
 pub(crate) struct CompressAddArgs {
@@ -48,24 +51,6 @@ struct CompressJson {
     logical_block_size: u32,
     physical_block_size: u32,
 }
-
-struct ReadJob {
-    tag: u16,
-    start_sector: u64,
-    nr_sectors: u32,
-    buf_addr: u64,
-}
-
-struct FlushJob {
-    tag: u16,
-}
-
-struct Completion {
-    tag: u16,
-    result: Result<i32, i32>,
-}
-
-const POLL_TAG: u16 = u16::MAX;
 
 fn handle_read(
     db: &DB,
@@ -100,6 +85,15 @@ fn handle_read(
         }
     }
     Ok((nr_sectors << 9) as i32)
+}
+
+fn handle_flush(db: &DB) -> Result<i32, i32> {
+    if let Err(e) = db.flush() {
+        log::error!("Background rocksdb flush error: {}", e);
+        Err(-libc::EIO)
+    } else {
+        Ok(0)
+    }
 }
 
 fn handle_write(
@@ -144,206 +138,80 @@ fn handle_discard(
     Ok(0)
 }
 
-fn submit_poll_sqe(q: &UblkQueue, efd: i32, op: u32) {
-    let user_data = UblkIOCtx::build_user_data(POLL_TAG, op, 0, true);
-    let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(efd), libc::POLLIN as _)
-        .build()
-        .user_data(user_data);
-    q.ublk_submit_sqe_sync(sqe).unwrap();
-}
-
-struct OffloadHandler<'a, Job> {
-    q: &'a UblkQueue<'a>,
-    bufs_ptr: *mut IoBuf<u8>,
-    efd: i32,
-    job_tx: Sender<Job>,
-    completion_rx: Receiver<Completion>,
-    poll_op: u32,
-}
-
-impl<'a, Job> OffloadHandler<'a, Job> {
-    fn handle_completion(&self) {
-        let mut buf = [0u8; 8];
-        nix::unistd::read(self.efd, &mut buf).unwrap();
-
-        while let Ok(completion) = self.completion_rx.try_recv() {
-            let result = match completion.result {
-                Ok(r) => UblkIORes::Result(r),
-                Err(e) => UblkIORes::Result(e),
-            };
-            let tag = completion.tag;
-            let buf_addr = unsafe {
-                let io_buf: &mut IoBuf<u8> = &mut *self.bufs_ptr.add(tag as usize);
-                io_buf.as_mut().as_mut_ptr()
-            };
-            self.q.complete_io_cmd(tag, buf_addr, Ok(result));
-        }
-        submit_poll_sqe(self.q, self.efd, self.poll_op);
-    }
-}
-
-impl<'a> OffloadHandler<'a, ReadJob> {
-    fn send_job(&self, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
-        self.job_tx
-            .send(ReadJob {
-                tag,
-                start_sector: iod.start_sector,
-                nr_sectors: iod.nr_sectors,
-                buf_addr: buf.as_mut_ptr() as u64,
-            })
-            .unwrap();
-    }
-}
-
-impl<'a> OffloadHandler<'a, FlushJob> {
-    fn send_job(&self, tag: u16) {
-        self.job_tx.send(FlushJob { tag }).unwrap();
-    }
-}
-
-struct QueueHandler<'a> {
-    q: &'a UblkQueue<'a>,
-    db: &'a Arc<DB>,
-    bufs_ptr: *mut IoBuf<u8>,
-    max_buf_len: usize,
+struct CompressTarget {
+    db: Arc<DB>,
     lbs: u32,
     read_only: bool,
-    read_handler: OffloadHandler<'a, ReadJob>,
-    flush_handler: OffloadHandler<'a, FlushJob>,
 }
 
-impl<'a> QueueHandler<'a> {
-    fn setup_worker_thread<Job, C, F>(efd: i32, handler: F) -> (Sender<Job>, Receiver<C>)
-    where
-        Job: Send + 'static,
-        C: Send + 'static,
-        F: Fn(Job) -> C + Send + 'static,
-    {
-        let (job_tx, job_rx) = channel();
-        let (completion_tx, completion_rx) = channel();
+fn handle_offload_fn(
+    db: &Arc<DB>,
+    lbs: u32,
+    job: OffloadJob,
+) -> Completion {
+    let res = match job.op as u32 {
+        libublk::sys::UBLK_IO_OP_READ => {
+            let buf_slice = unsafe {
+                std::slice::from_raw_parts_mut(
+                    job.buf_addr as *mut u8,
+                    (job.nr_sectors << 9) as usize,
+                )
+            };
+            handle_read(db, job.start_sector, job.nr_sectors, buf_slice, lbs)
+        }
+        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(db),
+        _ => Err(-libc::EINVAL),
+    };
+    Completion {
+        tag: job.tag,
+        result: res,
+        buf_addr: job.buf_addr,
+    }
+}
 
-        std::thread::spawn(move || {
-            for job in job_rx {
-                let completion = handler(job);
-                if completion_tx.send(completion).is_err() {
-                    break;
-                }
-                nix::unistd::write(efd, &1u64.to_le_bytes()).unwrap();
-            }
-        });
-
-        (job_tx, completion_rx)
+impl<'a> OffloadTargetLogic<'a> for CompressTarget {
+    fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>) {
+        let db = self.db.clone();
+        let lbs = self.lbs;
+        handler.offload_handlers[OPL_HANDLER_IDX as usize] = Some(OffloadHandler::new(
+            handler.q,
+            OPL_HANDLER_IDX,
+            move |job: OffloadJob| handle_offload_fn(&db, lbs, job),
+        ));
     }
 
-    fn new(
-        q: &'a UblkQueue<'a>,
-        db: &'a Arc<DB>,
-        bufs: &'a mut [IoBuf<u8>],
-        dev: &'a UblkDev,
-    ) -> Self {
-        let flush_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
-        let read_efd = eventfd(0, EfdFlags::EFD_CLOEXEC).unwrap();
-        let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
-        let bufs_ptr = bufs.as_mut_ptr();
-
-        let db_read = db.clone();
-        let (read_job_tx, read_completion_rx) =
-            Self::setup_worker_thread(read_efd, move |job: ReadJob| {
-                let buf_slice = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        job.buf_addr as *mut u8,
-                        (job.nr_sectors << 9) as usize,
-                    )
-                };
-                let res = handle_read(&db_read, job.start_sector, job.nr_sectors, buf_slice, lbs);
-                Completion {
-                    tag: job.tag,
-                    result: res,
-                }
-            });
-
-        let db_flush = db.clone();
-        let (flush_job_tx, flush_completion_rx) =
-            Self::setup_worker_thread(flush_efd, move |job: FlushJob| {
-                let res = if let Err(e) = db_flush.flush() {
-                    log::error!("Background rocksdb flush error: {}", e);
-                    Err(-libc::EIO)
-                } else {
-                    Ok(0)
-                };
-                Completion {
-                    tag: job.tag,
-                    result: res,
-                }
-            });
-
-        submit_poll_sqe(q, read_efd, libublk::sys::UBLK_IO_OP_READ);
-        submit_poll_sqe(q, flush_efd, libublk::sys::UBLK_IO_OP_FLUSH);
-
-        let read_handler = OffloadHandler {
-            q,
-            bufs_ptr,
-            efd: read_efd,
-            job_tx: read_job_tx,
-            completion_rx: read_completion_rx,
-            poll_op: libublk::sys::UBLK_IO_OP_READ,
-        };
-
-        let flush_handler = OffloadHandler {
-            q,
-            bufs_ptr,
-            efd: flush_efd,
-            job_tx: flush_job_tx,
-            completion_rx: flush_completion_rx,
-            poll_op: libublk::sys::UBLK_IO_OP_FLUSH,
-        };
-
-        Self {
-            q,
-            db,
-            bufs_ptr,
-            max_buf_len: dev.dev_info.max_io_buf_bytes as usize,
-            lbs,
-            read_only: (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
-            read_handler,
-            flush_handler,
-        }
-    }
-
-    fn handle_io(&self, tag: u16, io_ctx: &UblkIOCtx) {
-        if io_ctx.is_tgt_io() {
-            match UblkIOCtx::user_data_to_op(io_ctx.user_data()) {
-                libublk::sys::UBLK_IO_OP_FLUSH => {
-                    self.flush_handler.handle_completion();
-                    return;
-                }
-                libublk::sys::UBLK_IO_OP_READ => {
-                    self.read_handler.handle_completion();
-                    return;
-                }
-                _ => {}
+    fn handle_io(
+        &self,
+        handler: &mut QueueHandler<'a, Self>,
+        tag: u16,
+        io_ctx: &UblkIOCtx,
+        buf: Option<&mut [u8]>,
+    ) -> Result<i32, i32> {
+        if io_ctx.is_tgt_io() && io_ctx.get_tag() as u16 == crate::offload::handler::POLL_TAG {
+            let handler_idx = UblkIOCtx::user_data_to_op(io_ctx.user_data()) as usize;
+            if let Some(Some(h)) = handler.offload_handlers.get_mut(handler_idx) {
+                h.handle_completion(handler_idx as u32);
             }
+            return Ok(0);
         }
 
-        let iod = self.q.get_iod(tag);
-        let op = iod.op_flags & 0xff;
+        let q = handler.q;
+        let iod = q.get_iod(tag);
+        let op = (iod.op_flags & 0xff) as u16;
+        let buf = buf.unwrap();
 
-        let buf = unsafe {
-            let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, self.max_buf_len);
-            let io_buf: &mut IoBuf<u8> = &mut *self.bufs_ptr.add(tag as usize);
-            &mut io_buf.as_mut()[..buf_len]
-        };
-
-        let res = match op {
-            libublk::sys::UBLK_IO_OP_READ => {
-                self.read_handler.send_job(tag, iod, buf);
-                return;
+        let res = match op as u32 {
+            libublk::sys::UBLK_IO_OP_READ | libublk::sys::UBLK_IO_OP_FLUSH => {
+                if let Some(Some(h)) = handler.offload_handlers.get(OPL_HANDLER_IDX as usize) {
+                    h.send_job(op, tag, iod, buf);
+                }
+                return Ok(0);
             }
             libublk::sys::UBLK_IO_OP_WRITE => {
                 if self.read_only {
                     Err(-libc::EACCES)
                 } else {
-                    handle_write(self.db, iod.start_sector, iod.nr_sectors, buf, self.lbs)
+                    handle_write(&self.db, iod.start_sector, iod.nr_sectors, buf, self.lbs)
                 }
             }
             libublk::sys::UBLK_IO_OP_DISCARD => {
@@ -351,12 +219,8 @@ impl<'a> QueueHandler<'a> {
                     Err(-libc::EACCES)
                 } else {
                     let cf = self.db.cf_handle("default").unwrap();
-                    handle_discard(self.db, cf, iod.start_sector, iod.nr_sectors, self.lbs)
+                    handle_discard(&self.db, cf, iod.start_sector, iod.nr_sectors, self.lbs)
                 }
-            }
-            libublk::sys::UBLK_IO_OP_FLUSH => {
-                self.flush_handler.send_job(tag);
-                return;
             }
             _ => Err(-libc::EINVAL),
         };
@@ -365,7 +229,8 @@ impl<'a> QueueHandler<'a> {
             Ok(r) => UblkIORes::Result(r),
             Err(e) => UblkIORes::Result(e),
         };
-        self.q.complete_io_cmd(tag, buf.as_mut_ptr(), Ok(result));
+        q.complete_io_cmd(tag, buf.as_mut_ptr(), Ok(result));
+        Ok(0)
     }
 }
 
@@ -376,10 +241,24 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
         .regiser_io_bufs(Some(&bufs))
         .submit_fetch_commands(Some(&bufs));
 
-    let handler = QueueHandler::new(&q, db, &mut bufs, dev);
+    let target = CompressTarget {
+        db: db.clone(),
+        lbs: 1u32 << dev.tgt.params.basic.logical_bs_shift,
+        read_only: (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
+    };
+    let mut handler = crate::offload::handler::QueueHandler::new(&q, &target);
+    let max_io_buf_bytes = dev.dev_info.max_io_buf_bytes as usize;
 
     let io_handler = |_q: &UblkQueue, tag: u16, io_ctx: &UblkIOCtx| {
-        handler.handle_io(tag, io_ctx);
+        if io_ctx.is_tgt_io() && tag == crate::offload::handler::POLL_TAG {
+            handler.handle_event(tag, io_ctx, None);
+        } else {
+            let iod = q.get_iod(tag);
+            let buf_len =
+                std::cmp::min((iod.nr_sectors << 9) as usize, max_io_buf_bytes);
+            let buf = &mut bufs[tag as usize].as_mut()[..buf_len];
+            handler.handle_event(tag, io_ctx, Some(buf));
+        }
     };
 
     q.wait_and_handle_io(io_handler);

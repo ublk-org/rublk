@@ -16,11 +16,12 @@ pub(crate) mod target_flags {
 extern crate nix;
 
 mod args;
+mod compress;
 mod r#loop;
 mod null;
 mod qcow2;
+mod offload;
 mod zoned;
-mod compress;
 
 #[derive(Parser)]
 #[command(version)]
