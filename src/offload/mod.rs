@@ -3,7 +3,7 @@ pub mod handler;
 use crate::offload::handler::QueueHandler;
 use libublk::io::UblkIOCtx;
 
-pub trait OffloadTargetLogic<'a> {
+pub(crate) trait OffloadTargetLogic<'a> {
     fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>);
 
     fn handle_io(

@@ -4,11 +4,11 @@ use libublk::{
 };
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-pub const POLL_TAG: u16 = u16::MAX;
-pub const NR_OFFLOAD_HANDLERS: usize = 8;
+pub(crate) const POLL_TAG: u16 = u16::MAX;
+pub(crate) const NR_OFFLOAD_HANDLERS: usize = 8;
 
 #[derive(Debug, Default)]
-pub struct OffloadJob {
+pub(crate) struct OffloadJob {
     pub op: u16,
     pub tag: u16,
     pub start_sector: u64,
@@ -17,13 +17,13 @@ pub struct OffloadJob {
 }
 
 #[derive(Debug)]
-pub struct Completion {
+pub(crate) struct Completion {
     pub tag: u16,
     pub result: Result<i32, i32>,
     pub buf_addr: u64,
 }
 
-pub struct OffloadHandler<'a> {
+pub(crate) struct OffloadHandler<'a> {
     q: &'a UblkQueue<'a>,
     efd: i32,
     job_tx: Sender<OffloadJob>,
@@ -31,7 +31,7 @@ pub struct OffloadHandler<'a> {
 }
 
 impl<'a> OffloadHandler<'a> {
-    pub fn new(
+    pub(crate) fn new(
         q: &'a UblkQueue<'a>,
         handler_idx: u32,
         job_tx: Sender<OffloadJob>,
@@ -56,7 +56,7 @@ impl<'a> OffloadHandler<'a> {
         self.q.ublk_submit_sqe_sync(sqe).unwrap();
     }
 
-    pub fn handle_completion(&mut self, handler_idx: u32) {
+    pub(crate) fn handle_completion(&mut self, handler_idx: u32) {
         let mut buf = [0u8; 8];
         nix::unistd::read(self.efd, &mut buf).unwrap();
 
@@ -72,7 +72,7 @@ impl<'a> OffloadHandler<'a> {
         self.submit_poll_sqe(handler_idx);
     }
 
-    pub fn send_job(&self, op: u16, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
+    pub(crate) fn send_job(&self, op: u16, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
         self.job_tx
             .send(OffloadJob {
                 op,
@@ -85,14 +85,14 @@ impl<'a> OffloadHandler<'a> {
     }
 }
 
-pub struct QueueHandler<'a, T: super::OffloadTargetLogic<'a> + ?Sized> {
+pub(crate) struct QueueHandler<'a, T: super::OffloadTargetLogic<'a> + ?Sized> {
     pub q: &'a UblkQueue<'a>,
     target_logic: &'a T,
     pub offload_handlers: Vec<Option<OffloadHandler<'a>>>,
 }
 
 impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
-    pub fn new(
+    pub(crate) fn new(
         q: &'a UblkQueue<'a>,
         target_logic: &'a T,
     ) -> Self {
@@ -110,12 +110,12 @@ impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
         s
     }
 
-    pub fn handle_event(&mut self, tag: u16, io_ctx: &UblkIOCtx, buf: Option<&mut [u8]>) {
+    pub(crate) fn handle_event(&mut self, tag: u16, io_ctx: &UblkIOCtx, buf: Option<&mut [u8]>) {
         self.target_logic.handle_io(self, tag, io_ctx, buf).unwrap();
     }
 }
 
-pub fn setup_worker_thread<F>(efd: i32, handler: F) -> (Sender<OffloadJob>, Receiver<Completion>)
+pub(crate) fn setup_worker_thread<F>(efd: i32, handler: F) -> (Sender<OffloadJob>, Receiver<Completion>)
 where
     F: Fn(OffloadJob) -> Completion + Send + 'static,
 {
