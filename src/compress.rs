@@ -174,8 +174,6 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
         let db = self.db.clone();
         let lbs = self.lbs;
         handler.offload_handlers[OPL_HANDLER_IDX as usize] = Some(OffloadHandler::new(
-            handler.q,
-            OPL_HANDLER_IDX,
             move |job: OffloadJob| handle_offload_fn(&db, lbs, job),
         ));
     }
@@ -190,7 +188,7 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
         if io_ctx.is_tgt_io() && io_ctx.get_tag() as u16 == crate::offload::handler::POLL_TAG {
             let handler_idx = UblkIOCtx::user_data_to_op(io_ctx.user_data()) as usize;
             if let Some(Some(h)) = handler.offload_handlers.get_mut(handler_idx) {
-                h.handle_completion(handler_idx as u32);
+                h.handle_completion(handler.q, handler_idx as u32);
             }
             return Ok(0);
         }

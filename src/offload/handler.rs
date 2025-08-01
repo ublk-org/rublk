@@ -23,17 +23,14 @@ pub(crate) struct Completion {
     pub buf_addr: u64,
 }
 
-pub(crate) struct OffloadHandler<'a> {
-    q: &'a UblkQueue<'a>,
+pub(crate) struct OffloadHandler {
     efd: i32,
     job_tx: Sender<OffloadJob>,
     completion_rx: Receiver<Completion>,
 }
 
-impl<'a> OffloadHandler<'a> {
+impl OffloadHandler {
     pub(crate) fn new<F>(
-        q: &'a UblkQueue<'a>,
-        handler_idx: u32,
         worker_fn: F,
     ) -> Self
     where
@@ -43,24 +40,22 @@ impl<'a> OffloadHandler<'a> {
         let (job_tx, completion_rx) = setup_worker_thread(efd, worker_fn);
 
         let handler = Self {
-            q,
             efd,
             job_tx,
             completion_rx,
         };
-        handler.submit_poll_sqe(handler_idx);
         handler
     }
 
-    fn submit_poll_sqe(&self, handler_idx: u32) {
+    pub(crate) fn submit_poll_sqe(&self, q: &UblkQueue, handler_idx: u32) {
         let user_data = libublk::io::UblkIOCtx::build_user_data(POLL_TAG, handler_idx, 0, true);
         let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(self.efd), libc::POLLIN as _)
             .build()
             .user_data(user_data);
-        self.q.ublk_submit_sqe_sync(sqe).unwrap();
+        q.ublk_submit_sqe_sync(sqe).unwrap();
     }
 
-    pub(crate) fn handle_completion(&mut self, handler_idx: u32) {
+    pub(crate) fn handle_completion(&mut self, q: &UblkQueue, handler_idx: u32) {
         let mut buf = [0u8; 8];
         nix::unistd::read(self.efd, &mut buf).unwrap();
 
@@ -70,10 +65,9 @@ impl<'a> OffloadHandler<'a> {
                 Err(e) => UblkIORes::Result(e),
             };
             let tag = completion.tag;
-            self.q
-                .complete_io_cmd(tag, completion.buf_addr as *mut u8, Ok(result));
+            q.complete_io_cmd(tag, completion.buf_addr as *mut u8, Ok(result));
         }
-        self.submit_poll_sqe(handler_idx);
+        self.submit_poll_sqe(q, handler_idx);
     }
 
     pub(crate) fn send_job(&self, op: u16, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
@@ -92,7 +86,7 @@ impl<'a> OffloadHandler<'a> {
 pub(crate) struct QueueHandler<'a, T: super::OffloadTargetLogic<'a> + ?Sized> {
     pub q: &'a UblkQueue<'a>,
     target_logic: &'a T,
-    pub offload_handlers: Vec<Option<OffloadHandler<'a>>>,
+    pub offload_handlers: Vec<Option<OffloadHandler>>,
 }
 
 impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
@@ -111,6 +105,12 @@ impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
             offload_handlers: handlers,
         };
         target_logic.setup_offload_handlers(&mut s);
+
+        for (idx, h) in s.offload_handlers.iter().enumerate() {
+            if h.is_some() {
+                h.as_ref().unwrap().submit_poll_sqe(s.q, idx as u32);
+            }
+        }
         s
     }
 
