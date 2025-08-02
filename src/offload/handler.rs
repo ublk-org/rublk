@@ -83,6 +83,47 @@ impl OffloadHandler {
     }
 }
 
+/// The `QueueHandler` serves as a generic and reusable component that orchestrates I/O handling
+/// for a `UblkQueue`. Its primary purposes are:
+///
+/// 1.  **Abstraction**: It abstracts the complexities of I/O offloading. It manages a pool of
+///     `OffloadHandler`s, each running in a separate worker thread, to process tasks
+///     asynchronously. This keeps the main I/O processing loop non-blocking.
+/// 2.  **Decoupling**: It decouples the generic queue management logic from the specific
+///     application logic of an I/O target (like the `CompressTarget` which uses RocksDB). This is
+///     achieved by using the `OffloadTargetLogic` trait.
+/// 3.  **Centralization**: It centralizes the logic for handling events from the underlying
+///     `UblkQueue`, interpreting them, and dispatching them to the appropriate handler—either a
+///     synchronous operation or an asynchronous offload handler.
+///
+/// In essence, `QueueHandler` acts as the "brain" for a `ublk` queue, using the
+/// `OffloadTargetLogic` trait as a pluggable "strategy" to define how different I/O operations
+/// should actually be handled.
+///
+/// ### Is it really necessary?
+///
+/// Yes, this abstraction is highly beneficial and arguably necessary for a clean and maintainable
+/// design. Here’s why:
+///
+/// 1.  **Separation of Concerns**: Without `QueueHandler`, the logic currently in `CompressTarget`
+///     (specific to RocksDB) and the logic for managing worker threads, `eventfd`, and channels
+///     would be entangled within the main queue processing loop (`q_sync_fn`). This would create a
+///     monolithic and hard-to-maintain function.
+/// 2.  **Reusability**: The `QueueHandler` and `OffloadHandler` provide a reusable framework for
+///     creating new `ublk` targets. To implement a new target with its own offloading
+///     requirements, you would only need to provide a new implementation of the
+///     `OffloadTargetLogic` trait. The core machinery for managing the queue and worker threads
+///     remains unchanged.
+/// 3.  **Extensibility and Scalability**: This design, which employs the Strategy design pattern,
+///     makes the system extensible. New features or even entirely new storage backends can be
+///     added with minimal changes to the existing core logic. It also scales well by allowing
+///     different targets to define their own set of offload handlers tailored to their specific
+///     needs.
+///
+/// In conclusion, while it would be possible to implement the compression target without
+/// `QueueHandler`, the result would be less modular, harder to test, and more difficult to extend.
+/// The `QueueHandler` provides a necessary abstraction that leads to a cleaner, more robust, and
+/// more reusable codebase.
 pub(crate) struct QueueHandler<'a, T: super::OffloadTargetLogic<'a> + ?Sized> {
     pub q: &'a UblkQueue<'a>,
     target_logic: &'a T,
