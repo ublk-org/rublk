@@ -187,6 +187,24 @@ fn q_fn(qid: u16, dev: &UblkDev) {
         .wait_and_handle_io(lo_io_handler);
 }
 
+async fn handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16) {
+    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    let buf_addr = buf.as_mut_ptr();
+    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
+    let mut res = 0;
+
+    q.register_io_buf(tag, &buf);
+    loop {
+        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+            break;
+        }
+
+        res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
+        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+    }
+}
+
 fn q_a_fn(qid: u16, dev: &UblkDev) {
     let depth = dev.dev_info.queue_depth;
     let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
@@ -195,24 +213,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
 
     for tag in 0..depth {
         let q = q_rc.clone();
-
-        f_vec.push(exe.spawn(async move {
-            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-            let buf_addr = buf.as_mut_ptr();
-            let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
-            let mut res = 0;
-
-            q.register_io_buf(tag, &buf);
-            loop {
-                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
-                if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
-
-                res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
-                cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
-            }
-        }));
+        f_vec.push(exe.spawn(handle_queue_tag_async(q, tag)));
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
     smol::block_on(async { futures::future::join_all(f_vec).await });
