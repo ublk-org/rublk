@@ -17,7 +17,7 @@ maintenance = { status = "actively-developed" }
 
 [dependencies]
 qcow2-rs = "0.1"
-libublk = "0.3"
+libublk = "0.4"
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
 libc = "0.2"
@@ -30,7 +30,7 @@ env_logger = "0.9"
 backtrace = "0.3"
 daemonize = "0.5"
 nix = "0.26.2"
-io-uring = "0.6.0"
+io-uring = "=0.7.4"
 ilog = "1.0.1"
 shared_memory = "0.12.4"
 rand = "0.8.4"

@@ -60,6 +60,10 @@ pub(crate) struct GenAddArgs {
     #[clap(long, default_value_t = false)]
     pub foreground: bool,
 
+    /// Use auto_buf_reg for supporting zero copy
+    #[clap(long, short = 'z', default_value_t = false)]
+    pub zero_copy: bool,
+
     #[clap(skip)]
     start_dir: RefCell<Option<PathBuf>>,
 }
@@ -149,6 +153,14 @@ impl GenAddArgs {
 
         if name == "zoned" {
             ctrl_flags |= libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_ZONED;
+        }
+
+        if self.zero_copy {
+            if name != "loop" {
+                anyhow::bail!("Target {} doesn't support zero copy", name);
+            }
+            ctrl_flags |=
+                libublk::sys::UBLK_F_SUPPORT_ZERO_COPY | libublk::sys::UBLK_F_AUTO_BUF_REG;
         }
 
         if self.user_copy {
