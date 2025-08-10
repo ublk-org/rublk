@@ -34,11 +34,15 @@ struct LoJson {
     async_await: bool,
 }
 
-pub(crate) struct LoopTgt {
-    pub back_file_path: String,
+struct LoopTgt {
+    pub json: LoJson,
     pub back_file: std::fs::File,
-    pub direct_io: i32,
-    pub async_await: bool,
+}
+
+impl LoopTgt {
+    pub fn new(json: LoJson, back_file: std::fs::File) -> Self {
+        Self { json, back_file }
+    }
 }
 
 #[inline]
@@ -95,7 +99,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     let info = dev.dev_info;
 
-    if lo.direct_io != 0 {
+    if lo.json.direct_io != 0 {
         unsafe {
             libc::fcntl(lo.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
         }
@@ -131,7 +135,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
         o.gen_arg.apply_read_only(dev);
     }
 
-    let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: lo.direct_io, async_await:lo.async_await, } });
+    let val = serde_json::json!({"loop": &lo.json });
     dev.set_target_json(val);
 
     Ok(())
@@ -251,16 +255,19 @@ pub(crate) fn ublk_add_loop(
     };
 
     let file_path = format!("{}", file.as_path().display());
-    let lo = LoopTgt {
-        back_file: std::fs::OpenOptions::new()
+    let json = LoJson {
+        back_file_path: file_path,
+        direct_io: i32::from(dio),
+        async_await: aa,
+    };
+    let lo = LoopTgt::new(
+        json,
+        std::fs::OpenOptions::new()
             .read(true)
             .write(!ro)
             .open(&file)
             .unwrap(),
-        direct_io: i32::from(dio),
-        back_file_path: file_path,
-        async_await: aa,
-    };
+    );
 
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
         return Err(anyhow::anyhow!("loop doesn't support user copy"));
@@ -269,7 +276,13 @@ pub(crate) fn ublk_add_loop(
     let comm = comm_rc.clone();
     ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
-        move |qid, dev: &_| if aa { q_a_fn(qid, dev) } else { q_fn(qid, dev) },
+        move |qid, dev: &_| {
+            if lo.json.async_await {
+                q_a_fn(qid, dev)
+            } else {
+                q_fn(qid, dev)
+            }
+        },
         move |ctrl: &UblkCtrl| comm.send_dev_id(ctrl.dev_info().dev_id).unwrap(),
     )
     .unwrap();
