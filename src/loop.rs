@@ -25,6 +25,10 @@ pub struct LoopArgs {
     /// use async_await
     #[clap(long, short = 'a', default_value_t = false)]
     pub async_await: bool,
+
+    /// disable discard
+    #[clap(long, default_value_t = false)]
+    pub no_discard: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +36,7 @@ struct LoJson {
     back_file_path: String,
     direct_io: i32,
     async_await: bool,
+    no_discard: bool,
 }
 
 struct LoopTgt {
@@ -52,13 +57,48 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH
         | libublk::sys::UBLK_IO_OP_READ
-        | libublk::sys::UBLK_IO_OP_WRITE => 0,
+        | libublk::sys::UBLK_IO_OP_WRITE
+        | libublk::sys::UBLK_IO_OP_DISCARD
+        | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => 0,
         _ => -libc::EINVAL,
     }
 }
 
+fn lo_fallocate_mode(ublk_op: u32, flags: u32) -> i32 {
+    /* follow logic of linux kernel loop */
+    libc::FALLOC_FL_KEEP_SIZE
+        | if ublk_op == libublk::sys::UBLK_IO_OP_DISCARD {
+            libc::FALLOC_FL_PUNCH_HOLE
+        } else if ublk_op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES {
+            if (flags & libublk::sys::UBLK_IO_F_NOUNMAP) != 0 {
+                libc::FALLOC_FL_ZERO_RANGE
+            } else {
+                libc::FALLOC_FL_PUNCH_HOLE
+            }
+        } else {
+            libc::FALLOC_FL_ZERO_RANGE
+        }
+}
+
+fn lo_make_discard_sqe(op: u32, flags: u32, off: u64, bytes: u32) -> io_uring::squeue::Entry {
+    let mode = lo_fallocate_mode(op, flags);
+
+    opcode::Fallocate::new(types::Fixed(1), bytes as u64)
+        .offset(off)
+        .mode(mode)
+        .build()
+        .flags(squeue::Flags::FIXED_FILE)
+}
+
 #[inline]
-fn __lo_make_io_sqe_zc(op: u32, off: u64, bytes: u32, buf_index: u16) -> io_uring::squeue::Entry {
+fn __lo_make_io_sqe_zc(
+    iod: &libublk::sys::ublksrv_io_desc,
+    buf_index: u16,
+) -> io_uring::squeue::Entry {
+    let op = iod.op_flags & 0xff;
+    let off = iod.start_sector << 9;
+    let bytes = iod.nr_sectors << 9;
+
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
             .offset(off)
@@ -76,12 +116,22 @@ fn __lo_make_io_sqe_zc(op: u32, off: u64, bytes: u32, buf_index: u16) -> io_urin
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
         }
+        libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
+            lo_make_discard_sqe(op, iod.op_flags >> 8, off, bytes)
+        }
         _ => panic!(),
     }
 }
 
 #[inline]
-fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
+fn __lo_make_io_sqe(
+    iod: &libublk::sys::ublksrv_io_desc,
+    buf_addr: *mut u8,
+) -> io_uring::squeue::Entry {
+    let op = iod.op_flags & 0xff;
+    let off = iod.start_sector << 9;
+    let bytes = iod.nr_sectors << 9;
+
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => opcode::Fsync::new(types::Fixed(1)).build(),
         libublk::sys::UBLK_IO_OP_READ => opcode::Read::new(types::Fixed(1), buf_addr, bytes)
@@ -90,6 +140,9 @@ fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_urin
         libublk::sys::UBLK_IO_OP_WRITE => opcode::Write::new(types::Fixed(1), buf_addr, bytes)
             .offset(off)
             .build(),
+        libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
+            lo_make_discard_sqe(op, iod.op_flags >> 8, off, bytes)
+        }
         _ => panic!(),
     }
 }
@@ -103,15 +156,10 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8, 
     }
 
     for _ in 0..4 {
-        let op = iod.op_flags & 0xff;
-        // either start to handle or retry
-        let off = iod.start_sector << 9;
-        let bytes = iod.nr_sectors << 9;
-
         let sqe = if zc {
-            __lo_make_io_sqe_zc(op, off, bytes, tag)
+            __lo_make_io_sqe_zc(iod, tag)
         } else {
-            __lo_make_io_sqe(op, off, bytes, buf_addr)
+            __lo_make_io_sqe(iod, buf_addr)
         };
         let res = q.ublk_submit_sqe(sqe).await;
         if res != -(libc::EAGAIN) {
@@ -143,7 +191,12 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     tgt.dev_size = sz.0;
     //todo: figure out correct block size
     tgt.params = libublk::sys::ublk_params {
-        types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
+        types: libublk::sys::UBLK_PARAM_TYPE_BASIC
+            | if !lo.json.no_discard {
+                libublk::sys::UBLK_PARAM_TYPE_DISCARD
+            } else {
+                0
+            },
         basic: libublk::sys::ublk_param_basic {
             attrs,
             logical_bs_shift: sz.1,
@@ -152,6 +205,14 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
             io_min_shift: sz.1,
             max_sectors: info.max_io_buf_bytes >> 9,
             dev_sectors: tgt.dev_size >> 9,
+            ..Default::default()
+        },
+
+        discard: libublk::sys::ublk_param_discard {
+            discard_granularity: (sz.2 as u32) << 9,
+            max_discard_sectors: 1 << 30 >> 9,
+            max_write_zeroes_sectors: 1 << 30 >> 9,
+            max_discard_segments: 1,
             ..Default::default()
         },
         ..Default::default()
@@ -189,11 +250,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
     if res < 0 {
         q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
     } else {
-        let op = iod.op_flags & 0xff;
-        // either start to handle or retry
-        let off = iod.start_sector << 9;
-        let bytes = iod.nr_sectors << 9;
-        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
+        let sqe = __lo_make_io_sqe(iod, buf_addr).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
     }
 }
@@ -278,12 +335,13 @@ pub(crate) fn ublk_add_loop(
     opt: Option<LoopArgs>,
     comm_rc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
-    let (file, dio, ro, aa) = match opt {
+    let (file, dio, ro, aa, no_discard) = match opt {
         Some(ref o) => (
             o.gen_arg.build_abs_path(o.file.clone()),
             !o.buffered_io,
             o.gen_arg.read_only,
             o.async_await,
+            o.no_discard,
         ),
         None => {
             let mut p: libublk::sys::ublk_params = Default::default();
@@ -300,6 +358,7 @@ pub(crate) fn ublk_add_loop(
                             t.direct_io != 0,
                             (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
                             t.async_await,
+                            t.no_discard,
                         ),
                         Err(_) => return Err(anyhow::anyhow!("wrong json data")),
                     }
@@ -314,6 +373,7 @@ pub(crate) fn ublk_add_loop(
         back_file_path: file_path,
         direct_io: i32::from(dio),
         async_await: aa,
+        no_discard,
     };
     let lo = LoopTgt::new(
         json,
