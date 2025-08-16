@@ -93,7 +93,7 @@ impl DevIdComm {
             return Err(anyhow::anyhow!("Fail to start ublk daemon"));
         }
 
-        return Ok((ret - 1) as i32);
+        Ok((ret - 1) as i32)
     }
 
     pub(crate) fn send_dev_id(&self, id: u32) -> anyhow::Result<()> {

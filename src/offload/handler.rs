@@ -39,12 +39,12 @@ impl OffloadHandler {
         let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
         let (job_tx, completion_rx) = setup_worker_thread(efd, worker_fn);
 
-        let handler = Self {
+        
+        Self {
             efd,
             job_tx,
             completion_rx,
-        };
-        handler
+        }
     }
 
     pub(crate) fn submit_poll_sqe(&self, q: &UblkQueue, handler_idx: u32) {

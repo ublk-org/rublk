@@ -131,10 +131,7 @@ impl GenAddArgs {
         }
     }
     pub fn save_start_dir(&self) {
-        let start_dir = match std::env::current_dir() {
-            Ok(p) => Some(p),
-            Err(_) => None,
-        };
+        let start_dir = std::env::current_dir().ok();
 
         let mut dir = self.start_dir.borrow_mut();
         *dir = start_dir;

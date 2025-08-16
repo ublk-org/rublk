@@ -296,7 +296,7 @@ impl ZonedTgt {
         let secs = match self.back_file_size(zno) {
             Ok(s) => s >> 9,
             Err(e) => {
-                bail!(zs.set_seq_err(format!("read zone {} file size failed {:?}", zno, e)));
+                bail!(zs.set_seq_err(format!("read zone {zno} file size failed {e:?}")));
             }
         };
         if secs > (z.capacity as u64) {
@@ -321,7 +321,7 @@ impl ZonedTgt {
         let z = &self.zones[zno as usize];
         let mut zs = z.get_stat_mut();
 
-        self.__update_seq_zone(&z, &mut zs)
+        self.__update_seq_zone(z, &mut zs)
     }
 
     #[allow(clippy::uninit_vec)]
@@ -453,8 +453,8 @@ impl ZonedTgt {
                 } else {
                     "seq"
                 };
-                path = path.join(format!("{}-{:06}", t, zno));
-                Ok(PathBuf::from(path))
+                path = path.join(format!("{t}-{zno:06}"));
+                Ok(path)
             }
             None => Err(anyhow::anyhow!("base dir doesn't exist")),
         }
@@ -519,15 +519,12 @@ impl ZonedTgt {
 
             // the current zone may be locked already, so have
             // to use try_lock
-            match z.stat.try_write() {
-                Ok(mut zs) => {
-                    if zs.cond == BLK_ZONE_COND_IMP_OPEN {
-                        self.__close_zone(&z, &mut zs)?;
-                        self.set_imp_close_zone_no(zno);
-                        return Ok(());
-                    }
+            if let Ok(mut zs) = z.stat.try_write() {
+                if zs.cond == BLK_ZONE_COND_IMP_OPEN {
+                    self.__close_zone(z, &mut zs)?;
+                    self.set_imp_close_zone_no(zno);
+                    return Ok(());
                 }
-                _ => {}
             }
         }
         Ok(())
@@ -621,7 +618,7 @@ impl ZonedTgt {
         }
 
         if zs.is_seq_err() {
-            self.__update_seq_zone(&z, &mut zs)?;
+            self.__update_seq_zone(z, &mut zs)?;
         }
 
         //fixme: add zone check
@@ -688,9 +685,9 @@ impl ZonedTgt {
         let mut zs = z.get_stat_mut();
 
         if zs.is_seq_err() {
-            self.__update_seq_zone(&z, &mut zs)?;
+            self.__update_seq_zone(z, &mut zs)?;
         }
-        self.__close_zone(&z, &mut zs)
+        self.__close_zone(z, &mut zs)
     }
 
     fn zone_finish(&self, sector: u64) -> anyhow::Result<i32> {
@@ -726,7 +723,7 @@ impl ZonedTgt {
         if !self.ram_backed() {
             let zno = self.get_zone_no(sector);
             if let Err(e) = self.back_file_truncate(zno, self.cfg.zone_size) {
-                bail!(zs.set_seq_err(format!("truncate zone {} file, err {:?}", zno, e)));
+                bail!(zs.set_seq_err(format!("truncate zone {zno} file, err {e:?}")));
             }
         }
         zs.cond = BLK_ZONE_COND_FULL;
@@ -747,10 +744,8 @@ impl ZonedTgt {
                     libc::MADV_DONTNEED,
                 );
             }
-        } else {
-            if let Err(e) = self.back_file_truncate(zno, 0) {
-                bail!(zs.set_seq_err(format!("truncated zone {:?} file failed {:?}", zno, e)));
-            }
+        } else if let Err(e) = self.back_file_truncate(zno, 0) {
+            bail!(zs.set_seq_err(format!("truncated zone {zno:?} file failed {e:?}")));
         }
         Ok(0)
     }
@@ -778,7 +773,7 @@ fn handle_report_zones(
         let mut zs = z.get_stat_mut();
 
         if zs.is_seq_err() {
-            tgt.__update_seq_zone(&z, &mut zs)?;
+            tgt.__update_seq_zone(z, &mut zs)?;
         }
 
         zone.capacity = z.capacity as u64;
@@ -833,7 +828,7 @@ fn handle_mgmt(
         UBLK_IO_OP_ZONE_OPEN => tgt.zone_open(iod.start_sector),
         UBLK_IO_OP_ZONE_CLOSE => tgt.zone_close(iod.start_sector),
         UBLK_IO_OP_ZONE_FINISH => tgt.zone_finish(iod.start_sector),
-        _ => return Err(anyhow::anyhow!("unknow mgmt op")),
+        _ => Err(anyhow::anyhow!("unknow mgmt op")),
     }
 }
 
@@ -1004,7 +999,7 @@ async fn handle_write(
         }
 
         if zs.is_seq_err() {
-            tgt.__update_seq_zone(&z, &mut zs)?;
+            tgt.__update_seq_zone(z, &mut zs)?;
         }
 
         if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
@@ -1053,7 +1048,7 @@ async fn handle_write(
 
     if res < 0 {
         let mut zs = z.get_stat_mut();
-        bail!(zs.set_seq_err(format!("append fail: {} {}", zno, res)));
+        bail!(zs.set_seq_err(format!("append fail: {zno} {res}")));
     }
 
     Ok((sector, res))
@@ -1176,17 +1171,15 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
         let zfj = path.join("superblock.json");
         if zfj.exists() {
             Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false))
+        } else if zf.exists() {
+            let c = TgtCfg::from_file(&zf, Some(zo))?;
+            c.save_file_json(&zfj)?;
+            std::fs::remove_file(zf)?;
+            Ok((c, false))
         } else {
-            if zf.exists() {
-                let c = TgtCfg::from_file(&zf, Some(zo))?;
-                c.save_file_json(&zfj)?;
-                std::fs::remove_file(zf)?;
-                Ok((c, false))
-            } else {
-                let c = TgtCfg::from_argument(zo)?;
-                c.save_file_json(&zfj)?;
-                Ok((c, true))
-            }
+            let c = TgtCfg::from_argument(zo)?;
+            c.save_file_json(&zfj)?;
+            Ok((c, true))
         }
     }
 }
@@ -1220,7 +1213,7 @@ pub(crate) fn ublk_add_zoned(
         return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
     }
 
-    if u64::from((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
+    if ((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
         return Err(anyhow::anyhow!("Too many conventioanl zones"));
     }
 

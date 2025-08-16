@@ -12,7 +12,6 @@ use rocksdb::{
     WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -110,7 +109,7 @@ fn handle_write(
     for i in 0..nr_blocks {
         let key = (start_sector + i as u64 * sectors_per_block).to_be_bytes();
         let block_buf = &buf[(i * lbs as usize)..((i + 1) * lbs as usize)];
-        batch.put(&key, block_buf);
+        batch.put(key, block_buf);
     }
     let mut write_options = WriteOptions::new();
     write_options.set_sync(false);
@@ -345,7 +344,7 @@ fn setup_database(
     db_opts.create_if_missing(true);
     db_opts.set_use_fsync(false);
     db_opts.set_use_direct_io_for_flush_and_compaction(true);
-    let compression_type = parse_compression_type(&compression)?;
+    let compression_type = parse_compression_type(compression)?;
     db_opts.set_compression_type(compression_type);
     db_opts.set_bottommost_compression_type(compression_type);
     db_opts.set_write_buffer_size(64 * 1024 * 1024);
@@ -380,7 +379,7 @@ pub(crate) fn ublk_add_compress(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     let (db_path, size, compression, lbs, pbs, args_opt) = parse_and_load_config(&ctrl, &opt)?;
-    let read_only = args_opt.as_ref().map_or(false, |o| o.gen_arg.read_only);
+    let read_only = args_opt.as_ref().is_some_and(|o| o.gen_arg.read_only);
     let db = setup_database(&db_path, &compression, lbs, read_only)?;
     let db_arc = Arc::new(db);
     let db_for_handler = db_arc.clone();
