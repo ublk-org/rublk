@@ -19,8 +19,8 @@ mod args;
 mod compress;
 mod r#loop;
 mod null;
-mod qcow2;
 mod offload;
+mod qcow2;
 mod zoned;
 
 #[derive(Parser)]
@@ -296,6 +296,12 @@ const FEATURES_TABLE: &[&str] = &[
     "CMD_IOCTL_ENCODE",
     "USER_COPY",
     "ZONED",
+    "USER_RECOVERY_FAIL_IO",
+    "UPDATE_SIZE",
+    "AUTO_BUF_REG",
+    "QUIESCE",
+    "PER_IO_DAEMON",
+    "BUF_REG_OFF_DAEMON",
 ];
 
 #[allow(clippy::needless_range_loop)]
