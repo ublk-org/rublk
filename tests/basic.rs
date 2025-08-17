@@ -29,6 +29,15 @@ mod integration {
         }
     }
 
+    fn has_blkdiscard() -> bool {
+        Command::new("blkdiscard")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
     fn support_zoned() -> bool {
         match UblkCtrl::get_features() {
             Some(f) => {
@@ -672,13 +681,7 @@ mod integration {
             return;
         }
 
-        let has_blkdiscard = Command::new("blkdiscard")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
-        if !has_blkdiscard {
+        if !has_blkdiscard() {
             return;
         }
 
@@ -754,13 +757,7 @@ mod integration {
             return;
         }
 
-        let has_blkdiscard = Command::new("blkdiscard")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
-        if !has_blkdiscard {
+        if !has_blkdiscard() {
             return;
         }
 
