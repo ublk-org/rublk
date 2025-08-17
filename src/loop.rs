@@ -1,3 +1,4 @@
+use anyhow::Context;
 use io_uring::{opcode, squeue, types};
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
@@ -50,7 +51,6 @@ impl LoopTgt {
     }
 }
 
-#[inline]
 fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
     let op = iod.op_flags & 0xff;
 
@@ -90,7 +90,6 @@ fn lo_make_discard_sqe(op: u32, flags: u32, off: u64, bytes: u32) -> io_uring::s
         .flags(squeue::Flags::FIXED_FILE)
 }
 
-#[inline]
 fn __lo_make_io_sqe_zc(
     iod: &libublk::sys::ublksrv_io_desc,
     buf_index: u16,
@@ -123,7 +122,6 @@ fn __lo_make_io_sqe_zc(
     }
 }
 
-#[inline]
 fn __lo_make_io_sqe(
     iod: &libublk::sys::ublksrv_io_desc,
     buf_addr: *mut u8,
@@ -147,7 +145,6 @@ fn __lo_make_io_sqe(
     }
 }
 
-#[inline]
 async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8, zc: bool) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
@@ -335,43 +332,38 @@ pub(crate) fn ublk_add_loop(
     opt: Option<LoopArgs>,
     comm_rc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
-    let (file, dio, ro, aa, no_discard) = match opt {
-        Some(ref o) => (
+    let (file, dio, ro, aa, no_discard) = if let Some(ref o) = opt {
+        (
             o.gen_arg.build_abs_path(o.file.clone()),
             !o.buffered_io,
             o.gen_arg.read_only,
             o.async_await,
             o.no_discard,
-        ),
-        None => {
-            let mut p: libublk::sys::ublk_params = Default::default();
-            ctrl.get_params(&mut p)?;
+        )
+    } else {
+        let mut p: libublk::sys::ublk_params = Default::default();
+        ctrl.get_params(&mut p)?;
 
-            match ctrl.get_target_data_from_json() {
-                Some(val) => {
-                    let lo = &val["loop"];
-                    let tgt_data: Result<LoJson, _> = serde_json::from_value(lo.clone());
+        let val = ctrl
+            .get_target_data_from_json()
+            .ok_or_else(|| anyhow::anyhow!("not get json data"))?;
+        let lo = &val["loop"];
+        let tgt_data: LoJson =
+            serde_json::from_value(lo.clone()).map_err(|e| anyhow::anyhow!(e))?;
 
-                    match tgt_data {
-                        Ok(t) => (
-                            PathBuf::from(t.back_file_path.as_str()),
-                            t.direct_io != 0,
-                            (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
-                            t.async_await,
-                            t.no_discard,
-                        ),
-                        Err(_) => return Err(anyhow::anyhow!("wrong json data")),
-                    }
-                }
-                None => return Err(anyhow::anyhow!("not get json data")),
-            }
-        }
+        (
+            PathBuf::from(tgt_data.back_file_path.as_str()),
+            tgt_data.direct_io != 0,
+            (p.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
+            tgt_data.async_await,
+            tgt_data.no_discard,
+        )
     };
 
     let file_path = format!("{}", file.as_path().display());
     let json = LoJson {
         back_file_path: file_path,
-        direct_io: i32::from(dio),
+        direct_io: dio.into(),
         async_await: aa,
         no_discard,
     };
@@ -381,7 +373,7 @@ pub(crate) fn ublk_add_loop(
             .read(true)
             .write(!ro)
             .open(&file)
-            .unwrap(),
+            .with_context(|| format!("failed to open backing file {:?}", file))?,
     );
 
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {

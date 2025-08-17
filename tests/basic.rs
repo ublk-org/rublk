@@ -29,6 +29,15 @@ mod integration {
         }
     }
 
+    fn has_blkdiscard() -> bool {
+        Command::new("blkdiscard")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
     fn support_zoned() -> bool {
         match UblkCtrl::get_features() {
             Some(f) => {
@@ -672,13 +681,7 @@ mod integration {
             return;
         }
 
-        let has_blkdiscard = Command::new("blkdiscard")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
-        if !has_blkdiscard {
+        if !has_blkdiscard() {
             return;
         }
 
@@ -746,5 +749,57 @@ mod integration {
                 .expect("cmp failed");
             assert!(cmp_status.success());
         });
+    }
+
+    #[test]
+    fn test_ublk_null_discard() {
+        if !support_ublk() {
+            return;
+        }
+
+        if !has_blkdiscard() {
+            return;
+        }
+
+        let ctrl = run_rublk_add_dev(["add", "null"].to_vec());
+        let dev_path = ctrl.get_bdev_path();
+
+        let res = Command::new("blkdiscard")
+            .args([&dev_path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("blkdiscard failed");
+        assert!(res.success());
+
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    #[test]
+    fn test_rublk_add_no_hang() {
+        if !support_ublk() {
+            return;
+        }
+
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        let rublk_path = tgt_dir.join("rublk");
+
+        let output = Command::new(rublk_path)
+            .args(["add", "null"])
+            .output()
+            .expect("Failed to execute rublk add null");
+
+        assert!(output.status.success());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
+        let id: i32 = id_regx
+            .captures(&stdout)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse().ok())
+            .expect("Failed to parse device ID");
+
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        run_rublk_del_dev(ctrl, false);
     }
 }

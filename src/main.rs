@@ -205,8 +205,8 @@ fn ublk_add(opt: args::AddCommands) -> anyhow::Result<i32> {
         ublk_add_worker(opt, &comm)
     } else {
         let daemonize = daemonize::Daemonize::new()
-            .stdout(daemonize::Stdio::keep())
-            .stderr(daemonize::Stdio::keep());
+            .stdout(daemonize::Stdio::devnull())
+            .stderr(daemonize::Stdio::devnull());
 
         match daemonize.execute() {
             daemonize::Outcome::Child(Ok(_)) => match ublk_add_worker(opt, &comm) {
@@ -263,8 +263,8 @@ fn ublk_recover_work(opt: args::UblkArgs) -> anyhow::Result<i32> {
 
 fn ublk_recover(opt: args::UblkArgs) -> anyhow::Result<i32> {
     let daemonize = daemonize::Daemonize::new()
-        .stdout(daemonize::Stdio::keep())
-        .stderr(daemonize::Stdio::keep());
+        .stdout(daemonize::Stdio::devnull())
+        .stderr(daemonize::Stdio::devnull());
 
     let id = opt.number;
     if id < 0 {

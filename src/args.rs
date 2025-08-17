@@ -64,8 +64,37 @@ pub(crate) struct GenAddArgs {
     #[clap(long, short = 'z', default_value_t = false)]
     pub zero_copy: bool,
 
+    /// Used to resolve relative paths for backing files.
+    /// `RefCell` is used to allow deferred initialization of this field
+    /// from an immutable `GenAddArgs` reference, which is necessary
+    /// because the current directory is saved after argument parsing.
     #[clap(skip)]
     start_dir: RefCell<Option<PathBuf>>,
+}
+
+/// Rounds `x` up to the nearest multiple of `y`.
+/// `y` must be a power of two.
+pub fn round_up<T>(x: T, y: T) -> T
+where
+    T: Copy + Into<u64> + std::convert::TryFrom<u64>, // support u32, u64 and try conversion back
+{
+    let x: u64 = x.into();
+    let y: u64 = y.into();
+    assert!(y.is_power_of_two(), "y isn\'t power_of_2");
+    let result = (x + y - 1) & !(y - 1);
+
+    T::try_from(result).unwrap_or_else(|_| {
+        panic!("Overflow occurred during conversion from u64 to the original type");
+    })
+}
+
+/// Checks if `input` is a multiple of `base`, and that the result of
+/// `input / base` is a power of two.
+/// `base` must be a power of two.
+pub fn is_power2_of(input: u64, base: u64) -> bool {
+    assert!(base.is_power_of_two());
+
+    input % base == 0 && (input / base).is_power_of_two()
 }
 
 impl GenAddArgs {
@@ -85,33 +114,7 @@ impl GenAddArgs {
             dev.tgt.params.basic.attrs &= !libublk::sys::UBLK_ATTR_READ_ONLY;
         }
     }
-}
 
-use std::convert::TryFrom;
-
-pub fn round_up<T>(x: T, y: T) -> T
-where
-    T: Copy + Into<u64> + TryFrom<u64>, // support u32, u64 and try conversion back
-{
-    let x: u64 = x.into();
-    let y: u64 = y.into();
-    assert!(y & (y - 1) == 0, "y isn't power_of_2");
-    let result = (x + y - 1) & !(y - 1);
-
-    T::try_from(result).unwrap_or_else(|_| {
-        panic!("Overflow occurred during conversion from u64 to the original type");
-    })
-}
-
-pub fn is_power2_of(input: u64, base: u64) -> bool {
-    assert!((base & (base - 1)) == 0);
-
-    let quotient = input / base;
-    quotient > 0 && (quotient & (quotient - 1)) == 0
-}
-
-impl GenAddArgs {
-    /// Return shared memory os id
     pub fn get_start_dir(&self) -> Option<PathBuf> {
         let dir = self.start_dir.borrow();
 
@@ -142,11 +145,10 @@ impl GenAddArgs {
         name: &'static str,
         dev_flags: UblkFlags,
     ) -> anyhow::Result<UblkCtrl> {
-        let mut ctrl_flags = if self.user_recovery {
-            libublk::sys::UBLK_F_USER_RECOVERY
-        } else {
-            0
-        };
+        let mut ctrl_flags = 0;
+        if self.user_recovery {
+            ctrl_flags |= libublk::sys::UBLK_F_USER_RECOVERY;
+        }
 
         if name == "zoned" {
             ctrl_flags |= libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_ZONED;
@@ -174,7 +176,7 @@ impl GenAddArgs {
         }
 
         match self.logical_block_size {
-            None | Some(512) | Some(1024) | Some(2048) | Some(4096) => {}
+            None | Some(512) | Some(1024) | Some(2048) | Some(4096) => {} // No-op
             _ => {
                 anyhow::bail!("invalid logical block size");
             }
@@ -199,15 +201,14 @@ impl GenAddArgs {
 
         Ok(libublk::ctrl::UblkCtrlBuilder::default()
             .name(name)
-            .depth(self.depth.try_into().unwrap())
-            .nr_queues(self.queue.try_into().unwrap())
+            .depth(self.depth.try_into()?)
+            .nr_queues(self.queue.try_into()?)
             .id(self.number)
             .ctrl_flags(ctrl_flags.into())
             .ctrl_target_flags(gen_flags)
             .dev_flags(dev_flags)
             .io_buf_bytes(buf_size as u32)
-            .build()
-            .unwrap())
+            .build()?)
     }
 }
 
