@@ -774,4 +774,32 @@ mod integration {
 
         run_rublk_del_dev(ctrl, false);
     }
+
+    #[test]
+    fn test_rublk_add_no_hang() {
+        if !support_ublk() {
+            return;
+        }
+
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        let rublk_path = tgt_dir.join("rublk");
+
+        let output = Command::new(rublk_path)
+            .args(["add", "null"])
+            .output()
+            .expect("Failed to execute rublk add null");
+
+        assert!(output.status.success());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
+        let id: i32 = id_regx
+            .captures(&stdout)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse().ok())
+            .expect("Failed to parse device ID");
+
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        run_rublk_del_dev(ctrl, false);
+    }
 }
