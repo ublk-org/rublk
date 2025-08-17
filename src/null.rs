@@ -21,8 +21,14 @@ pub(crate) struct NullAddArgs {
 #[inline]
 fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
     let iod = q.get_iod(tag);
+    let op = iod.op_flags & 0xff;
 
-    (iod.nr_sectors << 9) as i32
+    match op {
+        libublk::sys::UBLK_IO_OP_READ | libublk::sys::UBLK_IO_OP_WRITE => {
+            (iod.nr_sectors << 9) as i32
+        }
+        _ => 0,
+    }
 }
 
 #[inline]
@@ -104,6 +110,13 @@ pub(crate) fn ublk_add_null(
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
+        let p = &mut dev.tgt.params;
+
+        p.types |= libublk::sys::UBLK_PARAM_TYPE_DISCARD;
+        p.discard.max_discard_sectors = 2 << 30 >> 9;
+        p.discard.discard_granularity = 1 << p.basic.physical_bs_shift;
+        p.discard.max_discard_segments = 1;
+
         if let Some(ref o) = opt {
             o.gen_arg.apply_block_size(dev);
             o.gen_arg.apply_read_only(dev);
@@ -111,12 +124,10 @@ pub(crate) fn ublk_add_null(
         Ok(())
     };
 
-    let aa = {
-        if let Some(ref o) = opt {
-            o.async_await
-        } else {
-            false
-        }
+    let aa = if let Some(ref o) = opt {
+        o.async_await
+    } else {
+        false
     };
 
     let q_handler = move |qid, dev: &_| {

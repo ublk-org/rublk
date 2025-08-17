@@ -747,4 +747,34 @@ mod integration {
             assert!(cmp_status.success());
         });
     }
+
+    #[test]
+    fn test_ublk_null_discard() {
+        if !support_ublk() {
+            return;
+        }
+
+        let has_blkdiscard = Command::new("blkdiscard")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if !has_blkdiscard {
+            return;
+        }
+
+        let ctrl = run_rublk_add_dev(["add", "null"].to_vec());
+        let dev_path = ctrl.get_bdev_path();
+
+        let res = Command::new("blkdiscard")
+            .args([&dev_path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("blkdiscard failed");
+        assert!(res.success());
+
+        run_rublk_del_dev(ctrl, false);
+    }
 }
