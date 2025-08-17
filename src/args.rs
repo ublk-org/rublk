@@ -64,6 +64,10 @@ pub(crate) struct GenAddArgs {
     #[clap(long, short = 'z', default_value_t = false)]
     pub zero_copy: bool,
 
+    /// Use multi-cpus affinity instead of single CPU affinity (default is single CPU)
+    #[clap(long, default_value_t = false)]
+    pub multi_cpus_affinity: bool,
+
     /// Used to resolve relative paths for backing files.
     /// `RefCell` is used to allow deferred initialization of this field
     /// from an immutable `GenAddArgs` reference, which is necessary
@@ -199,6 +203,13 @@ impl GenAddArgs {
             anyhow::bail!("invalid io buf size {}", buf_size);
         }
 
+        // Apply single CPU affinity by default unless multi_cpus_affinity is enabled
+        let final_dev_flags = if self.multi_cpus_affinity {
+            dev_flags
+        } else {
+            dev_flags | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY
+        };
+
         Ok(libublk::ctrl::UblkCtrlBuilder::default()
             .name(name)
             .depth(self.depth.try_into()?)
@@ -206,7 +217,7 @@ impl GenAddArgs {
             .id(self.number)
             .ctrl_flags(ctrl_flags.into())
             .ctrl_target_flags(gen_flags)
-            .dev_flags(dev_flags)
+            .dev_flags(final_dev_flags)
             .io_buf_bytes(buf_size as u32)
             .build()?)
     }
