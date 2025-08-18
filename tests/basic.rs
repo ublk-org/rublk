@@ -497,6 +497,9 @@ mod integration {
         __test_ublk_add_del_loop(4096, true, false, true, |ctrl, _bs, _file_size, _path| {
             ext4_format_and_mount(ctrl);
         });
+        __test_ublk_add_del_loop(4096, false, false, true, |ctrl, _bs, _file_size, _path| {
+            ext4_format_and_mount(ctrl);
+        });
     }
 
     #[test]
