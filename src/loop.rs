@@ -225,6 +225,32 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     Ok(())
 }
 
+fn lo_handle_io_cmd_sync_zc(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, auto_buf_reg: &libublk::sys::ublk_auto_buf_reg) {
+    let iod = q.get_iod(tag);
+    let op = iod.op_flags & 0xff;
+    let data = UblkIOCtx::build_user_data(tag, op, 0, true);
+    if i.is_tgt_io() {
+        let user_data = i.user_data();
+        let res = i.result();
+        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+
+        assert!(cqe_tag == tag as u32);
+
+        if res != -(libc::EAGAIN) {
+            q.complete_io_cmd_with_auto_buf_reg(tag, auto_buf_reg, Ok(UblkIORes::Result(res)));
+            return;
+        }
+    }
+
+    let res = __lo_prep_submit_io_cmd(iod);
+    if res < 0 {
+        q.complete_io_cmd_with_auto_buf_reg(tag, auto_buf_reg, Ok(UblkIORes::Result(res)));
+    } else {
+        let sqe = __lo_make_io_sqe_zc(iod, tag).user_data(data);
+        q.ublk_submit_sqe_sync(sqe).unwrap();
+    }
+}
+
 fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
@@ -249,6 +275,28 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
         let sqe = __lo_make_io_sqe(iod, buf_addr).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
     }
+}
+
+fn q_zc_fn(qid: u16, dev: &UblkDev) {
+    let auto_buf_reg_list_rc = Rc::new(
+        (0..dev.dev_info.queue_depth)
+            .map(|tag| libublk::sys::ublk_auto_buf_reg {
+                index: tag,
+                flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let auto_buf_reg_list = auto_buf_reg_list_rc.clone();
+    let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+        lo_handle_io_cmd_sync_zc(q, tag, io, &auto_buf_reg_list[tag as usize]);
+    };
+
+    UblkQueue::new(qid, dev)
+        .unwrap()
+        .submit_fetch_commands_with_auto_buf_reg(&auto_buf_reg_list_rc)
+        .wait_and_handle_io(lo_io_handler);
 }
 
 fn q_fn(qid: u16, dev: &UblkDev) {
@@ -379,16 +427,16 @@ pub(crate) fn ublk_add_loop(
         return Err(anyhow::anyhow!("loop doesn't support user copy"));
     }
 
-    if ((ctrl.dev_info().flags & (libublk::sys::UBLK_F_AUTO_BUF_REG as u64)) != 0) && !aa {
-        return Err(anyhow::anyhow!("loop zero copy requires --async-wait"));
-    }
 
+    let flags = ctrl.dev_info().flags;
     let comm = comm_rc.clone();
     ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
         move |qid, dev: &_| {
             if lo.json.async_await {
                 q_a_fn(qid, dev)
+            } else if (flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+                q_zc_fn(qid, dev)
             } else {
                 q_fn(qid, dev)
             }

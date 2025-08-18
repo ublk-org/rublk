@@ -313,6 +313,14 @@ fn ublk_qcow2_start<'a, T: Qcow2IoOps + 'a>(
     let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
     ublk_run_io_task(exe, &task, q, 1)?;
 
+    //setup single cpu affinity
+    if dev_clone
+        .flags
+        .intersects(libublk::UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+    {
+        ctrl_clone.set_queue_single_affinity(0, None)?;
+    }
+
     // Start device in one dedicated io task
     let task = exe.spawn(async move {
         let r = ctrl_clone.configure_queue(&dev_clone, 0, unsafe { libc::gettid() });
