@@ -99,8 +99,7 @@ fn __lo_make_io_sqe_zc(
     let bytes = iod.nr_sectors << 9;
 
     match op {
-        libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
-            .offset(off)
+        libublk::sys::UBLK_IO_OP_FLUSH => opcode::Fsync::new(types::Fixed(1))
             .build()
             .flags(squeue::Flags::FIXED_FILE),
         libublk::sys::UBLK_IO_OP_READ => {
