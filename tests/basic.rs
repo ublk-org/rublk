@@ -376,7 +376,7 @@ mod integration {
         __test_ublk_add_del_zoned(4096, 1, None, false, tf);
     }
 
-    fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, recover: bool, f: F)
+    fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, recover: bool, zc: bool, f: F)
     where
         F: Fn(&UblkCtrl, u32, usize, &str),
     {
@@ -398,6 +398,9 @@ mod integration {
         if recover {
             cmd_line.push("-r");
         }
+        if zc {
+            cmd_line.push("--zero-copy");
+        }
 
         let ctrl = run_rublk_add_dev(cmd_line);
         f(&ctrl, bs, file_size.try_into().unwrap(), pstr);
@@ -414,8 +417,8 @@ mod integration {
             check_block_size(ctrl, bs);
         };
 
-        __test_ublk_add_del_loop(4096, false, false, tf);
-        __test_ublk_add_del_loop(4096, true, false, tf);
+        __test_ublk_add_del_loop(4096, false, false, false, tf);
+        __test_ublk_add_del_loop(4096, true, false, false, tf);
     }
 
     fn __test_ublk_null_read_only(cmds: &[&str], exp_ro: bool) {
@@ -481,7 +484,17 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_loop(4096, true, false, |ctrl, _bs, _file_size, _path| {
+        __test_ublk_add_del_loop(4096, true, false, false, |ctrl, _bs, _file_size, _path| {
+            ext4_format_and_mount(ctrl);
+        });
+    }
+
+    #[test]
+    fn test_ublk_format_mount_loop_zero_copy() {
+        if !support_ublk() {
+            return;
+        }
+        __test_ublk_add_del_loop(4096, true, false, true, |ctrl, _bs, _file_size, _path| {
             ext4_format_and_mount(ctrl);
         });
     }
@@ -552,7 +565,7 @@ mod integration {
         if !support_ublk() {
             return;
         }
-        __test_ublk_add_del_loop(4096, true, true, |ctrl, _bs, _file_size, _path| {
+        __test_ublk_add_del_loop(4096, true, true, false, |ctrl, _bs, _file_size, _path| {
             run_ublk_recover(ctrl);
         });
     }
@@ -685,7 +698,7 @@ mod integration {
             return;
         }
 
-        __test_ublk_add_del_loop(4096, false, false, |ctrl, _, _, file_path| {
+        __test_ublk_add_del_loop(4096, false, false, false, |ctrl, _, _, file_path| {
             let dev_path = ctrl.get_bdev_path();
 
             // 1. write dev with random data
