@@ -123,11 +123,12 @@ fn __lo_make_io_sqe_zc(
 
 fn __lo_make_io_sqe(
     iod: &libublk::sys::ublksrv_io_desc,
-    buf_addr: *mut u8,
+    buf: Option<&[u8]>,
 ) -> io_uring::squeue::Entry {
     let op = iod.op_flags & 0xff;
     let off = iod.start_sector << 9;
     let bytes = iod.nr_sectors << 9;
+    let buf_addr = buf.map_or(std::ptr::null(), |b| b.as_ptr()) as *mut u8;
 
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => opcode::Fsync::new(types::Fixed(1)).build(),
@@ -144,7 +145,7 @@ fn __lo_make_io_sqe(
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8, zc: bool) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf: Option<&[u8]>, zc: bool) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
@@ -155,7 +156,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8, 
         let sqe = if zc {
             __lo_make_io_sqe_zc(iod, tag)
         } else {
-            __lo_make_io_sqe(iod, buf_addr)
+            __lo_make_io_sqe(iod, buf)
         };
         let res = q.ublk_submit_sqe(sqe).await;
         if res != -(libc::EAGAIN) {
@@ -225,7 +226,12 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     Ok(())
 }
 
-fn lo_handle_io_cmd_sync_zc(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, auto_buf_reg: &libublk::sys::ublk_auto_buf_reg) {
+fn lo_handle_io_cmd_sync_zc(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    i: &UblkIOCtx,
+    auto_buf_reg: &libublk::sys::ublk_auto_buf_reg,
+) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag, op, 0, true);
@@ -251,10 +257,11 @@ fn lo_handle_io_cmd_sync_zc(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, auto_buf
     }
 }
 
-fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
+fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf: Option<&[u8]>) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag, op, 0, true);
+    let buf_addr = buf.map_or(std::ptr::null(), |b| b.as_ptr()) as *mut u8;
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
@@ -272,7 +279,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
     if res < 0 {
         q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
     } else {
-        let sqe = __lo_make_io_sqe(iod, buf_addr).user_data(data);
+        let sqe = __lo_make_io_sqe(iod, buf).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
     }
 }
@@ -304,8 +311,8 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     let bufs = bufs_rc.clone();
     let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
         let bufs = bufs_rc.clone();
-
-        lo_handle_io_cmd_sync(q, tag, io, bufs[tag as usize].as_mut_ptr());
+        let buf_slice = &*bufs[tag as usize];
+        lo_handle_io_cmd_sync(q, tag, io, Some(buf_slice));
     };
 
     UblkQueue::new(qid, dev)
@@ -332,7 +339,7 @@ async fn handle_queue_tag_async_zc(q: Rc<UblkQueue<'_>>, tag: u16) {
             break;
         }
 
-        res = lo_handle_io_cmd_async(&q, tag, std::ptr::null_mut(), true).await;
+        res = lo_handle_io_cmd_async(&q, tag, None, true).await;
         cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
 }
@@ -350,7 +357,8 @@ async fn handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16) {
             break;
         }
 
-        res = lo_handle_io_cmd_async(&q, tag, buf_addr, false).await;
+        let buf_slice = &*buf;
+        res = lo_handle_io_cmd_async(&q, tag, Some(buf_slice), false).await;
         cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
 }
@@ -426,7 +434,6 @@ pub(crate) fn ublk_add_loop(
     if (ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_COPY as u64)) != 0 {
         return Err(anyhow::anyhow!("loop doesn't support user copy"));
     }
-
 
     let flags = ctrl.dev_info().flags;
     let comm = comm_rc.clone();
