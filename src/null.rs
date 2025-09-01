@@ -32,8 +32,9 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 }
 
 #[inline]
-fn handle_io_cmd(q: &UblkQueue, tag: u16, buf_addr: *mut u8) {
+fn handle_io_cmd(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) {
     let bytes = get_io_cmd_result(q, tag);
+    let buf_addr = buf.map_or(std::ptr::null_mut(), |b| b.as_ptr() as *mut u8);
 
     q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
 }
@@ -71,12 +72,12 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
 
     // logic for io handling
     let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-        let buf_addr = if user_copy {
-            std::ptr::null_mut()
+        let buf = if user_copy {
+            None
         } else {
-            bufs[tag as usize].as_mut_ptr()
+            Some(&*bufs[tag as usize])
         };
-        handle_io_cmd(q, tag, buf_addr);
+        handle_io_cmd(q, tag, buf);
     };
 
     UblkQueue::new(qid, dev)
