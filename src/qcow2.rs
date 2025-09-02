@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use io_uring::{opcode, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkQueue};
+use libublk::io::{BufDesc, UblkDev, UblkQueue};
 use libublk::uring_async::{ublk_run_ctrl_task, ublk_run_io_task, ublk_wake_task};
 use libublk::UblkError;
 use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams};
@@ -275,25 +275,23 @@ fn qcow2_init_tgt<T: Qcow2IoOps>(
     Ok(())
 }
 
-async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, tag: u16) {
+async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
     let qdev_q = &tgt.qdev;
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-    let buf_addr = buf.as_mut_ptr();
-    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
+    let _buf_addr = buf.as_mut_ptr();
     let mut res = 0;
 
     log::debug!("qcow2: io task {} stated", tag);
-    q.register_io_buf(tag, &buf);
-    loop {
-        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
-        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
 
+    // Submit initial prep command
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
+
+    loop {
         res = qcow2_handle_io_cmd_async(q, qdev_q, tag, &mut buf).await;
-        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+
+        // Submit commit command and get result
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
     }
-    q.unregister_io_buf(tag);
 }
 
 /// Start device in async IO task, in which both control and io rings
@@ -459,7 +457,10 @@ pub(crate) fn ublk_add_qcow2(
         f_vec.push(exe.spawn(async move {
             let t = &tgt;
             let qp = &q;
-            ublk_qcow2_io_fn(t, qp, tag).await;
+            match ublk_qcow2_io_fn(t, qp, tag).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) => log::error!("ublk_qcow2_io_fn failed for tag {}: {}", tag, e),
+            }
         }));
     }
 

@@ -1,5 +1,5 @@
 use libublk::{
-    io::{UblkIOCtx, UblkQueue},
+    io::{BufDesc, UblkIOCtx, UblkQueue},
     UblkIORes,
 };
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -30,16 +30,13 @@ pub(crate) struct OffloadHandler {
 }
 
 impl OffloadHandler {
-    pub(crate) fn new<F>(
-        worker_fn: F,
-    ) -> Self
+    pub(crate) fn new<F>(worker_fn: F) -> Self
     where
         F: Fn(OffloadJob) -> Completion + Send + 'static,
     {
         let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
         let (job_tx, completion_rx) = setup_worker_thread(efd, worker_fn);
 
-        
         Self {
             efd,
             job_tx,
@@ -60,17 +57,28 @@ impl OffloadHandler {
         nix::unistd::read(self.efd, &mut buf).unwrap();
 
         while let Ok(completion) = self.completion_rx.try_recv() {
+            let tag = completion.tag;
             let result = match completion.result {
                 Ok(r) => UblkIORes::Result(r),
                 Err(e) => UblkIORes::Result(e),
             };
-            let tag = completion.tag;
-            q.complete_io_cmd(tag, completion.buf_addr as *mut u8, Ok(result));
+            q.complete_io_cmd_unified(
+                tag,
+                BufDesc::RawAddress(completion.buf_addr as *const u8),
+                Ok(result),
+            )
+            .unwrap();
         }
         self.submit_poll_sqe(q, handler_idx);
     }
 
-    pub(crate) fn send_job(&self, op: u16, tag: u16, iod: &libublk::sys::ublksrv_io_desc, buf: &mut [u8]) {
+    pub(crate) fn send_job(
+        &self,
+        op: u16,
+        tag: u16,
+        iod: &libublk::sys::ublksrv_io_desc,
+        buf: &mut [u8],
+    ) {
         self.job_tx
             .send(OffloadJob {
                 op,
@@ -131,10 +139,7 @@ pub(crate) struct QueueHandler<'a, T: super::OffloadTargetLogic<'a> + ?Sized> {
 }
 
 impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
-    pub(crate) fn new(
-        q: &'a UblkQueue<'a>,
-        target_logic: &'a T,
-    ) -> Self {
+    pub(crate) fn new(q: &'a UblkQueue<'a>, target_logic: &'a T) -> Self {
         let mut handlers = Vec::with_capacity(NR_OFFLOAD_HANDLERS);
         for _ in 0..NR_OFFLOAD_HANDLERS {
             handlers.push(None);

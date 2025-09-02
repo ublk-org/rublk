@@ -13,7 +13,7 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_RESET, UBLK_IO_OP_ZONE_RESET_ALL,
 };
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
+use libublk::{ctrl::UblkCtrl, io::BufDesc, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError};
 
 use anyhow::bail;
 use bitflags::bitflags;
@@ -1054,6 +1054,40 @@ async fn handle_write(
     Ok((sector, res))
 }
 
+async fn handle_queue_tag_async_zoned(q: Rc<UblkQueue<'_>>, ztgt_io: Rc<&Arc<ZonedTgt>>, tag: u16) -> Result<(), UblkError> {
+    let mut lba = 0_u64;
+    let mut res = 0;
+
+    // Submit initial prep command
+    q.submit_io_prep_cmd(tag, BufDesc::ZonedAppendLba(lba), res, None).await?;
+
+    loop {
+        match zoned_handle_io(&ztgt_io, &q, tag).await {
+            Ok((r, l)) => {
+                res = r;
+                lba = l;
+            }
+            Err(e) => {
+                lba = 0;
+                if let Ok(ze) = e.downcast::<ZIOError>() {
+                    match ze {
+                        ZIOError::MaxOpenOverflow(_) => res = -libc::ETOOMANYREFS,
+                        ZIOError::MaxActiveOverflow(_) => res = -libc::EOVERFLOW,
+                        ZIOError::UpdateSeq(_) => res = -libc::EIO,
+                    };
+                } else {
+                    eprintln!("handle io failure");
+                    break;
+                }
+            }
+        }
+
+        // Submit commit command and get result
+        q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res).await?;
+    }
+    Ok(())
+}
+
 async fn zoned_handle_io(
     tgt: &ZonedTgt,
     q: &UblkQueue<'_>,
@@ -1270,36 +1304,9 @@ pub(crate) fn ublk_add_zoned(
             let ztgt_io = ztgt_q.clone();
 
             f_vec.push(exe.spawn(async move {
-                let mut lba = 0_u64;
-                let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
-                let mut res = 0;
-
-                loop {
-                    let cmd_res = q.submit_io_cmd(tag, cmd_op, lba as *mut u8, res).await;
-                    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                        break;
-                    }
-
-                    match zoned_handle_io(&ztgt_io, &q, tag).await {
-                        Ok((r, l)) => {
-                            res = r;
-                            lba = l;
-                        }
-                        Err(e) => {
-                            lba = 0;
-                            if let Ok(ze) = e.downcast::<ZIOError>() {
-                                match ze {
-                                    ZIOError::MaxOpenOverflow(_) => res = -libc::ETOOMANYREFS,
-                                    ZIOError::MaxActiveOverflow(_) => res = -libc::EOVERFLOW,
-                                    ZIOError::UpdateSeq(_) => res = -libc::EIO,
-                                };
-                            } else {
-                                eprintln!("handle io failre");
-                                break;
-                            }
-                        }
-                    }
-                    cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                match handle_queue_tag_async_zoned(q, ztgt_io, tag).await {
+                    Err(UblkError::QueueIsDown) | Ok(_) => {}
+                    Err(e) => log::error!("handle_queue_tag_async_zoned failed for tag {}: {}", tag, e),
                 }
             }));
         }
