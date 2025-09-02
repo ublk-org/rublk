@@ -1,6 +1,6 @@
 use anyhow::Context;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError, UblkIORes};
 use log::trace;
@@ -243,14 +243,24 @@ fn lo_handle_io_cmd_sync_zc(
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd_with_auto_buf_reg(tag, auto_buf_reg, Ok(UblkIORes::Result(res)));
+            q.complete_io_cmd_unified(
+                tag,
+                BufDesc::AutoReg(*auto_buf_reg),
+                Ok(UblkIORes::Result(res)),
+            )
+            .unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd_with_auto_buf_reg(tag, auto_buf_reg, Ok(UblkIORes::Result(res)));
+        q.complete_io_cmd_unified(
+            tag,
+            BufDesc::AutoReg(*auto_buf_reg),
+            Ok(UblkIORes::Result(res)),
+        )
+        .unwrap();
     } else {
         let sqe = __lo_make_io_sqe_zc(iod, tag).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
@@ -261,7 +271,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf: Option
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag, op, 0, true);
-    let buf_addr = buf.map_or(std::ptr::null(), |b| b.as_ptr()) as *mut u8;
+    let _buf_addr = buf.map_or(std::ptr::null(), |b| b.as_ptr()) as *mut u8;
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
@@ -270,14 +280,24 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf: Option
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
+            let buf_desc = match buf {
+                Some(slice) => BufDesc::Slice(slice),
+                None => BufDesc::Slice(&[]),
+            };
+            q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(res)))
+                .unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
+        let buf_desc = match buf {
+            Some(slice) => BufDesc::Slice(slice),
+            None => BufDesc::Slice(&[]),
+        };
+        q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(res)))
+            .unwrap();
     } else {
         let sqe = __lo_make_io_sqe(iod, buf).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
@@ -302,7 +322,8 @@ fn q_zc_fn(qid: u16, dev: &UblkDev) {
 
     UblkQueue::new(qid, dev)
         .unwrap()
-        .submit_fetch_commands_with_auto_buf_reg(&auto_buf_reg_list_rc)
+        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc))
+        .unwrap()
         .wait_and_handle_io(lo_io_handler);
 }
 
@@ -318,7 +339,8 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands(Some(&bufs))
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
+        .unwrap()
         .wait_and_handle_io(lo_io_handler);
 }
 
@@ -333,7 +355,8 @@ async fn handle_queue_tag_async_zc(q: Rc<UblkQueue<'_>>, tag: u16) {
 
     loop {
         let cmd_res = q
-            .submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &auto_buf_reg, res)
+            .submit_io_cmd_unified(tag, cmd_op, BufDesc::AutoReg(auto_buf_reg), res)
+            .unwrap()
             .await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
@@ -346,13 +369,16 @@ async fn handle_queue_tag_async_zc(q: Rc<UblkQueue<'_>>, tag: u16) {
 
 async fn handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16) {
     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-    let buf_addr = buf.as_mut_ptr();
+    let _buf_addr = buf.as_mut_ptr();
     let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
     q.register_io_buf(tag, &buf);
     loop {
-        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+        let cmd_res = q
+            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
+            .unwrap()
+            .await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }

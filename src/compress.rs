@@ -4,7 +4,7 @@ use crate::offload::{
 };
 use libublk::{
     ctrl::UblkCtrl,
-    io::{UblkDev, UblkIOCtx, UblkQueue},
+    io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue},
     UblkIORes,
 };
 use rocksdb::{
@@ -226,7 +226,7 @@ impl<'a> OffloadTargetLogic<'a> for CompressTarget {
             Ok(r) => UblkIORes::Result(r),
             Err(e) => UblkIORes::Result(e),
         };
-        q.complete_io_cmd(tag, buf.as_mut_ptr(), Ok(result));
+        q.complete_io_cmd_unified(tag, BufDesc::Slice(buf), Ok(result)).unwrap();
         Ok(0)
     }
 }
@@ -236,7 +236,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
     let q = UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands(Some(&bufs));
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap();
 
     let target = CompressTarget {
         db: db.clone(),

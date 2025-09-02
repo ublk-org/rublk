@@ -13,7 +13,7 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_RESET, UBLK_IO_OP_ZONE_RESET_ALL,
 };
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
+use libublk::{ctrl::UblkCtrl, io::BufDesc, io::UblkDev, io::UblkIOCtx, io::UblkQueue};
 
 use anyhow::bail;
 use bitflags::bitflags;
@@ -1275,7 +1275,10 @@ pub(crate) fn ublk_add_zoned(
                 let mut res = 0;
 
                 loop {
-                    let cmd_res = q.submit_io_cmd(tag, cmd_op, lba as *mut u8, res).await;
+                    let cmd_res = q
+                        .submit_io_cmd_unified(tag, cmd_op, BufDesc::ZonedAppendLba(lba), res)
+                        .unwrap()
+                        .await;
                     if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                         break;
                     }

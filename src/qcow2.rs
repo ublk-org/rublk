@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use io_uring::{opcode, types};
 use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkQueue};
+use libublk::io::{BufDesc, UblkDev, UblkQueue};
 use libublk::uring_async::{ublk_run_ctrl_task, ublk_run_io_task, ublk_wake_task};
 use libublk::UblkError;
 use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams};
@@ -278,14 +278,14 @@ fn qcow2_init_tgt<T: Qcow2IoOps>(
 async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, tag: u16) {
     let qdev_q = &tgt.qdev;
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-    let buf_addr = buf.as_mut_ptr();
+    let _buf_addr = buf.as_mut_ptr();
     let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
     log::debug!("qcow2: io task {} stated", tag);
     q.register_io_buf(tag, &buf);
     loop {
-        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+        let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }
