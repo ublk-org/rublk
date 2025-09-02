@@ -881,9 +881,8 @@ dependencies = [
 
 [[package]]
 name = "libublk"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "195076bfaf06fb58340ea959d4d3961d79840bb602b079e9a7e88246a9e99165"
+version = "0.4.3"
+source = "git+https://github.com/ublk-org/libublk-rs.git?branch=main"
 dependencies = [
  "anyhow",
  "bindgen 0.69.5",
