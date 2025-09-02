@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "rublk"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "async-trait",
