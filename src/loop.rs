@@ -145,13 +145,14 @@ fn __lo_make_io_sqe(
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf: Option<&[u8]>, zc: bool) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf: Option<&[u8]>) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
         return res;
     }
 
+    let zc = buf.is_none();
     for _ in 0..4 {
         let sqe = if zc {
             __lo_make_io_sqe_zc(iod, tag)
@@ -343,39 +344,38 @@ fn q_fn(qid: u16, dev: &UblkDev) {
         .wait_and_handle_io(lo_io_handler);
 }
 
-async fn handle_queue_tag_async_zc(q: Rc<UblkQueue<'_>>, tag: u16) -> Result<(), UblkError> {
+#[inline]
+async fn __handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16, buf: Option<&IoBuf<u8>>) -> Result<(), UblkError>{
     let mut res = 0;
     let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
         index: tag,
         flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
         ..Default::default()
     };
+    let (buf_desc, buf_ref) = match buf {
+        Some(io_buf) =>
+            (BufDesc::Slice(io_buf.as_slice()), Some(io_buf.as_slice())),
+        _ => (BufDesc::AutoReg(auto_buf_reg), None),
+    };
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res, None::<&IoBuf<u8>>).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, buf).await?;
 
     loop {
-        res = lo_handle_io_cmd_async(&q, tag, None, true).await;
+        res = lo_handle_io_cmd_async(&q, tag, buf_ref).await;
 
         // Submit commit command and get result
-        q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res).await?;
+        q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
     }
 }
 
 async fn handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16) -> Result<(), UblkError> {
-    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-    let _buf_addr = buf.as_mut_ptr();
-    let mut res = 0;
-
-    // Submit initial prep command
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
-
-    loop {
-        let buf_slice = &*buf;
-        res = lo_handle_io_cmd_async(&q, tag, Some(buf_slice), false).await;
-
-        // Submit commit command and get result
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+    if q.support_auto_buf_zc() {
+        __handle_queue_tag_async(q, tag, None).await
+    } else {
+        let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+ 
+        __handle_queue_tag_async(q, tag, Some(&buf)).await
     }
 }
 
@@ -388,21 +388,12 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
     for tag in 0..depth {
         let q = q_rc.clone();
 
-        if q.support_auto_buf_zc() {
-            f_vec.push(exe.spawn(async move {
-                match handle_queue_tag_async_zc(q, tag).await {
-                    Err(UblkError::QueueIsDown) | Ok(_) => {}
-                    Err(e) => log::error!("handle_queue_tag_async_zc failed for tag {}: {}", tag, e),
-                }
-            }));
-        } else {
-            f_vec.push(exe.spawn(async move {
+        f_vec.push(exe.spawn(async move {
                 match handle_queue_tag_async(q, tag).await {
                     Err(UblkError::QueueIsDown) | Ok(_) => {}
                     Err(e) => log::error!("handle_queue_tag_async failed for tag {}: {}", tag, e),
                 }
             }));
-        }
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
     smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
