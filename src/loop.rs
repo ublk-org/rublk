@@ -145,13 +145,14 @@ fn __lo_make_io_sqe(
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf: Option<&[u8]>, zc: bool) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf: Option<&[u8]>) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
         return res;
     }
 
+    let zc = buf.is_none();
     for _ in 0..4 {
         let sqe = if zc {
             __lo_make_io_sqe_zc(iod, tag)
@@ -344,7 +345,8 @@ fn q_fn(qid: u16, dev: &UblkDev) {
         .wait_and_handle_io(lo_io_handler);
 }
 
-async fn handle_queue_tag_async_zc(q: Rc<UblkQueue<'_>>, tag: u16) {
+#[inline]
+async fn __handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16, buf: Option<&IoBuf<u8>>) {
     let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
     let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
@@ -352,41 +354,36 @@ async fn handle_queue_tag_async_zc(q: Rc<UblkQueue<'_>>, tag: u16) {
         flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
         ..Default::default()
     };
+    let (buf_desc, buf_ref) = match buf {
+        Some(io_buf) => {
+            q.register_io_buf(tag, &io_buf);
+            (BufDesc::Slice(io_buf.as_slice()), Some(io_buf.as_slice()))
+        }
+        _ => (BufDesc::AutoReg(auto_buf_reg), None),
+    };
 
     loop {
         let cmd_res = q
-            .submit_io_cmd_unified(tag, cmd_op, BufDesc::AutoReg(auto_buf_reg), res)
+            .submit_io_cmd_unified(tag, cmd_op, buf_desc.clone(), res)
             .unwrap()
             .await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }
 
-        res = lo_handle_io_cmd_async(&q, tag, None, true).await;
+        res = lo_handle_io_cmd_async(&q, tag, buf_ref).await;
         cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
 }
 
 async fn handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16) {
-    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-    let _buf_addr = buf.as_mut_ptr();
-    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
-    let mut res = 0;
+    if q.support_auto_buf_zc() {
+        __handle_queue_tag_async(q, tag, None).await
+    } else {
+        let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
-    q.register_io_buf(tag, &buf);
-    loop {
-        let cmd_res = q
-            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
-            .unwrap()
-            .await;
-        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
-
-        let buf_slice = &*buf;
-        res = lo_handle_io_cmd_async(&q, tag, Some(buf_slice), false).await;
-        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
-    }
+        __handle_queue_tag_async(q, tag, Some(&buf)).await
+    };
 }
 
 fn q_a_fn(qid: u16, dev: &UblkDev) {
@@ -398,11 +395,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
     for tag in 0..depth {
         let q = q_rc.clone();
 
-        if q.support_auto_buf_zc() {
-            f_vec.push(exe.spawn(handle_queue_tag_async_zc(q, tag)));
-        } else {
-            f_vec.push(exe.spawn(handle_queue_tag_async(q, tag)));
-        }
+        f_vec.push(exe.spawn(handle_queue_tag_async(q, tag)));
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
     smol::block_on(async { futures::future::join_all(f_vec).await });
