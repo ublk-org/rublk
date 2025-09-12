@@ -2,6 +2,7 @@ use libublk::{
     io::{BufDesc, UblkIOCtx, UblkQueue},
     UblkIORes,
 };
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 pub(crate) const POLL_TAG: u16 = u16::MAX;
@@ -24,7 +25,7 @@ pub(crate) struct Completion {
 }
 
 pub(crate) struct OffloadHandler {
-    efd: i32,
+    efd: nix::sys::eventfd::EventFd,
     job_tx: Sender<OffloadJob>,
     completion_rx: Receiver<Completion>,
 }
@@ -34,8 +35,8 @@ impl OffloadHandler {
     where
         F: Fn(OffloadJob) -> Completion + Send + 'static,
     {
-        let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
-        let (job_tx, completion_rx) = setup_worker_thread(efd, worker_fn);
+        let efd = nix::sys::eventfd::EventFd::from_value_and_flags(0, nix::sys::eventfd::EfdFlags::EFD_CLOEXEC).unwrap();
+        let (job_tx, completion_rx) = setup_worker_thread(efd.as_raw_fd(), worker_fn);
 
         Self {
             efd,
@@ -46,7 +47,7 @@ impl OffloadHandler {
 
     pub(crate) fn submit_poll_sqe(&self, q: &UblkQueue, handler_idx: u32) {
         let user_data = libublk::io::UblkIOCtx::build_user_data(POLL_TAG, handler_idx, 0, true);
-        let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(self.efd), libc::POLLIN as _)
+        let sqe = io_uring::opcode::PollAdd::new(io_uring::types::Fd(self.efd.as_raw_fd()), libc::POLLIN as _)
             .build()
             .user_data(user_data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
@@ -54,7 +55,7 @@ impl OffloadHandler {
 
     pub(crate) fn handle_completion(&mut self, q: &UblkQueue, handler_idx: u32) {
         let mut buf = [0u8; 8];
-        nix::unistd::read(self.efd, &mut buf).unwrap();
+        nix::unistd::read(&self.efd, &mut buf).unwrap();
 
         while let Ok(completion) = self.completion_rx.try_recv() {
             let tag = completion.tag;
@@ -165,7 +166,7 @@ impl<'a, T: super::OffloadTargetLogic<'a>> QueueHandler<'a, T> {
     }
 }
 
-fn setup_worker_thread<F>(efd: i32, handler: F) -> (Sender<OffloadJob>, Receiver<Completion>)
+fn setup_worker_thread<F>(efd: std::os::fd::RawFd, handler: F) -> (Sender<OffloadJob>, Receiver<Completion>)
 where
     F: Fn(OffloadJob) -> Completion + Send + 'static,
 {
@@ -178,7 +179,9 @@ where
             if completion_tx.send(completion).is_err() {
                 break;
             }
-            nix::unistd::write(efd, &1u64.to_le_bytes()).unwrap();
+            unsafe {
+                nix::unistd::write(BorrowedFd::borrow_raw(efd), &1u64.to_le_bytes()).unwrap();
+            }
         }
     });
 
