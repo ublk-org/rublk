@@ -241,13 +241,22 @@ fn ublk_recover_work(opt: args::UblkArgs) -> anyhow::Result<i32> {
     ctrl.start_user_recover()?;
 
     let tgt_type = ctrl.get_target_type_from_json().unwrap();
+
+    // Extract device info and target flags to restore original configuration
+    let dev_info = ctrl.dev_info();
+    let target_flags = dev_info.ublksrv_flags;
+
+    // Restore original dev_flags from high 32 bits of target_flags
+    let stored_dev_flags_bits = (target_flags >> 32) as u32;
+    let recovered_dev_flags = UblkFlags::from_bits_truncate(stored_dev_flags_bits) | UblkFlags::UBLK_DEV_F_RECOVER_DEV;
+
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name(&tgt_type.clone())
-        .depth(ctrl.dev_info().queue_depth)
-        .nr_queues(ctrl.dev_info().nr_hw_queues)
-        .id(ctrl.dev_info().dev_id as i32)
+        .depth(dev_info.queue_depth)
+        .nr_queues(dev_info.nr_hw_queues)
+        .id(dev_info.dev_id as i32)
         .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY.into())
-        .dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
+        .dev_flags(recovered_dev_flags)
         .build()
         .unwrap();
 
