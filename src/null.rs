@@ -148,7 +148,7 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         f_vec.push(exe.spawn(handle_queue_tag_async_null(q, tag, user_copy)));
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(async { futures::future::join_all(f_vec).await });
+    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
 }
 
 pub(crate) fn ublk_add_null(

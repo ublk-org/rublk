@@ -331,7 +331,7 @@ fn ublk_qcow2_start<'a, T: Qcow2IoOps + 'a>(
         }
     });
     ublk_run_ctrl_task(exe, q, &task)?;
-    smol::block_on(task)
+    smol::block_on(exe.run(task))
 }
 
 fn ublk_qcow2_shutdown<'a, T: Qcow2IoOps + 'a>(
@@ -390,7 +390,7 @@ fn ublk_qcow2_drive_exec<'a, T: Qcow2IoOps + 'a>(
     }
 
     ublk_run_io_task(exe, &flush_task, q_rc, 0).unwrap();
-    smol::block_on(flush_task);
+    smol::block_on(exe.run(flush_task));
 }
 
 pub(crate) fn ublk_add_qcow2(
@@ -472,7 +472,7 @@ pub(crate) fn ublk_add_qcow2(
 
     // Drive IO tasks for moving on
     ublk_qcow2_drive_exec(&exe, &tgt_rc, &q_rc);
-    smol::block_on(async { futures::future::join_all(f_vec).await });
+    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
     log::info!("qcow2: queue is down");
 
     // Shutdown ublk-qcow2 device

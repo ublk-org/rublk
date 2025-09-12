@@ -378,7 +378,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev) {
         f_vec.push(exe.spawn(handle_queue_tag_async(q, tag)));
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(async { futures::future::join_all(f_vec).await });
+    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
 }
 
 pub(crate) fn ublk_add_loop(
