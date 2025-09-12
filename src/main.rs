@@ -24,6 +24,8 @@ mod null;
 mod offload;
 mod qcow2;
 mod zoned;
+mod opencl;
+mod vram;
 
 #[derive(Parser)]
 #[command(version)]
@@ -51,13 +53,13 @@ ioctl_read_bad!(
 );
 
 pub(crate) struct DevIdComm {
-    efd: i32,
+    efd: std::os::fd::OwnedFd,
     dump: bool,
 }
 
 impl DevIdComm {
     pub fn new(dump: bool) -> anyhow::Result<DevIdComm> {
-        let fd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty())?;
+        let fd = nix::sys::eventfd::EventFd::from_value_and_flags(0, nix::sys::eventfd::EfdFlags::empty())?.into();
 
         Ok(DevIdComm { efd: fd, dump })
     }
@@ -66,7 +68,7 @@ impl DevIdComm {
         let id = i64::MAX;
         let bytes = id.to_le_bytes();
 
-        match nix::unistd::write(self.efd, &bytes) {
+        match nix::unistd::write(&self.efd, &bytes) {
             Ok(_) => Ok(0),
             _ => Err(anyhow::anyhow!("fail to write failure to eventfd")),
         }
@@ -77,7 +79,7 @@ impl DevIdComm {
         let id = (dev_id + 1) as i64;
         let bytes = id.to_le_bytes();
 
-        match nix::unistd::write(self.efd, &bytes) {
+        match nix::unistd::write(&self.efd, &bytes) {
             Ok(_) => Ok(0),
             _ => Err(anyhow::anyhow!("fail to write dev_id to eventfd")),
         }
@@ -86,7 +88,7 @@ impl DevIdComm {
     fn read_dev_id(&self) -> anyhow::Result<i32> {
         let mut buffer = [0; 8];
 
-        let bytes_read = nix::unistd::read(self.efd, &mut buffer)?;
+        let bytes_read = nix::unistd::read(&self.efd, &mut buffer)?;
         if bytes_read == 0 {
             return Err(anyhow::anyhow!("fail to read dev_id from eventfd"));
         }
@@ -183,6 +185,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
         AddCommands::Qcow2(_opt) => ("qcow2", &_opt.gen_arg),
         #[cfg(feature = "compress")]
         AddCommands::Compress(_opt) => ("compress", &_opt.gen_arg),
+        AddCommands::Vram(_opt) => ("vram", &_opt.gen_arg),
     }
 }
 
@@ -203,6 +206,10 @@ fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> anyhow::Res
         AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt), comm),
         #[cfg(feature = "compress")]
         AddCommands::Compress(opt) => compress::ublk_add_compress(ctrl, Some(opt), comm),
+        AddCommands::Vram(opt) => {
+            vram::ublk_add_vram(ctrl, &opt, comm)?;
+            Ok(0)
+        },
     }
 }
 
@@ -427,6 +434,11 @@ fn ublk_list(opt: args::UblkArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+fn ublk_vram_cmd(opt: vram::VramCmd) -> anyhow::Result<i32> {
+    vram::ublk_vram_cmd(&opt)?;
+    Ok(0)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -446,5 +458,6 @@ fn main() {
         Commands::List(opt) => ublk_list(opt).unwrap(),
         Commands::Recover(opt) => ublk_recover(opt).unwrap(),
         Commands::Features(opt) => ublk_features(opt).unwrap(),
+        Commands::Vram(opt) => ublk_vram_cmd(opt).unwrap(),
     };
 }
