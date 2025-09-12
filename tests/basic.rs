@@ -601,6 +601,7 @@ mod integration {
         });
     }
 
+    #[cfg(feature = "compress")]
     fn __test_ublk_add_del_compress<F>(recover: bool, f: F)
     where
         F: Fn(&UblkCtrl),
@@ -624,6 +625,7 @@ mod integration {
     }
 
     #[test]
+    #[cfg(feature = "compress")]
     fn test_ublk_add_del_compress() {
         if !support_ublk() {
             return;
@@ -635,6 +637,7 @@ mod integration {
     }
 
     #[test]
+    #[cfg(feature = "compress")]
     fn test_ublk_compress_recover() {
         if !support_ublk() {
             return;
@@ -646,6 +649,7 @@ mod integration {
     }
 
     #[test]
+    #[cfg(feature = "compress")]
     fn test_ublk_format_mount_compress() {
         if !support_ublk() {
             return;
@@ -655,6 +659,7 @@ mod integration {
         });
     }
 
+    #[cfg(feature = "compress")]
     fn __test_ublk_compress_type(comp_type: &str, res: &str) {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let pstr = tmp_dir.path().to_str().unwrap();
@@ -680,6 +685,7 @@ mod integration {
         run_rublk_del_dev(ctrl, false);
     }
     #[test]
+    #[cfg(feature = "compress")]
     fn test_ublk_compress_type() {
         if !support_ublk() {
             return;
