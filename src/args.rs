@@ -285,6 +285,7 @@ pub(crate) enum AddCommands {
     Qcow2(super::qcow2::Qcow2Args),
 
     /// Add compress target
+    #[cfg(feature = "compress")]
     Compress(super::compress::CompressAddArgs),
 }
 
