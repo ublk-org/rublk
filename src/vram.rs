@@ -234,6 +234,8 @@ pub(crate) fn ublk_add_vram(ctrl: UblkCtrl, vram_args: &VramAddArgs,
     ctrl.run_target(
         |dev| {
             dev.set_default_params(dev_size);
+            dev.tgt.params.basic.attrs &= !libublk::sys::UBLK_ATTR_VOLATILE_CACHE;
+
             dev.set_target_json(serde_json::json!({
                 "type": "vram",
                 "blocks": dev_blocks,
