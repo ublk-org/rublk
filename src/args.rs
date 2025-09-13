@@ -289,6 +289,7 @@ pub(crate) enum AddCommands {
     Compress(super::compress::CompressAddArgs),
 
     /// Add vram target (GPU memory block device)
+    #[cfg(feature = "vram")]
     Vram(super::vram::VramAddArgs),
 }
 
@@ -306,5 +307,6 @@ pub(crate) enum Commands {
     /// Get supported features from ublk driver, supported since v6.5
     Features(UblkFeaturesArgs),
     /// GPU VRAM target specific commands
+    #[cfg(feature = "vram")]
     Vram(super::vram::VramCmd),
 }

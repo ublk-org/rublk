@@ -24,7 +24,9 @@ mod null;
 mod offload;
 mod qcow2;
 mod zoned;
+#[cfg(feature = "vram")]
 mod opencl;
+#[cfg(feature = "vram")]
 mod vram;
 
 #[derive(Parser)]
@@ -185,6 +187,7 @@ fn ublk_parse_add_args(opt: &args::AddCommands) -> (&'static str, &args::GenAddA
         AddCommands::Qcow2(_opt) => ("qcow2", &_opt.gen_arg),
         #[cfg(feature = "compress")]
         AddCommands::Compress(_opt) => ("compress", &_opt.gen_arg),
+        #[cfg(feature = "vram")]
         AddCommands::Vram(_opt) => ("vram", &_opt.gen_arg),
     }
 }
@@ -200,6 +203,7 @@ fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> anyhow::Res
         AddCommands::Qcow2(opt) => qcow2::ublk_add_qcow2(ctrl, Some(opt), comm),
         #[cfg(feature = "compress")]
         AddCommands::Compress(opt) => compress::ublk_add_compress(ctrl, Some(opt), comm),
+        #[cfg(feature = "vram")]
         AddCommands::Vram(opt) => {
             vram::ublk_add_vram(ctrl, &opt, comm)?;
             Ok(0)
@@ -428,6 +432,7 @@ fn ublk_list(opt: args::UblkArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+#[cfg(feature = "vram")]
 fn ublk_vram_cmd(opt: vram::VramCmd) -> anyhow::Result<i32> {
     vram::ublk_vram_cmd(&opt)?;
     Ok(0)
@@ -452,6 +457,7 @@ fn main() {
         Commands::List(opt) => ublk_list(opt).unwrap(),
         Commands::Recover(opt) => ublk_recover(opt).unwrap(),
         Commands::Features(opt) => ublk_features(opt).unwrap(),
+        #[cfg(feature = "vram")]
         Commands::Vram(opt) => ublk_vram_cmd(opt).unwrap(),
     };
 }
