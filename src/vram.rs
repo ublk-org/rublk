@@ -4,11 +4,12 @@ use libublk::{
     helpers::IoBuf,
     io::{UblkDev, UblkQueue},
     uring_async::ublk_wait_and_handle_ios,
+    UblkError,
 };
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::opencl::{VRamBuffer, VRamBufferConfig, VramDevice, list_opencl_devices};
+use crate::opencl::{list_opencl_devices, VRamBuffer, VRamBufferConfig, VramDevice};
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct VramAddArgs {
@@ -55,13 +56,13 @@ fn handle_io_cmd(
 ) -> i32 {
     let iod = q.get_iod(tag);
     let global_limit = q.dev.tgt.dev_size;
-    
+
     let mut global_offset = global_limit.min(iod.start_sector << 9);
     let mut global_length = (iod.nr_sectors << 9) as usize;
     if global_offset + global_length as u64 >= global_limit {
         global_length = (global_limit - global_offset) as usize;
     }
-    
+
     if global_length > 0 {
         let op = iod.op_flags & 0xff;
         match op {
@@ -72,13 +73,13 @@ fn handle_io_cmd(
                 };
                 let mut local_offset = 0;
                 let mut global_remaining = global_length;
-                
+
                 for (i, vram) in vrams.iter().enumerate() {
                     let local_remaining = vram.remaining(global_offset);
                     if local_remaining.is_none() {
                         continue;
                     }
-                    
+
                     let local_length = global_remaining.min(local_remaining.unwrap());
 
                     if libublk::sys::UBLK_IO_OP_READ == op {
@@ -123,7 +124,7 @@ fn handle_io_cmd(
                     local_offset += local_length;
                     global_offset += local_length as u64;
                 }
-                
+
                 if global_remaining > 0 {
                     log::error!(
                         "{} error, offset {} size {}",
@@ -143,13 +144,18 @@ fn handle_io_cmd(
     global_length as i32
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, vrams: Arc<Vec<VRamBuffer>>) -> anyhow::Result<()> {
+async fn io_task(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    vrams: Arc<Vec<VRamBuffer>>,
+) -> Result<(), UblkError> {
     let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
     let buf = IoBuf::<u8>::new(buf_bytes);
     let buf_desc = libublk::BufDesc::Slice(buf.as_slice());
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, Some(&buf)).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, Some(&buf))
+        .await?;
 
     loop {
         let res = handle_io_cmd(q, tag, &buf, &vrams);
@@ -158,7 +164,13 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, vrams: Arc<Vec<VRamBuffer>>) -> an
 }
 
 fn q_fn(qid: u16, dev: &UblkDev, vrams: Arc<Vec<VRamBuffer>>) {
-    let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+    let q_rc = match UblkQueue::new(qid, dev) {
+        Ok(queue) => Rc::new(queue),
+        Err(e) => {
+            log::error!("Failed to create queue {}: {}", qid, e);
+            return;
+        }
+    };
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
 
@@ -167,15 +179,8 @@ fn q_fn(qid: u16, dev: &UblkDev, vrams: Arc<Vec<VRamBuffer>>) {
         let use_vram = vrams.clone();
         f_vec.push(exe.spawn(async move {
             match io_task(&q, tag, use_vram).await {
-                Ok(_) => {}
-                Err(e) => {
-                    // Check if it's a UblkError::QueueIsDown by checking the error string
-                    if e.to_string().contains("QueueIsDown") {
-                        // Normal shutdown, don't log error
-                    } else {
-                        log::error!("io_task failed for tag {}: {}", tag, e);
-                    }
-                }
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) => log::error!("vram io_task failed for tag {}: {}", tag, e),
             }
         }));
     }
@@ -184,18 +189,18 @@ fn q_fn(qid: u16, dev: &UblkDev, vrams: Arc<Vec<VRamBuffer>>) {
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 
-pub(crate) fn ublk_add_vram(ctrl: UblkCtrl, vram_args: &VramAddArgs,
-    comm_rc: &Arc<crate::DevIdComm>
-    ) -> Result<()> {
-
+pub(crate) fn ublk_add_vram(
+    ctrl: UblkCtrl,
+    vram_args: &VramAddArgs,
+    comm_rc: &Arc<crate::DevIdComm>,
+) -> Result<()> {
     if ctrl.dev_info().flags & (libublk::sys::UBLK_F_USER_RECOVERY as u64) != 0 {
         anyhow::bail!("vram device can't support recovery");
     }
 
-     let size = match &vram_args.size {
-            Some(size_str) =>
-                parse_size::parse_size(size_str)?,
-            _ => 2 << 30,
+    let size = match &vram_args.size {
+        Some(size_str) => parse_size::parse_size(size_str)?,
+        _ => 2 << 30,
     };
     let mut config = VRamBufferConfig {
         platform_index: vram_args.platform,
@@ -204,7 +209,7 @@ pub(crate) fn ublk_add_vram(ctrl: UblkCtrl, vram_args: &VramAddArgs,
         mmap: vram_args.mmap,
         ..Default::default()
     };
-    
+
     if vram_args.cpu {
         config.with_cpu();
     }
@@ -252,7 +257,11 @@ pub(crate) fn ublk_add_vram(ctrl: UblkCtrl, vram_args: &VramAddArgs,
             Ok(())
         },
         move |qid, dev| q_fn(qid, dev, use_vram.clone()),
-        move |ctrl: &UblkCtrl| comm.send_dev_id(ctrl.dev_info().dev_id).unwrap(),
+        move |ctrl: &UblkCtrl| {
+            if let Err(e) = comm.send_dev_id(ctrl.dev_info().dev_id) {
+                log::error!("Failed to send device ID: {}", e);
+            }
+        },
     )?;
 
     Ok(())
@@ -264,7 +273,7 @@ pub(crate) fn ublk_vram_cmd(args: &VramCmd) -> Result<()> {
             ..Default::default()
         };
         match list_opencl_devices(&config) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Error: {}", e);
                 eprintln!("No OpenCL platforms found. Please ensure OpenCL drivers are installed.");
