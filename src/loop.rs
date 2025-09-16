@@ -326,7 +326,6 @@ fn q_sync_fn(qid: u16, dev: &UblkDev) {
 
 #[inline]
 async fn __handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16, buf: Option<&IoBuf<u8>>) -> Result<(), UblkError>{
-    let mut res = 0;
     let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
         index: tag,
         flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
@@ -339,12 +338,10 @@ async fn __handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16, buf: Option<&I
     };
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, buf).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, buf).await?;
 
     loop {
-        res = lo_handle_io_cmd_async(&q, tag, buf_ref).await;
-
-        // Submit commit command and get result
+        let res = lo_handle_io_cmd_async(&q, tag, buf_ref).await;
         q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
     }
 }

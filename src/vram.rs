@@ -147,15 +147,12 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, vrams: Arc<Vec<VRamBuffer>>) -> an
     let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
     let buf = IoBuf::<u8>::new(buf_bytes);
     let buf_desc = libublk::BufDesc::Slice(buf.as_slice());
-    let mut res = 0;
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, Some(&buf)).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, Some(&buf)).await?;
 
     loop {
-        res = handle_io_cmd(q, tag, &buf, &vrams);
-
-        // Submit commit command and get result
+        let res = handle_io_cmd(q, tag, &buf, &vrams);
         q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
     }
 }

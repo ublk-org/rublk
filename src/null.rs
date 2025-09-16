@@ -93,7 +93,6 @@ async fn __handle_queue_tag_async_null(
     buf: Option<&IoBuf<u8>>,
     user_copy: bool,
 ) -> Result<(), UblkError> {
-    let mut res = 0;
     let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
         index: tag,
         flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
@@ -110,9 +109,9 @@ async fn __handle_queue_tag_async_null(
     };
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, buf).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, buf).await?;
     loop {
-        res = get_io_cmd_result(&q, tag);
+        let res = get_io_cmd_result(&q, tag);
         q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
     }
 }
