@@ -22,12 +22,12 @@ mod r#loop;
 mod null;
 #[cfg(feature = "compress")]
 mod offload;
-mod qcow2;
-mod zoned;
 #[cfg(feature = "vram")]
 mod opencl;
+mod qcow2;
 #[cfg(feature = "vram")]
 mod vram;
+mod zoned;
 
 #[derive(Parser)]
 #[command(version)]
@@ -61,7 +61,11 @@ pub(crate) struct DevIdComm {
 
 impl DevIdComm {
     pub fn new(dump: bool) -> anyhow::Result<DevIdComm> {
-        let fd = nix::sys::eventfd::EventFd::from_value_and_flags(0, nix::sys::eventfd::EfdFlags::empty())?.into();
+        let fd = nix::sys::eventfd::EventFd::from_value_and_flags(
+            0,
+            nix::sys::eventfd::EfdFlags::empty(),
+        )?
+        .into();
 
         Ok(DevIdComm { efd: fd, dump })
     }
@@ -213,7 +217,7 @@ fn ublk_add_worker(opt: args::AddCommands, comm: &Arc<DevIdComm>) -> anyhow::Res
         AddCommands::Vram(opt) => {
             vram::ublk_add_vram(ctrl, &opt, comm)?;
             Ok(0)
-        },
+        }
     }
 }
 
@@ -269,7 +273,8 @@ fn ublk_recover_work(opt: args::UblkArgs) -> anyhow::Result<i32> {
 
     // Restore original dev_flags from high 32 bits of target_flags
     let stored_dev_flags_bits = (target_flags >> 32) as u32;
-    let recovered_dev_flags = UblkFlags::from_bits_truncate(stored_dev_flags_bits) | UblkFlags::UBLK_DEV_F_RECOVER_DEV;
+    let recovered_dev_flags =
+        UblkFlags::from_bits_truncate(stored_dev_flags_bits) | UblkFlags::UBLK_DEV_F_RECOVER_DEV;
 
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name(&tgt_type.clone())
@@ -289,7 +294,9 @@ fn ublk_recover_work(opt: args::UblkArgs) -> anyhow::Result<i32> {
         #[cfg(feature = "compress")]
         "compress" => compress::ublk_add_compress(ctrl, None, &comm),
         #[cfg(not(feature = "compress"))]
-        "compress" => Err(anyhow::anyhow!("compress target not available - build with --features compress")),
+        "compress" => Err(anyhow::anyhow!(
+            "compress target not available - build with --features compress"
+        )),
         &_ => Err(anyhow::anyhow!("unsupported target type: {}", tgt_type)),
     }
 }
@@ -385,20 +392,11 @@ fn ublk_del(opt: args::DelArgs) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
-        for entry in entries.flatten() {
-            let f = entry.path();
-            if f.is_file() {
-                if let Some(file_stem) = f.file_stem() {
-                    if let Some(stem) = file_stem.to_str() {
-                        if let Ok(num) = stem.parse::<i32>() {
-                            __ublk_del(num, opt.r#async)?;
-                        }
-                    }
-                }
-            }
+    UblkCtrl::for_each_dev_id(move |id| {
+        if let Err(e) = __ublk_del(id.try_into().unwrap(), opt.r#async) {
+            eprintln!("failed to delete ublk device {}: {}", id, e);
         }
-    }
+    });
 
     Ok(0)
 }
@@ -421,20 +419,12 @@ fn ublk_list(opt: args::UblkArgs) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
-        for entry in entries.flatten() {
-            let f = entry.path();
-            if f.is_file() {
-                if let Some(file_stem) = f.file_stem() {
-                    if let Some(stem) = file_stem.to_str() {
-                        if let Ok(num) = stem.parse::<i32>() {
-                            __ublk_list(num)?;
-                        }
-                    }
-                }
-            }
+    UblkCtrl::for_each_dev_id(move |id| {
+        if let Err(e) = __ublk_list(id.try_into().unwrap()) {
+            eprintln!("failed to list ublk device {}: {}", id, e);
         }
-    }
+    });
+
     Ok(0)
 }
 
