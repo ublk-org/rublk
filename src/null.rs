@@ -32,17 +32,17 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 }
 
 #[inline]
-fn handle_io_cmd(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) {
+fn handle_io_cmd(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) -> Result<(), UblkError> {
     let bytes = get_io_cmd_result(q, tag);
     let buf_desc = match buf {
         Some(slice) => BufDesc::Slice(slice),
         None => BufDesc::Slice(&[]),
     };
 
-    q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes))).unwrap();
+    q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
 }
 
-fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
+fn q_sync_zc_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
     let auto_buf_reg_list_rc = Rc::new(
         (0..dev.dev_info.queue_depth)
             .map(|tag| libublk::sys::ublk_auto_buf_reg {
@@ -57,16 +57,18 @@ fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
     let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
         let bytes = get_io_cmd_result(q, tag);
         let buf_desc = BufDesc::AutoReg(auto_buf_reg_list[tag as usize]);
-        q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes))).unwrap();
+        if let Err(e) = q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes))) {
+            log::error!("complete_io_cmd_unified failed {}/{}: {}", qid, tag, e);
+        }
     };
 
-    UblkQueue::new(qid, dev)
-        .unwrap()
-        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc)).unwrap()
+    UblkQueue::new(qid, dev)?
+        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc))?
         .wait_and_handle_io(io_handler);
+    Ok(())
 }
 
-fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
+fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError> {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
 
@@ -77,13 +79,19 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         } else {
             Some(&*bufs[tag as usize])
         };
-        handle_io_cmd(q, tag, buf);
+        if let Err(e) = handle_io_cmd(q, tag, buf) {
+            log::error!("handle_io_cmd failed {}/{}: {}", qid, tag, e);
+        }
     };
 
-    UblkQueue::new(qid, dev)
-        .unwrap()
-        .submit_fetch_commands_unified(BufDescList::Slices(if user_copy { None } else { Some(&bufs_rc) })).unwrap()
+    UblkQueue::new(qid, dev)?
+        .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+            None
+        } else {
+            Some(&bufs_rc)
+        }))?
         .wait_and_handle_io(io_handler);
+    Ok(())
 }
 
 #[inline]
@@ -116,36 +124,41 @@ async fn __handle_queue_tag_async_null(
     }
 }
 
-async fn handle_queue_tag_async_null(q: Rc<UblkQueue<'_>>, tag: u16, user_copy: bool) -> Result<(), UblkError> {
+async fn handle_queue_tag_async_null(
+    q: Rc<UblkQueue<'_>>,
+    tag: u16,
+    user_copy: bool,
+) -> Result<(), UblkError> {
     if q.support_auto_buf_zc() {
         __handle_queue_tag_async_null(q, tag, None, user_copy).await
     } else {
         let buf = if user_copy {
             None
-         } else {
+        } else {
             Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
-         };
+        };
         __handle_queue_tag_async_null(q, tag, buf.as_ref(), user_copy).await
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
+fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError> {
     let depth = dev.dev_info.queue_depth;
-    let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+    let q_rc = Rc::new(UblkQueue::new(qid, dev)?);
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
 
     for tag in 0..depth {
         let q = q_rc.clone();
         f_vec.push(exe.spawn(async move {
-                match handle_queue_tag_async_null(q, tag, user_copy).await {
-                    Err(UblkError::QueueIsDown) | Ok(_) => {}
-                    Err(e) => log::error!("handle_queue_tag_async_null failed for tag {}: {}", tag, e),
-                }
-            }));
+            match handle_queue_tag_async_null(q, tag, user_copy).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) => log::error!("handle_queue_tag_async_null failed for tag {}: {}", tag, e),
+            }
+        }));
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
     smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+    Ok(())
 }
 
 pub(crate) fn ublk_add_null(
@@ -184,7 +197,7 @@ pub(crate) fn ublk_add_null(
     };
 
     let q_handler = move |qid, dev: &_| {
-        if aa {
+        let result = if aa {
             q_async_fn(qid, dev, user_copy)
         } else {
             if (flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
@@ -192,14 +205,21 @@ pub(crate) fn ublk_add_null(
             } else {
                 q_sync_fn(qid, dev, user_copy)
             }
+        };
+        if let Err(e) = result {
+            log::error!("Queue handler failed for queue {}: {}", qid, e);
         }
     };
 
     let comm = comm_arc.clone();
-    ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
-        comm.send_dev_id(dev.dev_info().dev_id).unwrap();
-    })
-    .unwrap();
+    match ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
+        if let Err(e) = comm.send_dev_id(dev.dev_info().dev_id) {
+            log::error!("Failed to send device ID: {}", e);
+        }
+    }) {
+        Ok(_) => {}
+        Err(e) => log::error!("Failed to run target: {}", e),
+    }
 
     Ok(0)
 }
