@@ -54,3 +54,4 @@ vram = ["opencl3"]
 [dev-dependencies]
 tempfile = "3.6.0"
 regex = "1.8.4"
+ctor = "0.5"

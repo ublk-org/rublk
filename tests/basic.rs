@@ -6,6 +6,15 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    #[ctor::ctor]
+    fn init_logger() {
+        let _ = env_logger::builder()
+            .format_target(false)
+            .format_timestamp(None)
+            .is_test(true)
+            .try_init();
+    }
+
     fn has_mkfs_ext4() -> bool {
         match Command::new("mkfs.ext4")
             .arg("-V")
