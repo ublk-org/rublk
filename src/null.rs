@@ -108,10 +108,7 @@ async fn __handle_queue_tag_async_null(
     };
 
     let buf_desc = match buf {
-        Some(io_buf) => {
-            q.register_io_buf(tag, &io_buf);
-            BufDesc::Slice(io_buf.as_slice())
-        }
+        Some(io_buf) => BufDesc::Slice(io_buf.as_slice()),
         None if user_copy => BufDesc::Slice(&[]),
         _ => BufDesc::AutoReg(auto_buf_reg),
     };
