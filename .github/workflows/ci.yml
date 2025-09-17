@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --verbose
+      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --verbose --features compress
 
   build_i686:
     name: build rust i686
@@ -37,4 +37,4 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++-multilib gcc-multilib build-essential pkg-config libclang-dev
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }} && rustup target add i686-unknown-linux-gnu
-      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --verbose --target i686-unknown-linux-gnu
+      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --verbose --target i686-unknown-linux-gnu --features compress

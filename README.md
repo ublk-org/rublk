@@ -35,6 +35,7 @@ Commands:
   list      Lists ublk targets
   recover   Recover ublk targets
   features  Get supported features from ublk driver, supported since v6.5
+  vram      GPU VRAM target specific commands
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -56,6 +57,7 @@ Commands:
   zoned  Add zoned target, supported since v6.6
   qcow2  Add qcow2 target
   compress  Add RocksDB based compression target
+  vram   Add vram target (GPU memory block device)
   help   Print this message or the help of the given subcommand(s)
 
 Options:

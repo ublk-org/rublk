@@ -1,1 +1,8 @@
 /target
+/Cargo.lock
+/.claude
+/*.patch
+/temp
+/*.orig
+/*.rej
+/*~

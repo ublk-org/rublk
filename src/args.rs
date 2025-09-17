@@ -68,6 +68,10 @@ pub(crate) struct GenAddArgs {
     #[clap(long, default_value_t = false)]
     pub multi_cpus_affinity: bool,
 
+    /// Enable memory locking for I/O buffers (sets UBLK_DEV_F_MLOCK_IO_BUFFER)
+    #[clap(long, default_value_t = false)]
+    pub mlock: bool,
+
     /// Used to resolve relative paths for backing files.
     /// `RefCell` is used to allow deferred initialization of this field
     /// from an immutable `GenAddArgs` reference, which is necessary
@@ -144,6 +148,19 @@ impl GenAddArgs {
         *dir = start_dir;
     }
 
+    /// Validates that the target is compatible with mlock flag
+    pub fn validate_mlock_compatibility(&self, target_name: &str) -> anyhow::Result<()> {
+        if self.mlock {
+            match target_name {
+                "compress" | "qcow2" | "zoned" => {
+                    anyhow::bail!("{} target is not compatible with --mlock flag", target_name);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn new_ublk_ctrl(
         &self,
         name: &'static str,
@@ -168,6 +185,13 @@ impl GenAddArgs {
 
         if self.user_copy {
             ctrl_flags |= libublk::sys::UBLK_F_USER_COPY;
+        }
+
+        // Validate --mlock flag
+        if self.mlock {
+            if self.user_copy {
+                anyhow::bail!("--mlock is not allowed with --user-copy (-u) because user needs extra buffer, which is a deadlock risk");
+            }
         }
 
         if self.unprivileged {
@@ -204,11 +228,21 @@ impl GenAddArgs {
         }
 
         // Apply single CPU affinity by default unless multi_cpus_affinity is enabled
-        let final_dev_flags = if self.multi_cpus_affinity {
+        let mut final_dev_flags = if self.multi_cpus_affinity {
             dev_flags
         } else {
             dev_flags | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY
         };
+
+        // Set UBLK_DEV_F_MLOCK_IO_BUFFER when --mlock is used without --zero-copy
+        if self.mlock && !self.zero_copy {
+            final_dev_flags |= UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER;
+        }
+
+        // Store UblkFlags in high 32 bits of target_flags for recovery
+        // Exclude UBLK_DEV_F_ADD_DEV since it's only relevant during creation
+        let persistent_dev_flags = final_dev_flags & !UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let combined_target_flags = gen_flags | ((persistent_dev_flags.bits() as u64) << 32);
 
         Ok(libublk::ctrl::UblkCtrlBuilder::default()
             .name(name)
@@ -216,7 +250,7 @@ impl GenAddArgs {
             .nr_queues(self.queue.try_into()?)
             .id(self.number)
             .ctrl_flags(ctrl_flags.into())
-            .ctrl_target_flags(gen_flags)
+            .ctrl_target_flags(combined_target_flags)
             .dev_flags(final_dev_flags)
             .io_buf_bytes(buf_size as u32)
             .build()?)
@@ -264,7 +298,12 @@ pub(crate) enum AddCommands {
     Qcow2(super::qcow2::Qcow2Args),
 
     /// Add compress target
+    #[cfg(feature = "compress")]
     Compress(super::compress::CompressAddArgs),
+
+    /// Add vram target (GPU memory block device)
+    #[cfg(feature = "vram")]
+    Vram(super::vram::VramAddArgs),
 }
 
 #[derive(Subcommand)]
@@ -280,4 +319,7 @@ pub(crate) enum Commands {
     Recover(UblkArgs),
     /// Get supported features from ublk driver, supported since v6.5
     Features(UblkFeaturesArgs),
+    /// GPU VRAM target specific commands
+    #[cfg(feature = "vram")]
+    Vram(super::vram::VramCmd),
 }
