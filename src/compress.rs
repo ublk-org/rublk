@@ -124,13 +124,23 @@ async fn handle_read(
     res
 }
 
-fn handle_flush(db: &DB) -> Result<i32, i32> {
+fn __handle_flush(db: &DB) -> Result<i32, i32> {
     if let Err(e) = db.flush() {
         log::error!("Background rocksdb flush error: {}", e);
         Err(-libc::EIO)
     } else {
         Ok(0)
     }
+}
+
+async fn handle_flush(cq: &CompressQueue<'_>, db: Arc<DB>) -> Result<i32, i32> {
+    let db_clone = db.clone();
+
+    // Offload to thread pool
+    let res = smol::unblock(move || __handle_flush(&db_clone)).await;
+    // Notify via eventfd
+    nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+    res
 }
 
 fn handle_write(
@@ -212,7 +222,7 @@ async fn handle_compress_io_cmd_async(
                 handle_write(db, iod.start_sector, iod.nr_sectors, buf_slice, lbs)
             }
         }
-        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(db),
+        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(cq, db.clone()).await,
         libublk::sys::UBLK_IO_OP_DISCARD => {
             if read_only {
                 Err(-libc::EACCES)
