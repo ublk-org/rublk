@@ -1,10 +1,12 @@
+use io_uring::{opcode, types};
 use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
-    io::{BufDesc, UblkDev, UblkQueue},
-    uring_async::ublk_wait_and_handle_ios,
-    UblkError,
+    io::{with_task_io_ring, with_task_io_ring_mut, BufDesc, UblkDev, UblkQueue},
+    uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task},
+    UblkError, UblkUringData,
 };
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
     WriteOptions, DB,
@@ -12,6 +14,8 @@ use rocksdb::{
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -46,6 +50,18 @@ struct CompressJson {
     compression: String,
     logical_block_size: u32,
     physical_block_size: u32,
+}
+
+struct CompressQueue<'a> {
+    q: &'a UblkQueue<'a>,
+    eventfd: EventFd,
+}
+
+impl<'a> CompressQueue<'a> {
+    fn new(q: &'a UblkQueue<'a>) -> Result<Self, std::io::Error> {
+        let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)?;
+        Ok(CompressQueue { q, eventfd })
+    }
 }
 
 fn handle_read(
@@ -135,14 +151,14 @@ fn handle_discard(
 }
 
 async fn handle_compress_io_cmd_async(
-    q: &UblkQueue<'_>,
+    cq: &CompressQueue<'_>,
     tag: u16,
     buf: &mut IoBuf<u8>,
     db: &Arc<DB>,
     lbs: u32,
     read_only: bool,
 ) -> Result<i32, i32> {
-    let iod = q.get_iod(tag);
+    let iod = cq.q.get_iod(tag);
     let op = iod.op_flags & 0xff;
 
     match op as u32 {
@@ -174,44 +190,120 @@ async fn handle_compress_io_cmd_async(
 }
 
 async fn handle_queue_tag_async_compress(
-    q: Rc<UblkQueue<'_>>,
+    cq: &CompressQueue<'_>,
     tag: u16,
     db: Arc<DB>,
     lbs: u32,
     read_only: bool,
 ) -> Result<(), UblkError> {
-    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    let mut buf = IoBuf::<u8>::new(cq.q.dev.dev_info.max_io_buf_bytes as usize);
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+    cq.q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
         .await?;
     loop {
-        let res = handle_compress_io_cmd_async(&q, tag, &mut buf, &db, lbs, read_only).await;
+        let res = handle_compress_io_cmd_async(&cq, tag, &mut buf, &db, lbs, read_only).await;
         let buf_desc = BufDesc::Slice(buf.as_slice());
         match res {
             Ok(result) => {
-                q.submit_io_commit_cmd(tag, buf_desc, result).await?;
+                cq.q.submit_io_commit_cmd(tag, buf_desc, result).await?;
             }
             Err(error) => {
-                q.submit_io_commit_cmd(tag, buf_desc, error).await?;
+                cq.q.submit_io_commit_cmd(tag, buf_desc, error).await?;
             }
         }
     }
 }
 
+async fn handle_eventfd(cq: &CompressQueue<'_>) -> Result<(), UblkError> {
+    let mut buf = [0u8; 8];
+    loop {
+        if cq.q.is_stopping() {
+            break;
+        }
+
+        let eventfd = cq.eventfd.as_raw_fd();
+        let sqe =
+            io_uring::opcode::Read::new(io_uring::types::Fd(eventfd), buf.as_mut_ptr(), 8).build();
+        log::debug!("before eventfd reading");
+        cq.q.ublk_submit_sqe(sqe).await;
+        log::debug!("after eventfd reading");
+    }
+    Ok(())
+}
+
+async fn handle_uring_events<T>(
+    exe: &smol::LocalExecutor<'_>,
+    cq: &CompressQueue<'_>,
+    tasks: Vec<smol::Task<T>>,
+) -> Result<(), UblkError> {
+    const TIMEOUT_USER_DATA: u64 = UblkUringData::Target as u64 | UblkUringData::NonAsync as u64;
+    const TIMEOUT_SECS: u64 = 20;
+    let q = cq.q;
+    // Register io_uring FD with smol's async reactor
+    let uring_fd = with_task_io_ring(|ring| ring.as_raw_fd());
+    let file = unsafe { File::from_raw_fd(uring_fd) };
+    let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
+
+    let ts = types::Timespec::new().sec(TIMEOUT_SECS);
+    let timeout_e = opcode::Timeout::new(&ts)
+        .flags(io_uring::types::TimeoutFlags::MULTISHOT)
+        .build()
+        .user_data(TIMEOUT_USER_DATA);
+    q.ublk_submit_sqe_sync(timeout_e)?;
+
+    // Has to use smol::Async readable polling because we need smol::unblock()
+    // for offloading IO handling
+    let poll_uring = || async {
+        with_task_io_ring_mut(|r| r.submit_and_wait(0))?;
+        if !cq.q.is_stopping() {
+            async_uring
+                .readable()
+                .await
+                .map_err(|_| UblkError::OtherError(-libc::EIO))?;
+            Ok(false)
+        } else {
+            log::debug!("write to eventfd {}", unsafe { libc::gettid() });
+            nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+            Err(UblkError::QueueIsDown)
+        }
+    };
+
+    let reap_event = |poll_timeout| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, Some(TIMEOUT_USER_DATA), |cqe| {
+            // Handle normal CQEs by waking tasks
+            // Timeout CQEs are handled internally by ublk_reap_io_events_with_update_queue
+            ublk_wake_task(cqe.user_data(), cqe);
+        })
+    };
+    let run_ops = || while exe.try_tick() {};
+    let is_done = || tasks.iter().all(|task| task.is_finished());
+    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
+
+    // Prevent the File wrapper from closing the fd when dropped
+    // since the original io_uring instance still owns it
+    let _ = async_uring.into_inner().map(|f| {
+        use std::os::fd::IntoRawFd;
+        f.into_raw_fd()
+    });
+    Ok(())
+}
+
 fn q_async_fn(qid: u16, dev: &UblkDev, db: Arc<DB>) -> Result<(), UblkError> {
     let depth = dev.dev_info.queue_depth;
-    let q_rc = Rc::new(UblkQueue::new(qid, dev)?);
-    let exe = smol::LocalExecutor::new();
+    let q = UblkQueue::new(qid, dev)?;
+    let cq_rc = Rc::new(CompressQueue::new(&q).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?);
+    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let exe = exe_rc.clone();
     let mut f_vec = Vec::new();
     let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
     let read_only = (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0;
 
     for tag in 0..depth {
-        let q = q_rc.clone();
+        let cq = cq_rc.clone();
         let db = db.clone();
         f_vec.push(exe.spawn(async move {
-            match handle_queue_tag_async_compress(q, tag, db, lbs, read_only).await {
+            match handle_queue_tag_async_compress(&cq, tag, db, lbs, read_only).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
                 Err(e) => log::error!(
                     "handle_queue_tag_async_compress failed for tag {}: {}",
@@ -221,8 +313,23 @@ fn q_async_fn(qid: u16, dev: &UblkDev, db: Arc<DB>) -> Result<(), UblkError> {
             }
         }));
     }
-    ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+
+    let cq = cq_rc.clone();
+    f_vec.push(exe.spawn(async move {
+        if let Err(e) = handle_eventfd(&cq).await {
+            log::error!("handle_eventfd failed: {}", e);
+        }
+    }));
+
+    let cq = cq_rc.clone();
+    let exe2 = exe_rc.clone();
+    let exe_task = exe.spawn(async move {
+        if let Err(e) = handle_uring_events(&exe2, &cq, f_vec).await {
+            log::error!("handle_uring_events failed: {}", e);
+        }
+    });
+
+    smol::block_on(exe_rc.run(async move { exe_task.await }));
     Ok(())
 }
 
