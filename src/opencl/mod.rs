@@ -3,8 +3,8 @@
 //! This module handles interaction with the OCL via OpenCL,
 //! including device selection, memory allocation, and data transfer.
 
-mod memory;
 mod device;
+mod memory;
 
+pub(crate) use device::{list_opencl_devices, VramDevice};
 pub(crate) use memory::{VRamBuffer, VRamBufferConfig};
-pub(crate) use device::{VramDevice, list_opencl_devices};

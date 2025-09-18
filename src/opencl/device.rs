@@ -1,11 +1,11 @@
 use std::ptr;
 
 use super::VRamBufferConfig;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use opencl3::{
     command_queue::{self as cl_command_queue, CommandQueue},
     context::Context as ClContext,
-    device::{Device as CLDevice, get_device_ids},
+    device::{get_device_ids, Device as CLDevice},
     memory::Buffer,
     memory::{self as cl_memory},
     platform::get_platforms,

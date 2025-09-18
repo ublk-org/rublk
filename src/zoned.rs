@@ -1054,12 +1054,17 @@ async fn handle_write(
     Ok((sector, res))
 }
 
-async fn handle_queue_tag_async_zoned(q: Rc<UblkQueue<'_>>, ztgt_io: Rc<&Arc<ZonedTgt>>, tag: u16) -> Result<(), UblkError> {
+async fn handle_queue_tag_async_zoned(
+    q: Rc<UblkQueue<'_>>,
+    ztgt_io: Rc<&Arc<ZonedTgt>>,
+    tag: u16,
+) -> Result<(), UblkError> {
     let mut lba = 0_u64;
     let mut res = 0;
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, BufDesc::ZonedAppendLba(lba), res, None).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::ZonedAppendLba(lba), res, None)
+        .await?;
 
     loop {
         match zoned_handle_io(&ztgt_io, &q, tag).await {
@@ -1083,7 +1088,8 @@ async fn handle_queue_tag_async_zoned(q: Rc<UblkQueue<'_>>, ztgt_io: Rc<&Arc<Zon
         }
 
         // Submit commit command and get result
-        q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res).await?;
+        q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res)
+            .await?;
     }
     Ok(())
 }
@@ -1306,7 +1312,9 @@ pub(crate) fn ublk_add_zoned(
             f_vec.push(exe.spawn(async move {
                 match handle_queue_tag_async_zoned(q, ztgt_io, tag).await {
                     Err(UblkError::QueueIsDown) | Ok(_) => {}
-                    Err(e) => log::error!("handle_queue_tag_async_zoned failed for tag {}: {}", tag, e),
+                    Err(e) => {
+                        log::error!("handle_queue_tag_async_zoned failed for tag {}: {}", tag, e)
+                    }
                 }
             }));
         }

@@ -275,7 +275,11 @@ fn qcow2_init_tgt<T: Qcow2IoOps>(
     Ok(())
 }
 
-async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
+async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(
+    tgt: &Qcow2Tgt<T>,
+    q: &UblkQueue<'_>,
+    tag: u16,
+) -> Result<(), UblkError> {
     let qdev_q = &tgt.qdev;
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
     let _buf_addr = buf.as_mut_ptr();
@@ -283,10 +287,12 @@ async fn ublk_qcow2_io_fn<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'_>, t
     log::debug!("qcow2: io task {} stated", tag);
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+        .await?;
     loop {
         let res = qcow2_handle_io_cmd_async(q, qdev_q, tag, &mut buf).await;
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+            .await?;
     }
 }
 
