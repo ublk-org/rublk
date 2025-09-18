@@ -71,7 +71,7 @@ impl<'a> CompressQueue<'a> {
     }
 }
 
-fn handle_read(
+fn __handle_read(
     db: &DB,
     start_sector: u64,
     nr_sectors: u32,
@@ -104,6 +104,33 @@ fn handle_read(
         }
     }
     Ok((nr_sectors << 9) as i32)
+}
+
+async fn handle_read(
+    cq: &CompressQueue<'_>,
+    db: Arc<DB>,
+    start_sector: u64,
+    nr_sectors: u32,
+    buf: &mut [u8],
+    lbs: u32,
+) -> Result<i32, i32> {
+    let buf_ptr = buf.as_ptr() as u64;
+    let buf_len = buf.len();
+    let db_clone = db.clone();
+
+    // Offload to thread pool
+    let res = smol::unblock(move || {
+        // Reconstruct the slice safely since the buffer outlive the closure
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len) };
+        let res = __handle_read(&db_clone, start_sector, nr_sectors, buf_slice, lbs);
+        log::info!(" read offload done");
+        res
+    })
+    .await;
+
+    log::info!("handle read done");
+    nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+    res
 }
 
 fn handle_flush(db: &DB) -> Result<i32, i32> {
@@ -172,7 +199,20 @@ async fn handle_compress_io_cmd_async(
         libublk::sys::UBLK_IO_OP_READ => {
             let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, buf.len());
             let buf_slice = &mut buf.as_mut_slice()[..buf_len];
-            handle_read(db, iod.start_sector, iod.nr_sectors, buf_slice, lbs)
+
+            log::info!("before read tid {}", unsafe { libc::gettid() });
+            let res = handle_read(
+                cq,
+                db.clone(),
+                iod.start_sector,
+                iod.nr_sectors,
+                buf_slice,
+                lbs,
+            )
+            .await;
+            log::info!("after read tid {} res {:?}", unsafe { libc::gettid() }, res);
+
+            res
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
             if read_only {
