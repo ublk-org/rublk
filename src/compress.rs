@@ -1,11 +1,9 @@
-use crate::offload::{
-    handler::{Completion, OffloadHandler, OffloadJob, QueueHandler},
-    OffloadTargetLogic,
-};
 use libublk::{
     ctrl::UblkCtrl,
-    io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue},
-    UblkIORes,
+    helpers::IoBuf,
+    io::{BufDesc, UblkDev, UblkQueue},
+    uring_async::ublk_wait_and_handle_ios,
+    UblkError,
 };
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
@@ -15,9 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
-
-const OPL_HANDLER_IDX: u32 = 0;
 
 #[derive(clap::Args, Debug, Clone)]
 pub(crate) struct CompressAddArgs {
@@ -137,127 +134,96 @@ fn handle_discard(
     Ok(0)
 }
 
-struct CompressTarget {
+async fn handle_compress_io_cmd_async(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    buf: &mut IoBuf<u8>,
+    db: &Arc<DB>,
+    lbs: u32,
+    read_only: bool,
+) -> Result<i32, i32> {
+    let iod = q.get_iod(tag);
+    let op = iod.op_flags & 0xff;
+
+    match op as u32 {
+        libublk::sys::UBLK_IO_OP_READ => {
+            let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, buf.len());
+            let buf_slice = &mut buf.as_mut_slice()[..buf_len];
+            handle_read(db, iod.start_sector, iod.nr_sectors, buf_slice, lbs)
+        }
+        libublk::sys::UBLK_IO_OP_WRITE => {
+            if read_only {
+                Err(-libc::EACCES)
+            } else {
+                let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, buf.len());
+                let buf_slice = &buf.as_slice()[..buf_len];
+                handle_write(db, iod.start_sector, iod.nr_sectors, buf_slice, lbs)
+            }
+        }
+        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(db),
+        libublk::sys::UBLK_IO_OP_DISCARD => {
+            if read_only {
+                Err(-libc::EACCES)
+            } else {
+                let cf = db.cf_handle("default").unwrap();
+                handle_discard(db, cf, iod.start_sector, iod.nr_sectors, lbs)
+            }
+        }
+        _ => Err(-libc::EINVAL),
+    }
+}
+
+async fn handle_queue_tag_async_compress(
+    q: Rc<UblkQueue<'_>>,
+    tag: u16,
     db: Arc<DB>,
     lbs: u32,
     read_only: bool,
-}
+) -> Result<(), UblkError> {
+    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
-fn handle_offload_fn(
-    db: &Arc<DB>,
-    lbs: u32,
-    job: OffloadJob,
-) -> Completion {
-    let res = match job.op as u32 {
-        libublk::sys::UBLK_IO_OP_READ => {
-            let buf_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    job.buf_addr as *mut u8,
-                    (job.nr_sectors << 9) as usize,
-                )
-            };
-            handle_read(db, job.start_sector, job.nr_sectors, buf_slice, lbs)
+    // Submit initial prep command
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+        .await?;
+    loop {
+        let res = handle_compress_io_cmd_async(&q, tag, &mut buf, &db, lbs, read_only).await;
+        let buf_desc = BufDesc::Slice(buf.as_slice());
+        match res {
+            Ok(result) => {
+                q.submit_io_commit_cmd(tag, buf_desc, result).await?;
+            }
+            Err(error) => {
+                q.submit_io_commit_cmd(tag, buf_desc, error).await?;
+            }
         }
-        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(db),
-        _ => Err(-libc::EINVAL),
-    };
-    Completion {
-        tag: job.tag,
-        result: res,
-        buf_addr: job.buf_addr,
     }
 }
 
-impl<'a> OffloadTargetLogic<'a> for CompressTarget {
-    fn setup_offload_handlers(&self, handler: &mut QueueHandler<'a, Self>) {
-        let db = self.db.clone();
-        let lbs = self.lbs;
-        handler.offload_handlers[OPL_HANDLER_IDX as usize] = Some(OffloadHandler::new(
-            move |job: OffloadJob| handle_offload_fn(&db, lbs, job),
-        ));
+fn q_async_fn(qid: u16, dev: &UblkDev, db: Arc<DB>) -> Result<(), UblkError> {
+    let depth = dev.dev_info.queue_depth;
+    let q_rc = Rc::new(UblkQueue::new(qid, dev)?);
+    let exe = smol::LocalExecutor::new();
+    let mut f_vec = Vec::new();
+    let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
+    let read_only = (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0;
+
+    for tag in 0..depth {
+        let q = q_rc.clone();
+        let db = db.clone();
+        f_vec.push(exe.spawn(async move {
+            match handle_queue_tag_async_compress(q, tag, db, lbs, read_only).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) => log::error!(
+                    "handle_queue_tag_async_compress failed for tag {}: {}",
+                    tag,
+                    e
+                ),
+            }
+        }));
     }
-
-    fn handle_io(
-        &self,
-        handler: &mut QueueHandler<'a, Self>,
-        tag: u16,
-        io_ctx: &UblkIOCtx,
-        buf: Option<&mut [u8]>,
-    ) -> Result<i32, i32> {
-        if io_ctx.is_tgt_io() && io_ctx.get_tag() as u16 == crate::offload::handler::POLL_TAG {
-            let handler_idx = UblkIOCtx::user_data_to_op(io_ctx.user_data()) as usize;
-            if let Some(Some(h)) = handler.offload_handlers.get_mut(handler_idx) {
-                h.handle_completion(handler.q, handler_idx as u32);
-            }
-            return Ok(0);
-        }
-
-        let q = handler.q;
-        let iod = q.get_iod(tag);
-        let op = (iod.op_flags & 0xff) as u16;
-        let buf = buf.unwrap();
-
-        let res = match op as u32 {
-            libublk::sys::UBLK_IO_OP_READ | libublk::sys::UBLK_IO_OP_FLUSH => {
-                if let Some(Some(h)) = handler.offload_handlers.get(OPL_HANDLER_IDX as usize) {
-                    h.send_job(op, tag, iod, buf);
-                }
-                return Ok(0);
-            }
-            libublk::sys::UBLK_IO_OP_WRITE => {
-                if self.read_only {
-                    Err(-libc::EACCES)
-                } else {
-                    handle_write(&self.db, iod.start_sector, iod.nr_sectors, buf, self.lbs)
-                }
-            }
-            libublk::sys::UBLK_IO_OP_DISCARD => {
-                if self.read_only {
-                    Err(-libc::EACCES)
-                } else {
-                    let cf = self.db.cf_handle("default").unwrap();
-                    handle_discard(&self.db, cf, iod.start_sector, iod.nr_sectors, self.lbs)
-                }
-            }
-            _ => Err(-libc::EINVAL),
-        };
-
-        let result = match res {
-            Ok(r) => UblkIORes::Result(r),
-            Err(e) => UblkIORes::Result(e),
-        };
-        q.complete_io_cmd_unified(tag, BufDesc::Slice(buf), Ok(result)).unwrap();
-        Ok(0)
-    }
-}
-
-fn q_sync_fn(qid: u16, dev: &UblkDev, db: &Arc<DB>) {
-    let mut bufs = dev.alloc_queue_io_bufs();
-    let q = UblkQueue::new(qid, dev)
-        .unwrap()
-        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap();
-
-    let target = CompressTarget {
-        db: db.clone(),
-        lbs: 1u32 << dev.tgt.params.basic.logical_bs_shift,
-        read_only: (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0,
-    };
-    let mut handler = crate::offload::handler::QueueHandler::new(&q, &target);
-    let max_io_buf_bytes = dev.dev_info.max_io_buf_bytes as usize;
-
-    let io_handler = |_q: &UblkQueue, tag: u16, io_ctx: &UblkIOCtx| {
-        if io_ctx.is_tgt_io() && tag == crate::offload::handler::POLL_TAG {
-            handler.handle_event(tag, io_ctx, None);
-        } else {
-            let iod = q.get_iod(tag);
-            let buf_len =
-                std::cmp::min((iod.nr_sectors << 9) as usize, max_io_buf_bytes);
-            let buf = &mut bufs[tag as usize].as_mut()[..buf_len];
-            handler.handle_event(tag, io_ctx, Some(buf));
-        }
-    };
-
-    q.wait_and_handle_io(io_handler);
+    ublk_wait_and_handle_ios(&exe, &q_rc);
+    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+    Ok(())
 }
 
 fn parse_compression_type(s: &str) -> anyhow::Result<DBCompressionType> {
@@ -379,6 +345,7 @@ pub(crate) fn ublk_add_compress(
 ) -> anyhow::Result<i32> {
     let (db_path, size, compression, lbs, pbs, args_opt) = parse_and_load_config(&ctrl, &opt)?;
     let read_only = args_opt.as_ref().is_some_and(|o| o.gen_arg.read_only);
+
     let db = setup_database(&db_path, &compression, lbs, read_only)?;
     let db_arc = Arc::new(db);
     let db_for_handler = db_arc.clone();
@@ -415,20 +382,28 @@ pub(crate) fn ublk_add_compress(
         Ok(())
     };
 
-    let q_handler = move |qid, dev: &_| q_sync_fn(qid, dev, &db_for_handler);
+    let q_handler = move |qid, dev: &_| {
+        let result = q_async_fn(qid, dev, db_for_handler.clone());
+        if let Err(e) = result {
+            log::error!("Queue handler failed for queue {}: {}", qid, e);
+        }
+    };
 
     let comm = comm_arc.clone();
-    let run_result = ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
-        comm.send_dev_id(dev.dev_info().dev_id).unwrap();
-    });
+    match ctrl.run_target(tgt_init, q_handler, move |dev: &UblkCtrl| {
+        if let Err(e) = comm.send_dev_id(dev.dev_info().dev_id) {
+            log::error!("Failed to send device ID: {}", e);
+        }
+    }) {
+        Ok(_) => {}
+        Err(e) => log::error!("Failed to run target: {}", e),
+    }
 
     if !read_only {
         log::info!("ublk device stopped, flushing RocksDB before exit...");
         db_arc.flush()?;
         log::info!("Final RocksDB flush successful.");
     }
-
-    run_result.unwrap();
 
     Ok(0)
 }

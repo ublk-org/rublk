@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub mod handler;
 
 use crate::offload::handler::QueueHandler;
