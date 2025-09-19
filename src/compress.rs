@@ -58,6 +58,7 @@ struct CompressQueue<'a> {
     q: &'a UblkQueue<'a>,
     eventfd: EventFd,
     eventfd_reading: RefCell<bool>,
+    stopping: RefCell<bool>,
 }
 
 impl<'a> CompressQueue<'a> {
@@ -67,6 +68,7 @@ impl<'a> CompressQueue<'a> {
             q,
             eventfd,
             eventfd_reading: RefCell::new(false),
+            stopping: RefCell::new(false),
         })
     }
 }
@@ -275,7 +277,7 @@ async fn handle_queue_tag_async_compress(
 async fn handle_eventfd(cq: &CompressQueue<'_>) -> Result<(), UblkError> {
     let mut buf = [0u8; 8];
     loop {
-        if cq.q.is_stopping() {
+        if *cq.stopping.borrow() {
             break;
         }
 
@@ -283,32 +285,54 @@ async fn handle_eventfd(cq: &CompressQueue<'_>) -> Result<(), UblkError> {
         let eventfd = cq.eventfd.as_raw_fd();
         let sqe =
             io_uring::opcode::Read::new(io_uring::types::Fd(eventfd), buf.as_mut_ptr(), 8).build();
-        log::info!("before eventfd reading");
+        log::debug!("before eventfd reading");
         cq.q.ublk_submit_sqe(sqe).await;
         *cq.eventfd_reading.borrow_mut() = false;
-        log::info!("after eventfd reading");
+        log::debug!("after eventfd reading");
     }
     Ok(())
 }
 
-async fn reap_events(
-    q: &UblkQueue<'_>,
+async fn __reap_events(cq: &CompressQueue<'_>) -> Result<bool, UblkError> {
+    libublk::io::with_queue_ring_mut(cq.q, |r: &mut IoUring<squeue::Entry>| {
+        let mut res = false;
+        loop {
+            match r.completion().next() {
+                Some(cqe) => {
+                    let user_data = cqe.user_data();
+                    ublk_wake_task(user_data, &cqe);
+                    res = cqe.result() == libublk::sys::UBLK_IO_RES_ABORT;
+                }
+                _ => break,
+            };
+        }
+        Ok(res)
+    })
+}
+
+async fn submit_and_reap_events(
+    exe: &smol::LocalExecutor<'_>,
+    cq: &CompressQueue<'_>,
     async_uring: &smol::Async<std::fs::File>,
-) -> Result<(), UblkError> {
-    with_queue_ring_mut(q, |r| r.submit())?;
+    nr_wait: usize,
+) -> Result<bool, UblkError> {
     log::info!("before readable tid {}", unsafe { libc::gettid() });
+    with_queue_ring_mut(cq.q, |r| r.submit_and_wait(nr_wait))?;
     async_uring
         .readable()
         .await
         .map_err(|_| UblkError::OtherError(-libc::EIO))?;
     log::info!("after readable {}", unsafe { libc::gettid() });
-    q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 0)?;
-    Ok(())
+    let res = __reap_events(cq).await?;
+    while exe.try_tick() {}
+    Ok(res)
 }
 
-async fn handle_uring_events(
+async fn handle_uring_events<T>(
     exe: &smol::LocalExecutor<'_>,
     cq: &CompressQueue<'_>,
+    tasks: Vec<smol::Task<T>>,
+    evtfd_task: smol::Task<T>,
 ) -> Result<(), UblkError> {
     let q = cq.q;
     // Register io_uring FD with smol's async reactor
@@ -318,31 +342,33 @@ async fn handle_uring_events(
 
     smol::future::yield_now().await;
     loop {
-        if q.is_stopping() {
-            break;
-        }
-        reap_events(q, &async_uring).await?;
-        while exe.try_tick() {}
-    }
-    // Only do these operations if eventfd reading is active
-    if *cq.eventfd_reading.borrow() {
-        log::info!("write to eventfd {}", unsafe { libc::gettid() });
-        nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
-        libublk::io::with_queue_ring_mut(cq.q, |r: &mut IoUring<squeue::Entry>| {
-            let c = match r.submit_and_wait(1) {
-                Err(_) => None,
-                _ => r.completion().next(),
-            };
-            match c {
-                Some(cqe) => {
-                    let user_data = cqe.user_data();
-                    log::info!("wait task user_data {:x}", user_data);
-                    libublk::uring_async::ublk_wake_task(user_data, &cqe);
-                }
-                _ => {}
+        let aborted = submit_and_reap_events(exe, cq, &async_uring, 0).await?;
+        if aborted {
+            if tasks.iter().all(|task| task.is_finished()) {
+                break;
             }
-        })
+        }
     }
+
+    log::info!("all io tasks are done {}", unsafe { libc::gettid() });
+    while !evtfd_task.is_finished() {
+        // Only do these operations if eventfd reading is active
+        *cq.stopping.borrow_mut() = true;
+        if *cq.eventfd_reading.borrow() {
+            log::info!("write to eventfd {}", unsafe { libc::gettid() });
+            nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+            let _ = submit_and_reap_events(exe, cq, &async_uring, 1).await?;
+        }
+    }
+    log::info!("eventfd task is done {}", unsafe { libc::gettid() });
+
+    // Prevent the File wrapper from closing the fd when dropped
+    // since the original io_uring instance still owns it
+    let _ = async_uring.into_inner().map(|f| {
+        use std::os::fd::IntoRawFd;
+        f.into_raw_fd()
+    });
+
     Ok(())
 }
 
@@ -372,21 +398,21 @@ fn q_async_fn(qid: u16, dev: &UblkDev, db: Arc<DB>) -> Result<(), UblkError> {
     }
 
     let cq = cq_rc.clone();
-    f_vec.push(exe.spawn(async move {
+    let evt_task = exe.spawn(async move {
         if let Err(e) = handle_eventfd(&cq).await {
             log::error!("handle_eventfd failed: {}", e);
         }
-    }));
+    });
 
     let cq = cq_rc.clone();
     let exe2 = exe_rc.clone();
-    f_vec.push(exe.spawn(async move {
-        if let Err(e) = handle_uring_events(&exe2, &cq).await {
+    let real_exe = exe.spawn(async move {
+        if let Err(e) = handle_uring_events(&exe2, &cq, f_vec, evt_task).await {
             log::error!("handle_uring_events failed: {}", e);
         }
-    }));
+    });
 
-    smol::block_on(exe_rc.run(async { futures::future::join_all(f_vec).await }));
+    smol::block_on(exe_rc.run(async move { real_exe.await }));
     Ok(())
 }
 
