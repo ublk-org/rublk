@@ -20,8 +20,6 @@ mod args;
 mod compress;
 mod r#loop;
 mod null;
-#[cfg(feature = "compress")]
-mod offload;
 #[cfg(feature = "vram")]
 mod opencl;
 mod qcow2;
