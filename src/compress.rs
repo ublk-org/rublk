@@ -62,6 +62,11 @@ impl<'a> CompressQueue<'a> {
         let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)?;
         Ok(CompressQueue { q, eventfd })
     }
+
+    fn notify_blocking_io_done(&self) -> anyhow::Result<()> {
+        nix::unistd::write(&self.eventfd, &1u64.to_le_bytes())?;
+        Ok(())
+    }
 }
 
 fn __handle_read(
@@ -120,7 +125,9 @@ async fn handle_read(
     })
     .await;
 
-    nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+    cq.notify_blocking_io_done().unwrap_or_else(|e| {
+        log::error!("Failed to notify blocking I/O done: {}", e);
+    });
     res
 }
 
@@ -139,7 +146,9 @@ async fn handle_flush(cq: &CompressQueue<'_>, db: Arc<DB>) -> Result<i32, i32> {
     // Offload to thread pool
     let res = smol::unblock(move || __handle_flush(&db_clone)).await;
     // Notify via eventfd
-    nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+    cq.notify_blocking_io_done().unwrap_or_else(|e| {
+        log::error!("Failed to notify blocking I/O done: {}", e);
+    });
     res
 }
 
