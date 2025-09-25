@@ -898,9 +898,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.6"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c2f96dfbc20c12b9b4f12eef60472d8c29b9c3f29463570dcb47e4a48551168"
+checksum = "d93587f37623a1a17d94ef2bc9ada592f5465fe7732084ab7beefabe5c77c0c4"
 dependencies = [
  "bitflags 2.8.0",
  "cfg-if",
@@ -982,9 +982,9 @@ dependencies = [
 
 [[package]]
 name = "libublk"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b3b3da0e48072f2cf600ccb550e6972f6db8dcdb93828247b18c14b493b3990"
+checksum = "8f04dfe83ab33e49161882b6113c0ab5af4fb69fa001a0b393ff70209fee5c39"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -993,7 +993,7 @@ dependencies = [
  "bitmaps",
  "derive_setters",
  "futures-timer",
- "io-uring 0.7.6",
+ "io-uring 0.7.9",
  "libc",
  "log",
  "regex",
@@ -1445,7 +1445,7 @@ dependencies = [
  "env_logger",
  "futures",
  "ilog",
- "io-uring 0.7.6",
+ "io-uring 0.7.9",
  "libc",
  "libublk",
  "log",
