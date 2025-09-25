@@ -446,7 +446,9 @@ fn main() {
     }
 
     match cli.command {
-        Commands::Add(opt) => ublk_add(opt).unwrap(),
+        Commands::Add(opt) => {
+            ublk_add(opt).expect("Fail to add ublk, pass --foreground for getting detailed error\n")
+        }
         Commands::Del(opt) => ublk_del(opt).unwrap(),
         Commands::List(opt) => ublk_list(opt).unwrap(),
         Commands::Recover(opt) => ublk_recover(opt).unwrap(),
