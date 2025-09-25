@@ -12,7 +12,7 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_APPEND, UBLK_IO_OP_ZONE_CLOSE, UBLK_IO_OP_ZONE_FINISH, UBLK_IO_OP_ZONE_OPEN,
     UBLK_IO_OP_ZONE_RESET, UBLK_IO_OP_ZONE_RESET_ALL,
 };
-use libublk::uring_async::ublk_wait_and_handle_ios;
+use libublk::wait_and_handle_io_events;
 use libublk::{ctrl::UblkCtrl, io::BufDesc, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError};
 
 use anyhow::bail;
@@ -1299,7 +1299,8 @@ pub(crate) fn ublk_add_zoned(
 
     let q_handler = move |qid: u16, dev: &UblkDev| {
         let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
-        let exe = smol::LocalExecutor::new();
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
         let mut f_vec = Vec::new();
 
         //// `q_handler` closure implements Clone()
@@ -1318,8 +1319,15 @@ pub(crate) fn ublk_add_zoned(
                 }
             }));
         }
-        ublk_wait_and_handle_ios(&exe, &q_rc);
-        smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+
+        smol::block_on(exe_rc.run(async move {
+            let run_ops = || while exe.try_tick() {};
+            let done = || f_vec.iter().all(|task| task.is_finished());
+
+            if let Err(e) = wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+                log::error!("zoned queue wait_and_handle_io_events failed: {}", e);
+            }
+        }));
     };
 
     let comm = comm_arc.clone();
