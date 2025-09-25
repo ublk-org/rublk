@@ -2,8 +2,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue},
-    wait_and_handle_io_events,
-    UblkError, UblkIORes,
+    wait_and_handle_io_events, UblkError, UblkIORes,
 };
 use std::rc::Rc;
 use std::sync::Arc;
