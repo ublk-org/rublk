@@ -17,7 +17,7 @@ pub(crate) struct VramAddArgs {
 
     /// Size of the block device (e.g., 512MiB, 2GiB).
     #[clap(long, default_value = "2GiB")]
-    size: Option<String>,
+    size: String,
 
     /// OCL device index to use (0 for first OCL)
     #[clap(long, default_value = "0")]
@@ -204,10 +204,11 @@ pub(crate) fn ublk_add_vram(
         anyhow::bail!("vram device can't support recovery");
     }
 
-    let size = match &vram_args.size {
-        Some(size_str) => parse_size::parse_size(size_str)?,
-        _ => 2 << 30,
+    let size = match parse_size::parse_size(&vram_args.size) {
+        Ok(sz) => sz,
+        _ => 2 << 20,
     };
+
     let mut config = VRamBufferConfig {
         platform_index: vram_args.platform,
         device_index: vram_args.device,
