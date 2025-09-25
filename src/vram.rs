@@ -3,7 +3,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{UblkDev, UblkQueue},
-    uring_async::ublk_wait_and_handle_ios,
+    wait_and_handle_io_events,
     UblkError,
 };
 use std::rc::Rc;
@@ -171,7 +171,8 @@ fn q_fn(qid: u16, dev: &UblkDev, vrams: Arc<Vec<VRamBuffer>>) {
             return;
         }
     };
-    let exe = smol::LocalExecutor::new();
+    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let exe = exe_rc.clone();
     let mut f_vec = Vec::new();
 
     for tag in 0..dev.dev_info.queue_depth {
@@ -185,8 +186,14 @@ fn q_fn(qid: u16, dev: &UblkDev, vrams: Arc<Vec<VRamBuffer>>) {
         }));
     }
 
-    ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(async { futures::future::join_all(f_vec).await });
+    smol::block_on(exe_rc.run(async move {
+        let run_ops = || while exe.try_tick() {};
+        let done = || f_vec.iter().all(|task| task.is_finished());
+
+        if let Err(e) = wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+            log::error!("vram queue {} wait_and_handle_io_events failed: {}", qid, e);
+        }
+    }));
 }
 
 pub(crate) fn ublk_add_vram(

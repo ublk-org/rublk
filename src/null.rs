@@ -2,7 +2,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue},
-    uring_async::ublk_wait_and_handle_ios,
+    wait_and_handle_io_events,
     UblkError, UblkIORes,
 };
 use std::rc::Rc;
@@ -141,7 +141,8 @@ async fn handle_queue_tag_async_null(
 fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError> {
     let depth = dev.dev_info.queue_depth;
     let q_rc = Rc::new(UblkQueue::new(qid, dev)?);
-    let exe = smol::LocalExecutor::new();
+    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let exe = exe_rc.clone();
     let mut f_vec = Vec::new();
 
     for tag in 0..depth {
@@ -153,8 +154,14 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError>
             }
         }));
     }
-    ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+    smol::block_on(exe_rc.run(async move {
+        let run_ops = || while exe.try_tick() {};
+        let done = || f_vec.iter().all(|task| task.is_finished());
+
+        if let Err(e) = wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+            log::error!("handle_uring_events failed: {}", e);
+        }
+    }));
     Ok(())
 }
 
