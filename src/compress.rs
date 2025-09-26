@@ -1,3 +1,4 @@
+use crate::notifier::Notifier;
 use io_uring::{opcode, types};
 use libublk::{
     ctrl::UblkCtrl,
@@ -6,7 +7,6 @@ use libublk::{
     uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task},
     UblkError, UblkUringData,
 };
-use nix::sys::eventfd::{EfdFlags, EventFd};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
     WriteOptions, DB,
@@ -54,18 +54,13 @@ struct CompressJson {
 
 struct CompressQueue<'a> {
     q: &'a UblkQueue<'a>,
-    eventfd: EventFd,
+    notifier: Notifier,
 }
 
 impl<'a> CompressQueue<'a> {
     fn new(q: &'a UblkQueue<'a>) -> Result<Self, std::io::Error> {
-        let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)?;
-        Ok(CompressQueue { q, eventfd })
-    }
-
-    fn notify_blocking_io_done(&self) -> anyhow::Result<()> {
-        nix::unistd::write(&self.eventfd, &1u64.to_le_bytes())?;
-        Ok(())
+        let notifier = Notifier::new()?;
+        Ok(CompressQueue { q, notifier })
     }
 }
 
@@ -125,7 +120,7 @@ async fn handle_read(
     })
     .await;
 
-    cq.notify_blocking_io_done().unwrap_or_else(|e| {
+    cq.notifier.notify().unwrap_or_else(|e| {
         log::error!("Failed to notify blocking I/O done: {}", e);
     });
     res
@@ -146,7 +141,7 @@ async fn handle_flush(cq: &CompressQueue<'_>, db: Arc<DB>) -> Result<i32, i32> {
     // Offload to thread pool
     let res = smol::unblock(move || __handle_flush(&db_clone)).await;
     // Notify via eventfd
-    cq.notify_blocking_io_done().unwrap_or_else(|e| {
+    cq.notifier.notify().unwrap_or_else(|e| {
         log::error!("Failed to notify blocking I/O done: {}", e);
     });
     res
@@ -271,17 +266,12 @@ async fn handle_queue_tag_async_compress(
 }
 
 async fn handle_eventfd(cq: &CompressQueue<'_>) -> Result<(), UblkError> {
-    let mut buf = [0u8; 8];
     loop {
         if cq.q.is_stopping() {
             break;
         }
 
-        let eventfd = cq.eventfd.as_raw_fd();
-        let sqe =
-            io_uring::opcode::Read::new(io_uring::types::Fd(eventfd), buf.as_mut_ptr(), 8).build();
-        log::debug!("before eventfd reading");
-        cq.q.ublk_submit_sqe(sqe).await;
+        cq.notifier.event_read(cq.q).await?;
         log::debug!("after eventfd reading");
     }
     Ok(())
@@ -319,7 +309,9 @@ async fn handle_uring_events<T>(
             Ok(false)
         } else {
             log::debug!("write to eventfd {}", unsafe { libc::gettid() });
-            nix::unistd::write(&cq.eventfd, &1u64.to_le_bytes()).unwrap();
+            cq.notifier.notify().unwrap_or_else(|e| {
+                log::error!("Failed to notify via eventfd: {}", e);
+            });
             Err(UblkError::QueueIsDown)
         }
     };
