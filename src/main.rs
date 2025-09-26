@@ -19,6 +19,8 @@ mod args;
 #[cfg(feature = "compress")]
 mod compress;
 mod r#loop;
+#[cfg(feature = "compress")]
+mod notifier;
 mod null;
 #[cfg(feature = "vram")]
 mod opencl;
