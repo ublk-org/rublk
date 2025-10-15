@@ -17,7 +17,7 @@ maintenance = { status = "actively-developed" }
 
 [dependencies]
 qcow2-rs = "0.1"
-libublk = "0.4.4"
+libublk = "0.4.5"
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
 libc = "0.2"
