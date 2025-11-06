@@ -320,7 +320,9 @@ async fn handle_uring_events<T>(
         ublk_reap_io_events_with_update_queue(q, poll_timeout, Some(TIMEOUT_USER_DATA), |cqe| {
             // Handle normal CQEs by waking tasks
             // Timeout CQEs are handled internally by ublk_reap_io_events_with_update_queue
-            ublk_wake_task(cqe.user_data(), cqe);
+            if cqe.user_data() != TIMEOUT_USER_DATA {
+                ublk_wake_task(cqe.user_data(), cqe);
+            }
         })
     };
     let run_ops = || while exe.try_tick() {};
