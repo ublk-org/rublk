@@ -902,6 +902,7 @@ version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d93587f37623a1a17d94ef2bc9ada592f5465fe7732084ab7beefabe5c77c0c4"
 dependencies = [
+ "bindgen 0.69.5",
  "bitflags 2.8.0",
  "cfg-if",
  "libc",
@@ -982,26 +983,37 @@ dependencies = [
 
 [[package]]
 name = "libublk"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fee7b9ce29b86779425045540deb389ef4a40f9079014a822a496c513396895"
+checksum = "cd0cc4f0d9771dc50a2807a495e80287911d1bf4871fad45663753692db7c432"
 dependencies = [
- "anyhow",
  "async-lock",
- "bindgen 0.69.5",
  "bitflags 2.8.0",
  "bitmaps",
  "derive_setters",
  "futures-timer",
  "io-uring 0.7.9",
  "libc",
+ "libublk-rs-sys",
  "log",
- "regex",
  "serde",
  "serde_json",
  "slab",
  "smol",
  "thiserror 1.0.64",
+]
+
+[[package]]
+name = "libublk-rs-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ab204ac509937ddb9ca815e642e204f8944bb98c8f0dd613a7c2567c774e593"
+dependencies = [
+ "anyhow",
+ "bindgen 0.69.5",
+ "libc",
+ "regex",
+ "serde",
 ]
 
 [[package]]
