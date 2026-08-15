@@ -898,9 +898,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.9"
+version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d93587f37623a1a17d94ef2bc9ada592f5465fe7732084ab7beefabe5c77c0c4"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
 dependencies = [
  "bindgen 0.69.5",
  "bitflags 2.8.0",
@@ -983,16 +983,16 @@ dependencies = [
 
 [[package]]
 name = "libublk"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd0cc4f0d9771dc50a2807a495e80287911d1bf4871fad45663753692db7c432"
+checksum = "25d2e91aa5046a25e8aeef80f75d33e77645fc812e3cdf82f83678b89b47c028"
 dependencies = [
  "async-lock",
  "bitflags 2.8.0",
  "bitmaps",
  "derive_setters",
  "futures-timer",
- "io-uring 0.7.9",
+ "io-uring 0.7.12",
  "libc",
  "libublk-rs-sys",
  "log",
@@ -1005,9 +1005,9 @@ dependencies = [
 
 [[package]]
 name = "libublk-rs-sys"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ab204ac509937ddb9ca815e642e204f8944bb98c8f0dd613a7c2567c774e593"
+checksum = "e43961a17c2599912d3d6f3e5cd13f9275688f34cb14e9545e1cc34a605f6052"
 dependencies = [
  "anyhow",
  "bindgen 0.69.5",
@@ -1457,7 +1457,7 @@ dependencies = [
  "env_logger",
  "futures",
  "ilog",
- "io-uring 0.7.9",
+ "io-uring 0.7.12",
  "libc",
  "libublk",
  "log",
