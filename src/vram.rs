@@ -3,9 +3,8 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{UblkDev, UblkQueue},
-    wait_and_handle_io_events, UblkError,
+    UblkError, UblkRuntime,
 };
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::opencl::{list_opencl_devices, VRamBuffer, VRamBufferConfig, VramDevice};
@@ -47,14 +46,9 @@ pub(crate) struct VramCmd {
     pub(crate) list_opencl_dev: bool,
 }
 
-fn handle_io_cmd(
-    q: &UblkQueue<'_>,
-    tag: u16,
-    buf: &IoBuf<u8>,
-    vrams: &Arc<Vec<VRamBuffer>>,
-) -> i32 {
+fn handle_io_cmd(q: &UblkQueue, tag: u16, buf: &IoBuf<u8>, vrams: &Arc<Vec<VRamBuffer>>) -> i32 {
     let iod = q.get_iod(tag);
-    let global_limit = q.dev.tgt.dev_size;
+    let global_limit = q.dev().tgt.dev_size;
 
     let mut global_offset = global_limit.min(iod.start_sector << 9);
     let mut global_length = (iod.nr_sectors << 9) as usize;
@@ -143,12 +137,8 @@ fn handle_io_cmd(
     global_length as i32
 }
 
-async fn io_task(
-    q: &UblkQueue<'_>,
-    tag: u16,
-    vrams: Arc<Vec<VRamBuffer>>,
-) -> Result<(), UblkError> {
-    let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
+async fn io_task(q: &UblkQueue, tag: u16, vrams: Arc<Vec<VRamBuffer>>) -> Result<(), UblkError> {
+    let buf_bytes = q.dev().dev_info.max_io_buf_bytes as usize;
     let buf = IoBuf::<u8>::new(buf_bytes);
     let buf_desc = libublk::BufDesc::Slice(buf.as_slice());
 
@@ -162,37 +152,13 @@ async fn io_task(
     }
 }
 
-fn q_fn(qid: u16, dev: &UblkDev, vrams: Arc<Vec<VRamBuffer>>) {
-    let q_rc = match UblkQueue::new(qid, dev) {
-        Ok(queue) => Rc::new(queue),
-        Err(e) => {
-            log::error!("Failed to create queue {}: {}", qid, e);
-            return;
-        }
-    };
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
-
-    for tag in 0..dev.dev_info.queue_depth {
-        let q = q_rc.clone();
+fn q_fn(qid: u16, dev: &Arc<UblkDev>, vrams: Arc<Vec<VRamBuffer>>) {
+    if let Err(e) = UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
         let use_vram = vrams.clone();
-        f_vec.push(exe.spawn(async move {
-            match io_task(&q, tag, use_vram).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("vram io_task failed for tag {}: {}", tag, e),
-            }
-        }));
+        async move { io_task(&q, tag, use_vram).await }
+    }) {
+        log::error!("vram queue {} failed: {}", qid, e);
     }
-
-    smol::block_on(exe_rc.run(async move {
-        let run_ops = || while exe.try_tick() {};
-        let done = || f_vec.iter().all(|task| task.is_finished());
-
-        if let Err(e) = wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("vram queue {} wait_and_handle_io_events failed: {}", qid, e);
-        }
-    }));
 }
 
 pub(crate) fn ublk_add_vram(

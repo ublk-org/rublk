@@ -1,7 +1,8 @@
 use anyhow::Context;
 use io_uring::{opcode, squeue, types};
 use libublk::io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError, UblkIORes};
+use libublk::ops::{self, TgtFd};
+use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError, UblkRuntime};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
@@ -144,21 +145,53 @@ fn __lo_make_io_sqe(
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf: Option<&[u8]>) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) -> i32 {
+    /// The backing file registered at fixed-file index 1 by lo_init_tgt()
+    const BACK_FILE: TgtFd = TgtFd::Fixed(1);
+
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
         return res;
     }
 
-    let zc = buf.is_none();
+    let op = iod.op_flags & 0xff;
+    let off = iod.start_sector << 9;
+    let bytes = iod.nr_sectors << 9;
+
     for _ in 0..4 {
-        let sqe = if zc {
-            __lo_make_io_sqe_zc(iod, tag)
-        } else {
-            __lo_make_io_sqe(iod, buf)
+        // SAFETY: the queue-slot buffer (or the fixed-buffer slot for
+        // zero copy) outlives the await below.
+        let f = match op {
+            libublk::sys::UBLK_IO_OP_FLUSH => ops::fsync(BACK_FILE, false),
+            libublk::sys::UBLK_IO_OP_READ => match buf {
+                Some(b) => unsafe {
+                    ops::read_at_raw(BACK_FILE, b.as_ptr() as *mut u8, bytes, off)
+                },
+                None => unsafe {
+                    ops::read_at_fixed(BACK_FILE, tag, std::ptr::null_mut(), bytes, off)
+                },
+            },
+            libublk::sys::UBLK_IO_OP_WRITE => match buf {
+                Some(b) => unsafe { ops::write_at_raw(BACK_FILE, b.as_ptr(), bytes, off) },
+                None => unsafe {
+                    ops::write_at_fixed(BACK_FILE, tag, std::ptr::null(), bytes, off)
+                },
+            },
+            libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
+                ops::fallocate(
+                    BACK_FILE,
+                    lo_fallocate_mode(op, iod.op_flags >> 8),
+                    off,
+                    bytes as u64,
+                )
+            }
+            _ => return -libc::EINVAL,
         };
-        let res = q.ublk_submit_sqe(sqe).await;
+        let res = match f {
+            Ok(f) => f.await,
+            Err(e) => e.errno(),
+        };
         if res != -(libc::EAGAIN) {
             return res;
         }
@@ -228,7 +261,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
 
 #[inline]
 fn __lo_handle_io_cmd_sync(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     i: &UblkIOCtx,
     buf_desc: BufDesc,
@@ -245,28 +278,28 @@ fn __lo_handle_io_cmd_sync(
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(res)))?;
+            q.complete_io_cmd_unified(tag, buf_desc, res)?;
             return Ok(());
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(res)))?;
+        q.complete_io_cmd_unified(tag, buf_desc, res)?;
     } else {
         let zc = buf.is_none();
         let sqe = if zc {
-            __lo_make_io_sqe_zc(iod, tag).user_data(data)
+            __lo_make_io_sqe_zc(iod, tag)
         } else {
-            __lo_make_io_sqe(iod, buf).user_data(data)
+            __lo_make_io_sqe(iod, buf)
         };
-        q.ublk_submit_sqe_sync(sqe)?;
+        q.ublk_submit_sqe_sync(sqe, data)?;
     }
     Ok(())
 }
 
 fn lo_handle_io_cmd_sync(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     i: &UblkIOCtx,
     buf: Option<&[u8]>,
@@ -278,7 +311,7 @@ fn lo_handle_io_cmd_sync(
     __lo_handle_io_cmd_sync(q, tag, i, buf_desc, buf)
 }
 
-fn q_sync_fn_zc(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
+fn q_sync_fn_zc(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     let auto_buf_reg_list_rc = Rc::new(
         (0..dev.dev_info.queue_depth)
             .map(|tag| libublk::sys::ublk_auto_buf_reg {
@@ -303,7 +336,7 @@ fn q_sync_fn_zc(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
     Ok(())
 }
 
-fn q_sync_fn_buf(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
+fn q_sync_fn_buf(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
     let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
@@ -320,7 +353,7 @@ fn q_sync_fn_buf(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
     Ok(())
 }
 
-fn q_sync_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
+fn q_sync_fn(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     let flags = dev.dev_info.flags;
     if (flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
         q_sync_fn_zc(qid, dev)
@@ -331,7 +364,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
 
 #[inline]
 async fn __handle_queue_tag_async(
-    q: Rc<UblkQueue<'_>>,
+    q: Rc<UblkQueue>,
     tag: u16,
     buf: Option<&IoBuf<u8>>,
 ) -> Result<(), UblkError> {
@@ -354,42 +387,18 @@ async fn __handle_queue_tag_async(
     }
 }
 
-async fn handle_queue_tag_async(q: Rc<UblkQueue<'_>>, tag: u16) -> Result<(), UblkError> {
+async fn handle_queue_tag_async(q: Rc<UblkQueue>, tag: u16) -> Result<(), UblkError> {
     if q.support_auto_buf_zc() {
         __handle_queue_tag_async(q, tag, None).await
     } else {
-        let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+        let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
         __handle_queue_tag_async(q, tag, Some(&buf)).await
     }
 }
 
-fn q_a_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
-    let depth = dev.dev_info.queue_depth;
-    let q_rc = Rc::new(UblkQueue::new(qid, dev)?);
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
-
-    for tag in 0..depth {
-        let q = q_rc.clone();
-
-        f_vec.push(exe.spawn(async move {
-            match handle_queue_tag_async(q, tag).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("handle_queue_tag_async failed for tag {}: {}", tag, e),
-            }
-        }));
-    }
-    smol::block_on(exe_rc.run(async move {
-        let run_ops = || while exe.try_tick() {};
-        let done = || f_vec.iter().all(|task| task.is_finished());
-
-        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("handle_uring_events failed: {}", e);
-        }
-    }));
-    Ok(())
+fn q_a_fn(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
+    UblkRuntime::run_io_tasks(dev, qid, handle_queue_tag_async)
 }
 
 pub(crate) fn ublk_add_loop(
@@ -448,7 +457,7 @@ pub(crate) fn ublk_add_loop(
     let comm = comm_rc.clone();
     match ctrl.run_target(
         |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
-        move |qid, dev: &_| {
+        move |qid, dev: &Arc<UblkDev>| {
             let result = if lo.json.async_await {
                 q_a_fn(qid, dev)
             } else {

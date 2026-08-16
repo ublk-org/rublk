@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 use libublk::helpers::IoBuf;
+use libublk::ops::{self, TgtFd};
 use libublk::sys::ublksrv_io_desc;
 use libublk::sys::{
     BLK_ZONE_COND_CLOSED, BLK_ZONE_COND_EMPTY, BLK_ZONE_COND_EXP_OPEN, BLK_ZONE_COND_FULL,
@@ -12,12 +13,10 @@ use libublk::sys::{
     UBLK_IO_OP_ZONE_APPEND, UBLK_IO_OP_ZONE_CLOSE, UBLK_IO_OP_ZONE_FINISH, UBLK_IO_OP_ZONE_OPEN,
     UBLK_IO_OP_ZONE_RESET, UBLK_IO_OP_ZONE_RESET_ALL,
 };
-use libublk::wait_and_handle_io_events;
 use libublk::{ctrl::UblkCtrl, io::BufDesc, io::UblkDev, io::UblkIOCtx, io::UblkQueue, UblkError};
 
 use anyhow::bail;
 use bitflags::bitflags;
-use io_uring::{opcode, types};
 use libc::{c_void, memset, pread, pwrite};
 use log::trace;
 use std::fs::{File, OpenOptions};
@@ -482,7 +481,7 @@ impl ZonedTgt {
         }
     }
 
-    async fn back_file_preallocate(&self, q: &UblkQueue<'_>, sector: u64, nr_sects: u32) {
+    async fn back_file_preallocate(&self, sector: u64, nr_sects: u32) {
         let zfd = self.get_zone_fd(sector);
         let zsize = self.cfg.zone_size;
         let za_size = self.cfg.pre_alloc_size;
@@ -496,11 +495,9 @@ impl ZonedTgt {
         }
 
         let sz = za_end - za_start;
-        let sqe = opcode::Fallocate::new(types::Fd(zfd), sz)
-            .offset(za_start)
-            .mode(libc::FALLOC_FL_KEEP_SIZE)
-            .build();
-        let _ = q.ublk_submit_sqe(sqe).await;
+        if let Ok(op) = ops::fallocate(TgtFd::Raw(zfd), libc::FALLOC_FL_KEEP_SIZE, za_start, sz) {
+            let _ = op.await;
+        }
     }
 
     fn close_imp_open_zone(&self) -> anyhow::Result<()> {
@@ -791,7 +788,7 @@ fn handle_report_zones(
         let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
 
         libc::pwrite(
-            q.dev.tgt.fds[0],
+            q.dev().tgt.fds[0],
             buf_addr as *const libc::c_void,
             dsize.try_into().unwrap(),
             offset.try_into().unwrap(),
@@ -861,7 +858,7 @@ fn handle_read_copy(
 
 async fn handle_read(
     tgt: &ZonedTgt,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     iod: &ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
@@ -872,7 +869,7 @@ async fn handle_read(
 
     let bytes = (iod.nr_sectors << 9) as usize;
     let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
-    let fd = q.dev.tgt.fds[0];
+    let fd = q.dev().tgt.fds[0];
 
     if !tgt.ram_backed() {
         let zfd = tgt.get_zone_fd(iod.start_sector);
@@ -881,10 +878,18 @@ async fn handle_read(
         let zf_offset = (iod.start_sector << 9) & (tgt.cfg.zone_size - 1);
 
         //read to temp buffer from backed-file
-        let sqe = opcode::Read::new(types::Fd(zfd), buf_addr as *mut u8, bytes as u32)
-            .offset(zf_offset)
-            .build();
-        let res = q.ublk_submit_sqe(sqe).await;
+        // SAFETY: `buf` outlives the await below
+        let res = match unsafe {
+            ops::read_at_raw(
+                TgtFd::Raw(zfd),
+                buf_addr as *mut u8,
+                bytes as u32,
+                zf_offset,
+            )
+        } {
+            Ok(op) => op.await,
+            Err(e) => e.errno(),
+        };
         if res < 0 {
             return Err(anyhow::anyhow!("io uring read failure {}", res));
         }
@@ -901,14 +906,14 @@ async fn handle_read(
 
 async fn handle_plain_write(
     tgt: &ZonedTgt,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     start_sector: u64,
     nr_sectors: u32,
 ) -> anyhow::Result<i32> {
     let bytes = (nr_sectors << 9) as usize;
     let offset = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
-    let fd = q.dev.tgt.fds[0];
+    let fd = q.dev().tgt.fds[0];
 
     let res = if !tgt.ram_backed() {
         let zfd = tgt.get_zone_fd(start_sector);
@@ -923,10 +928,18 @@ async fn handle_plain_write(
         }
 
         // handle the write
-        let sqe = opcode::Write::new(types::Fd(zfd), buf_addr as *const u8, bytes as u32)
-            .offset(zf_offset)
-            .build();
-        q.ublk_submit_sqe(sqe).await
+        // SAFETY: `buf` outlives the await below
+        match unsafe {
+            ops::write_at_raw(
+                TgtFd::Raw(zfd),
+                buf_addr as *const u8,
+                bytes as u32,
+                zf_offset,
+            )
+        } {
+            Ok(op) => op.await,
+            Err(e) => e.errno(),
+        }
     } else {
         let off = start_sector << 9;
         let addr = (tgt.start + off) as *mut c_void;
@@ -942,7 +955,7 @@ async fn handle_plain_write(
 
 fn handle_flush(
     tgt: &ZonedTgt,
-    _q: &UblkQueue<'_>,
+    _q: &UblkQueue,
     _tag: u16,
     _iod: &libublk::sys::ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
@@ -960,7 +973,7 @@ fn handle_flush(
 
 async fn handle_write(
     tgt: &ZonedTgt,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     iod: &libublk::sys::ublksrv_io_desc,
     append: bool,
@@ -1025,7 +1038,7 @@ async fn handle_write(
 
     // preallocate space for this zone
     if !tgt.ram_backed() {
-        tgt.back_file_preallocate(q, sector, iod.nr_sectors).await;
+        tgt.back_file_preallocate(sector, iod.nr_sectors).await;
     }
 
     let res = handle_plain_write(tgt, q, tag, sector, iod.nr_sectors).await?;
@@ -1055,8 +1068,8 @@ async fn handle_write(
 }
 
 async fn handle_queue_tag_async_zoned(
-    q: Rc<UblkQueue<'_>>,
-    ztgt_io: Rc<&Arc<ZonedTgt>>,
+    q: Rc<UblkQueue>,
+    ztgt_io: Arc<ZonedTgt>,
     tag: u16,
 ) -> Result<(), UblkError> {
     let mut lba = 0_u64;
@@ -1094,11 +1107,7 @@ async fn handle_queue_tag_async_zoned(
     Ok(())
 }
 
-async fn zoned_handle_io(
-    tgt: &ZonedTgt,
-    q: &UblkQueue<'_>,
-    tag: u16,
-) -> anyhow::Result<(i32, u64)> {
+async fn zoned_handle_io(tgt: &ZonedTgt, q: &UblkQueue, tag: u16) -> anyhow::Result<(i32, u64)> {
     let iod = q.get_iod(tag);
     let mut sector: u64 = 0;
     let bytes;
@@ -1286,7 +1295,6 @@ pub(crate) fn ublk_add_zoned(
     };
 
     let zoned_tgt = Arc::new(ZonedTgt::new(cfg, is_new)?);
-    let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
         Some(f) => {
@@ -1297,37 +1305,14 @@ pub(crate) fn ublk_add_zoned(
         _ => return Err(anyhow::anyhow!("zoned isn't supported until v6.6 kernel")),
     }
 
-    let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-        let mut f_vec = Vec::new();
-
-        //// `q_handler` closure implements Clone()
-        let ztgt_q = Rc::new(&zoned_tgt);
-
-        for tag in 0..depth {
-            let q = q_rc.clone();
-            let ztgt_io = ztgt_q.clone();
-
-            f_vec.push(exe.spawn(async move {
-                match handle_queue_tag_async_zoned(q, ztgt_io, tag).await {
-                    Err(UblkError::QueueIsDown) | Ok(_) => {}
-                    Err(e) => {
-                        log::error!("handle_queue_tag_async_zoned failed for tag {}: {}", tag, e)
-                    }
-                }
-            }));
+    let q_handler = move |qid: u16, dev: &Arc<UblkDev>| {
+        let ztgt = zoned_tgt.clone();
+        if let Err(e) = libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+            let ztgt_io = ztgt.clone();
+            async move { handle_queue_tag_async_zoned(q, ztgt_io, tag).await }
+        }) {
+            log::error!("zoned queue {} failed: {}", qid, e);
         }
-
-        smol::block_on(exe_rc.run(async move {
-            let run_ops = || while exe.try_tick() {};
-            let done = || f_vec.iter().all(|task| task.is_finished());
-
-            if let Err(e) = wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-                log::error!("zoned queue wait_and_handle_io_events failed: {}", e);
-            }
-        }));
     };
 
     let comm = comm_arc.clone();

@@ -1,11 +1,9 @@
 use crate::notifier::Notifier;
-use io_uring::{opcode, types};
 use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
-    io::{with_task_io_ring, with_task_io_ring_mut, BufDesc, UblkDev, UblkQueue},
-    uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task},
-    UblkError, UblkUringData,
+    io::{BufDesc, UblkDev, UblkQueue},
+    UblkError, UblkRuntime,
 };
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
@@ -14,8 +12,6 @@ use rocksdb::{
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -52,16 +48,34 @@ struct CompressJson {
     physical_block_size: u32,
 }
 
-struct CompressQueue<'a> {
-    q: &'a UblkQueue<'a>,
-    notifier: Notifier,
+struct CompressQueue {
+    q: Rc<UblkQueue>,
+    notifier: Arc<Notifier>,
 }
 
-impl<'a> CompressQueue<'a> {
-    fn new(q: &'a UblkQueue<'a>) -> Result<Self, std::io::Error> {
-        let notifier = Notifier::new()?;
+impl CompressQueue {
+    fn new(q: Rc<UblkQueue>) -> Result<Self, std::io::Error> {
+        let notifier = Arc::new(Notifier::new()?);
         Ok(CompressQueue { q, notifier })
     }
+}
+
+/// Run `f` on the blocking thread pool. The result is published before the
+/// notifier fires, so the eventfd CQE that wakes the parked queue thread
+/// always finds the receiver ready.
+async fn unblock<T, F>(notifier: Arc<Notifier>, f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    libublk::tokio::task::spawn_blocking(move || {
+        let _ = tx.send(f());
+        notifier.notify().unwrap_or_else(|e| {
+            log::error!("Failed to notify blocking work done: {}", e);
+        });
+    });
+    rx.await.expect("blocking worker dropped its result")
 }
 
 fn __handle_read(
@@ -100,7 +114,7 @@ fn __handle_read(
 }
 
 async fn handle_read(
-    cq: &CompressQueue<'_>,
+    cq: &CompressQueue,
     db: Arc<DB>,
     start_sector: u64,
     nr_sectors: u32,
@@ -112,18 +126,12 @@ async fn handle_read(
     let db_clone = db.clone();
 
     // Offload to thread pool
-    let res = smol::unblock(move || {
+    unblock(cq.notifier.clone(), move || {
         // Reconstruct the slice safely since the buffer outlive the closure
         let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len) };
-        let res = __handle_read(&db_clone, start_sector, nr_sectors, buf_slice, lbs);
-        res
+        __handle_read(&db_clone, start_sector, nr_sectors, buf_slice, lbs)
     })
-    .await;
-
-    cq.notifier.notify().unwrap_or_else(|e| {
-        log::error!("Failed to notify blocking I/O done: {}", e);
-    });
-    res
+    .await
 }
 
 fn __handle_flush(db: &DB) -> Result<i32, i32> {
@@ -135,16 +143,11 @@ fn __handle_flush(db: &DB) -> Result<i32, i32> {
     }
 }
 
-async fn handle_flush(cq: &CompressQueue<'_>, db: Arc<DB>) -> Result<i32, i32> {
+async fn handle_flush(cq: &CompressQueue, db: Arc<DB>) -> Result<i32, i32> {
     let db_clone = db.clone();
 
     // Offload to thread pool
-    let res = smol::unblock(move || __handle_flush(&db_clone)).await;
-    // Notify via eventfd
-    cq.notifier.notify().unwrap_or_else(|e| {
-        log::error!("Failed to notify blocking I/O done: {}", e);
-    });
-    res
+    unblock(cq.notifier.clone(), move || __handle_flush(&db_clone)).await
 }
 
 fn handle_write(
@@ -190,7 +193,7 @@ fn handle_discard(
 }
 
 async fn handle_compress_io_cmd_async(
-    cq: &CompressQueue<'_>,
+    cq: &CompressQueue,
     tag: u16,
     buf: &mut IoBuf<u8>,
     db: &Arc<DB>,
@@ -240,13 +243,13 @@ async fn handle_compress_io_cmd_async(
 }
 
 async fn handle_queue_tag_async_compress(
-    cq: &CompressQueue<'_>,
+    cq: &CompressQueue,
     tag: u16,
     db: Arc<DB>,
     lbs: u32,
     read_only: bool,
 ) -> Result<(), UblkError> {
-    let mut buf = IoBuf::<u8>::new(cq.q.dev.dev_info.max_io_buf_bytes as usize);
+    let mut buf = IoBuf::<u8>::new(cq.q.dev().dev_info.max_io_buf_bytes as usize);
 
     // Submit initial prep command
     cq.q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
@@ -265,121 +268,64 @@ async fn handle_queue_tag_async_compress(
     }
 }
 
-async fn handle_eventfd(cq: &CompressQueue<'_>) -> Result<(), UblkError> {
+async fn handle_eventfd(cq: &CompressQueue) -> Result<(), UblkError> {
     loop {
         if cq.q.is_stopping() {
             break;
         }
 
-        cq.notifier.event_read(cq.q).await?;
+        cq.notifier.event_read().await?;
         log::debug!("after eventfd reading");
     }
     Ok(())
 }
 
-async fn handle_uring_events<T>(
-    exe: &smol::LocalExecutor<'_>,
-    cq: &CompressQueue<'_>,
-    tasks: Vec<smol::Task<T>>,
-) -> Result<(), UblkError> {
-    const TIMEOUT_USER_DATA: u64 = UblkUringData::Target as u64 | UblkUringData::NonAsync as u64;
-    const TIMEOUT_SECS: u64 = 20;
-    let q = cq.q;
-    // Register io_uring FD with smol's async reactor
-    let uring_fd = with_task_io_ring(|ring| ring.as_raw_fd());
-    let file = unsafe { File::from_raw_fd(uring_fd) };
-    let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
-
-    let ts = types::Timespec::new().sec(TIMEOUT_SECS);
-    let timeout_e = opcode::Timeout::new(&ts)
-        .flags(io_uring::types::TimeoutFlags::MULTISHOT)
-        .build()
-        .user_data(TIMEOUT_USER_DATA);
-    q.ublk_submit_sqe_sync(timeout_e)?;
-
-    // Has to use smol::Async readable polling because we need smol::unblock()
-    // for offloading IO handling
-    let poll_uring = || async {
-        with_task_io_ring_mut(|r| r.submit_and_wait(0))?;
-        if !cq.q.is_stopping() {
-            async_uring
-                .readable()
-                .await
-                .map_err(|_| UblkError::OtherError(-libc::EIO))?;
-            Ok(false)
-        } else {
-            log::debug!("write to eventfd {}", unsafe { libc::gettid() });
-            cq.notifier.notify().unwrap_or_else(|e| {
-                log::error!("Failed to notify via eventfd: {}", e);
-            });
-            Err(UblkError::QueueIsDown)
-        }
-    };
-
-    let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, Some(TIMEOUT_USER_DATA), |cqe| {
-            // Handle normal CQEs by waking tasks
-            // Timeout CQEs are handled internally by ublk_reap_io_events_with_update_queue
-            if cqe.user_data() != TIMEOUT_USER_DATA {
-                ublk_wake_task(cqe.user_data(), cqe);
-            }
-        })
-    };
-    let run_ops = || while exe.try_tick() {};
-    let is_done = || tasks.iter().all(|task| task.is_finished());
-    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
-
-    // Prevent the File wrapper from closing the fd when dropped
-    // since the original io_uring instance still owns it
-    let _ = async_uring.into_inner().map(|f| {
-        use std::os::fd::IntoRawFd;
-        f.into_raw_fd()
-    });
-    Ok(())
-}
-
-fn q_async_fn(qid: u16, dev: &UblkDev, db: Arc<DB>) -> Result<(), UblkError> {
+fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, db: Arc<DB>) -> Result<(), UblkError> {
     let depth = dev.dev_info.queue_depth;
-    let q = UblkQueue::new(qid, dev)?;
-    let cq_rc = Rc::new(CompressQueue::new(&q).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?);
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
     let lbs = 1u32 << dev.tgt.params.basic.logical_bs_shift;
     let read_only = (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0;
+    let dev = dev.clone();
 
-    for tag in 0..depth {
+    let rt = UblkRuntime::new()?;
+    rt.block_on(async move {
+        let q = Rc::new(UblkQueue::new(qid, &dev)?);
+        let cq_rc =
+            Rc::new(CompressQueue::new(q).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?);
+        let mut f_vec = Vec::new();
+
+        for tag in 0..depth {
+            let cq = cq_rc.clone();
+            let db = db.clone();
+            f_vec.push(libublk::tokio::task::spawn_local(async move {
+                match handle_queue_tag_async_compress(&cq, tag, db, lbs, read_only).await {
+                    Err(UblkError::QueueIsDown) | Ok(_) => {}
+                    Err(e) => log::error!(
+                        "handle_queue_tag_async_compress failed for tag {}: {}",
+                        tag,
+                        e
+                    ),
+                }
+            }));
+        }
+
         let cq = cq_rc.clone();
-        let db = db.clone();
-        f_vec.push(exe.spawn(async move {
-            match handle_queue_tag_async_compress(&cq, tag, db, lbs, read_only).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!(
-                    "handle_queue_tag_async_compress failed for tag {}: {}",
-                    tag,
-                    e
-                ),
+        let event_task = libublk::tokio::task::spawn_local(async move {
+            if let Err(e) = handle_eventfd(&cq).await {
+                log::error!("handle_eventfd failed: {}", e);
             }
-        }));
-    }
+        });
 
-    let cq = cq_rc.clone();
-    f_vec.push(exe.spawn(async move {
-        if let Err(e) = handle_eventfd(&cq).await {
-            log::error!("handle_eventfd failed: {}", e);
+        for f in f_vec {
+            let _ = f.await;
         }
-    }));
 
-    let cq = cq_rc.clone();
-    let exe2 = exe_rc.clone();
-    let exe_task = exe.spawn(async move {
-        if let Err(e) = handle_uring_events(&exe2, &cq, f_vec).await {
-            log::error!("handle_uring_events failed: {}", e);
-        }
-    });
-
-    smol::block_on(exe_rc.run(async move { exe_task.await }));
-    Ok(())
+        // Queue is down: kick the eventfd task so it observes is_stopping()
+        cq_rc.notifier.notify().unwrap_or_else(|e| {
+            log::error!("Failed to notify eventfd task on shutdown: {}", e);
+        });
+        let _ = event_task.await;
+        Ok(())
+    })
 }
 
 fn parse_compression_type(s: &str) -> anyhow::Result<DBCompressionType> {

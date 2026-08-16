@@ -17,7 +17,7 @@ maintenance = { status = "actively-developed" }
 
 [dependencies]
 qcow2-rs = "0.1"
-libublk = "0.4.7"
+libublk = { git = "https://github.com/ublk-org/libublk-rs.git" }
 clap = { version = "4.3", features = ["derive"] }
 clap_derive = "4.3"
 libc = "0.2"
@@ -34,8 +34,7 @@ io-uring = "0.7.12"
 ilog = "1.0.1"
 shared_memory = "0.12.4"
 rand = "0.8.4"
-smol = "2.0.2"
-futures = "0.3.31"
+tokio = { version = "1", features = ["sync"] }
 async-trait = "0.1"
 rustversion = "1.0.14"
 parse-size = "1.1.0"

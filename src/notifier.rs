@@ -1,11 +1,16 @@
-use libublk::{io::UblkQueue, UblkError};
+use libublk::{ops, UblkError};
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use std::cell::RefCell;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Coalescing eventfd notifier, safe to signal from any thread.
+///
+/// Its job is to make a CQE arrive on the queue ring whenever another
+/// thread completes offloaded work: the queue thread parks inside
+/// `io_uring_enter`, so a plain task wakeup cannot reach it.
 pub(crate) struct Notifier {
     eventfd: EventFd,
-    counter: RefCell<u32>,
+    counter: AtomicU32,
 }
 
 impl Notifier {
@@ -13,27 +18,30 @@ impl Notifier {
         let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)?;
         Ok(Notifier {
             eventfd,
-            counter: RefCell::new(0),
+            counter: AtomicU32::new(0),
         })
     }
 
     pub fn notify(&self) -> anyhow::Result<()> {
-        let old_value = self.counter.replace_with(|&mut old| old + 1);
-        if old_value == 0 {
+        if self.counter.fetch_add(1, Ordering::AcqRel) == 0 {
             nix::unistd::write(&self.eventfd, &1u64.to_le_bytes())?;
         }
         Ok(())
     }
 
-    pub async fn event_read(&self, q: &UblkQueue<'_>) -> Result<(), UblkError> {
+    pub async fn event_read(&self) -> Result<(), UblkError> {
         let mut buf = [0u8; 8];
         let eventfd = self.eventfd.as_raw_fd();
-        let sqe =
-            io_uring::opcode::Read::new(io_uring::types::Fd(eventfd), buf.as_mut_ptr(), 8).build();
-        log::debug!("before eventfd reading");
-        let res = q.ublk_submit_sqe(sqe).await;
 
-        self.counter.replace(0);
+        log::debug!("before eventfd reading");
+        // SAFETY: `buf` outlives the await below
+        let res =
+            unsafe { ops::read_at_raw(ops::TgtFd::Raw(eventfd), buf.as_mut_ptr(), 8, 0) }?.await;
+
+        // Notifications arriving before this swap are covered by the wakeup
+        // being handled right now; any later notify() sees 0 and writes the
+        // eventfd again, so no wakeup is ever lost.
+        self.counter.swap(0, Ordering::AcqRel);
 
         if res < 8 {
             Err(UblkError::OtherError(-libc::EIO))

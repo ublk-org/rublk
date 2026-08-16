@@ -2,7 +2,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue},
-    wait_and_handle_io_events, UblkError, UblkIORes,
+    UblkError, UblkRuntime,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -38,10 +38,10 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) -> Result<(), Ublk
         None => BufDesc::Slice(&[]),
     };
 
-    q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+    q.complete_io_cmd_unified(tag, buf_desc, bytes)
 }
 
-fn q_sync_zc_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
+fn q_sync_zc_fn(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     let auto_buf_reg_list_rc = Rc::new(
         (0..dev.dev_info.queue_depth)
             .map(|tag| libublk::sys::ublk_auto_buf_reg {
@@ -56,7 +56,7 @@ fn q_sync_zc_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
     let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
         let bytes = get_io_cmd_result(q, tag);
         let buf_desc = BufDesc::AutoReg(auto_buf_reg_list[tag as usize]);
-        if let Err(e) = q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes))) {
+        if let Err(e) = q.complete_io_cmd_unified(tag, buf_desc, bytes) {
             log::error!("complete_io_cmd_unified failed {}/{}: {}", qid, tag, e);
         }
     };
@@ -67,7 +67,7 @@ fn q_sync_zc_fn(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
     Ok(())
 }
 
-fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError> {
+fn q_sync_fn(qid: u16, dev: &Arc<UblkDev>, user_copy: bool) -> Result<(), UblkError> {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
 
@@ -95,7 +95,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError> 
 
 #[inline]
 async fn __handle_queue_tag_async_null(
-    q: Rc<UblkQueue<'_>>,
+    q: Rc<UblkQueue>,
     tag: u16,
     buf: Option<&IoBuf<u8>>,
     user_copy: bool,
@@ -121,7 +121,7 @@ async fn __handle_queue_tag_async_null(
 }
 
 async fn handle_queue_tag_async_null(
-    q: Rc<UblkQueue<'_>>,
+    q: Rc<UblkQueue>,
     tag: u16,
     user_copy: bool,
 ) -> Result<(), UblkError> {
@@ -131,37 +131,16 @@ async fn handle_queue_tag_async_null(
         let buf = if user_copy {
             None
         } else {
-            Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
+            Some(IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize))
         };
         __handle_queue_tag_async_null(q, tag, buf.as_ref(), user_copy).await
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) -> Result<(), UblkError> {
-    let depth = dev.dev_info.queue_depth;
-    let q_rc = Rc::new(UblkQueue::new(qid, dev)?);
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
-
-    for tag in 0..depth {
-        let q = q_rc.clone();
-        f_vec.push(exe.spawn(async move {
-            match handle_queue_tag_async_null(q, tag, user_copy).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("handle_queue_tag_async_null failed for tag {}: {}", tag, e),
-            }
-        }));
-    }
-    smol::block_on(exe_rc.run(async move {
-        let run_ops = || while exe.try_tick() {};
-        let done = || f_vec.iter().all(|task| task.is_finished());
-
-        if let Err(e) = wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("handle_uring_events failed: {}", e);
-        }
-    }));
-    Ok(())
+fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, user_copy: bool) -> Result<(), UblkError> {
+    UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+        handle_queue_tag_async_null(q, tag, user_copy)
+    })
 }
 
 pub(crate) fn ublk_add_null(
@@ -199,7 +178,7 @@ pub(crate) fn ublk_add_null(
         Ok(())
     };
 
-    let q_handler = move |qid, dev: &_| {
+    let q_handler = move |qid, dev: &Arc<UblkDev>| {
         let result = if aa {
             q_async_fn(qid, dev, user_copy)
         } else {
