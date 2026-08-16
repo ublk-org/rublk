@@ -51,31 +51,130 @@ struct CompressJson {
 struct CompressQueue {
     q: Rc<UblkQueue>,
     notifier: Arc<Notifier>,
+    worker: DbWorker,
 }
 
 impl CompressQueue {
-    fn new(q: Rc<UblkQueue>) -> Result<Self, std::io::Error> {
+    fn new(q: Rc<UblkQueue>, db: Arc<DB>) -> Result<Self, std::io::Error> {
         let notifier = Arc::new(Notifier::new()?);
-        Ok(CompressQueue { q, notifier })
+        let worker = DbWorker::start(db, notifier.clone());
+        Ok(CompressQueue {
+            q,
+            notifier,
+            worker,
+        })
     }
 }
 
-/// Run `f` on the blocking thread pool. The result is published before the
-/// notifier fires, so the eventfd CQE that wakes the parked queue thread
-/// always finds the receiver ready.
-async fn unblock<T, F>(notifier: Arc<Notifier>, f: F) -> T
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    libublk::tokio::task::spawn_blocking(move || {
-        let _ = tx.send(f());
-        notifier.notify().unwrap_or_else(|e| {
-            log::error!("Failed to notify blocking work done: {}", e);
+/// One RocksDB request offloaded to the queue's [`DbWorker`].
+enum DbWork {
+    /// Read `nr_sectors` from `start_sector` into the caller's buffer.
+    ///
+    /// The raw pointer is valid because the submitting tag task owns the
+    /// buffer and blocks on the reply before touching it again -- the
+    /// same contract the previous spawn_blocking offload relied on.
+    Read {
+        start_sector: u64,
+        nr_sectors: u32,
+        buf_ptr: u64,
+        buf_len: usize,
+        lbs: u32,
+    },
+    Flush,
+}
+
+struct DbRequest {
+    work: DbWork,
+    tx: tokio::sync::oneshot::Sender<Result<i32, i32>>,
+}
+
+type DbQueue = std::sync::Mutex<(std::collections::VecDeque<DbRequest>, bool)>;
+
+/// Dedicated blocking-side worker of one queue: it drains whole batches
+/// of requests, runs them against RocksDB, publishes every result, and
+/// fires one eventfd kick for the batch -- so the queue thread, parked
+/// in io_uring_enter, pays one wakeup per batch instead of one per
+/// request.
+struct DbWorker {
+    shared: Arc<(DbQueue, std::sync::Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DbWorker {
+    fn start(db: Arc<DB>, notifier: Arc<Notifier>) -> Self {
+        let shared: Arc<(DbQueue, std::sync::Condvar)> = Arc::new((
+            std::sync::Mutex::new((std::collections::VecDeque::new(), false)),
+            std::sync::Condvar::new(),
+        ));
+        let worker_shared = shared.clone();
+        let handle = std::thread::spawn(move || {
+            let (lock, cvar) = &*worker_shared;
+            let mut batch = Vec::new();
+            loop {
+                {
+                    let mut guard = lock.lock().unwrap();
+                    while guard.0.is_empty() && !guard.1 {
+                        guard = cvar.wait(guard).unwrap();
+                    }
+                    if guard.0.is_empty() && guard.1 {
+                        return;
+                    }
+                    batch.extend(guard.0.drain(..));
+                }
+                for req in batch.drain(..) {
+                    let res = match req.work {
+                        DbWork::Read {
+                            start_sector,
+                            nr_sectors,
+                            buf_ptr,
+                            buf_len,
+                            lbs,
+                        } => {
+                            // SAFETY: the submitting task owns the buffer and
+                            // waits for this reply before reusing it.
+                            let buf = unsafe {
+                                std::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len)
+                            };
+                            __handle_read(&db, start_sector, nr_sectors, buf, lbs)
+                        }
+                        DbWork::Flush => __handle_flush(&db),
+                    };
+                    let _ = req.tx.send(res);
+                }
+                // One wakeup for the whole batch, after every result is
+                // published, so the eventfd CQE always finds the
+                // receivers ready.
+                notifier.notify().unwrap_or_else(|e| {
+                    log::error!("Failed to notify blocking work done: {}", e);
+                });
+            }
         });
-    });
-    rx.await.expect("blocking worker dropped its result")
+        DbWorker {
+            shared,
+            handle: Some(handle),
+        }
+    }
+
+    async fn submit(&self, work: DbWork) -> Result<i32, i32> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let (lock, cvar) = &*self.shared;
+            lock.lock().unwrap().0.push_back(DbRequest { work, tx });
+            cvar.notify_one();
+        }
+        rx.await.expect("db worker dropped a request")
+    }
+}
+
+impl Drop for DbWorker {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.shared;
+        lock.lock().unwrap().1 = true;
+        cvar.notify_one();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn __handle_read(
@@ -115,23 +214,20 @@ fn __handle_read(
 
 async fn handle_read(
     cq: &CompressQueue,
-    db: Arc<DB>,
     start_sector: u64,
     nr_sectors: u32,
     buf: &mut [u8],
     lbs: u32,
 ) -> Result<i32, i32> {
-    let buf_ptr = buf.as_ptr() as u64;
-    let buf_len = buf.len();
-    let db_clone = db.clone();
-
-    // Offload to thread pool
-    unblock(cq.notifier.clone(), move || {
-        // Reconstruct the slice safely since the buffer outlive the closure
-        let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len) };
-        __handle_read(&db_clone, start_sector, nr_sectors, buf_slice, lbs)
-    })
-    .await
+    cq.worker
+        .submit(DbWork::Read {
+            start_sector,
+            nr_sectors,
+            buf_ptr: buf.as_ptr() as u64,
+            buf_len: buf.len(),
+            lbs,
+        })
+        .await
 }
 
 fn __handle_flush(db: &DB) -> Result<i32, i32> {
@@ -143,11 +239,8 @@ fn __handle_flush(db: &DB) -> Result<i32, i32> {
     }
 }
 
-async fn handle_flush(cq: &CompressQueue, db: Arc<DB>) -> Result<i32, i32> {
-    let db_clone = db.clone();
-
-    // Offload to thread pool
-    unblock(cq.notifier.clone(), move || __handle_flush(&db_clone)).await
+async fn handle_flush(cq: &CompressQueue) -> Result<i32, i32> {
+    cq.worker.submit(DbWork::Flush).await
 }
 
 fn handle_write(
@@ -208,17 +301,7 @@ async fn handle_compress_io_cmd_async(
             let buf_len = std::cmp::min((iod.nr_sectors << 9) as usize, buf.len());
             let buf_slice = &mut buf.as_mut_slice()[..buf_len];
 
-            let res = handle_read(
-                cq,
-                db.clone(),
-                iod.start_sector,
-                iod.nr_sectors,
-                buf_slice,
-                lbs,
-            )
-            .await;
-
-            res
+            handle_read(cq, iod.start_sector, iod.nr_sectors, buf_slice, lbs).await
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
             if read_only {
@@ -229,7 +312,7 @@ async fn handle_compress_io_cmd_async(
                 handle_write(db, iod.start_sector, iod.nr_sectors, buf_slice, lbs)
             }
         }
-        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(cq, db.clone()).await,
+        libublk::sys::UBLK_IO_OP_FLUSH => handle_flush(cq).await,
         libublk::sys::UBLK_IO_OP_DISCARD => {
             if read_only {
                 Err(-libc::EACCES)
@@ -289,8 +372,9 @@ fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, db: Arc<DB>) -> Result<(), UblkError
     let rt = UblkRuntime::new()?;
     rt.block_on(async move {
         let q = Rc::new(UblkQueue::new(qid, &dev)?);
-        let cq_rc =
-            Rc::new(CompressQueue::new(q).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?);
+        let cq_rc = Rc::new(
+            CompressQueue::new(q, db.clone()).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?,
+        );
         let mut f_vec = Vec::new();
 
         for tag in 0..depth {
