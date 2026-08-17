@@ -554,6 +554,94 @@ mod integration {
         __test_ublk_add_del_zoned(4096, 2, Some(&path_str), false, tf);
     }
 
+    fn support_nbd() -> bool {
+        Command::new("nbdkit")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_or(false, |s| s.success())
+    }
+
+    /// Start nbdkit serving a memory export on a unix socket; killed by
+    /// the caller.
+    fn start_nbd_server(sock: &str) -> std::process::Child {
+        let child = Command::new("nbdkit")
+            .args(["-f", "-U", sock, "memory", "64M"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start nbdkit");
+        for _ in 0..100 {
+            if Path::new(sock).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        child
+    }
+
+    fn __test_ublk_add_del_nbd<F>(extra: &[&str], recover: bool, f: F)
+    where
+        F: Fn(&UblkCtrl, u32, usize),
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("nbd.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+        let mut server = start_nbd_server(&sock_str);
+
+        let mut cmd_line = ["add", "nbd", "--unix", &sock_str].to_vec();
+        cmd_line.extend_from_slice(extra);
+        if recover {
+            cmd_line.push("-r");
+        }
+        let ctrl = run_rublk_add_dev(cmd_line);
+        f(&ctrl, 512, 64 * 1024 * 1024);
+        run_rublk_del_dev(ctrl, false);
+
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+
+    #[test]
+    fn test_ublk_add_del_nbd() {
+        if !support_ublk() || !support_nbd() {
+            return;
+        }
+        let tf = |ctrl: &UblkCtrl, bs: u32, file_size: usize| {
+            read_ublk_disk(ctrl);
+            write_ublk_disk(ctrl, bs, file_size);
+        };
+        __test_ublk_add_del_nbd(&[], false, tf);
+        __test_ublk_add_del_nbd(&["--send-zc"], false, tf);
+        __test_ublk_add_del_nbd(&["-z"], false, tf);
+        __test_ublk_add_del_nbd(&["-z", "--send-zc"], false, tf);
+        __test_ublk_add_del_nbd(&["-q", "2"], false, tf);
+    }
+
+    #[test]
+    fn test_ublk_format_mount_nbd() {
+        if !support_ublk() || !support_nbd() {
+            return;
+        }
+        __test_ublk_add_del_nbd(&[], false, |ctrl, _bs, _file_size| {
+            ext4_format_and_mount(ctrl);
+        });
+        __test_ublk_add_del_nbd(&["-z", "--send-zc"], false, |ctrl, _bs, _file_size| {
+            ext4_format_and_mount(ctrl);
+        });
+    }
+
+    #[test]
+    fn test_ublk_nbd_recover() {
+        if !support_ublk() || !support_nbd() {
+            return;
+        }
+        __test_ublk_add_del_nbd(&[], true, |ctrl, _bs, _file_size| {
+            run_ublk_recover(ctrl);
+        });
+    }
+
     fn run_ublk_recover(ctrl: &UblkCtrl) {
         let id = ctrl.dev_info().dev_id.to_string();
         let pid = ctrl.dev_info().ublksrv_pid.to_string();

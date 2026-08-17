@@ -176,7 +176,7 @@ impl GenAddArgs {
         }
 
         if self.zero_copy {
-            if name != "loop" && name != "null" {
+            if name != "loop" && name != "null" && name != "nbd" {
                 anyhow::bail!("Target {} doesn't support zero copy", name);
             }
             ctrl_flags |=
@@ -296,6 +296,9 @@ pub(crate) enum AddCommands {
 
     /// Add qcow2 target
     Qcow2(super::qcow2::Qcow2Args),
+
+    /// Add nbd (network block device) client target
+    Nbd(super::nbd::NbdAddArgs),
 
     /// Add compress target
     #[cfg(feature = "compress")]
