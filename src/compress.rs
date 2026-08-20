@@ -3,7 +3,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{BufDesc, UblkDev, UblkQueue},
-    UblkError, UblkRuntime,
+    UblkError,
 };
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options, SliceTransform, WriteBatch,
@@ -369,7 +369,7 @@ fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, db: Arc<DB>) -> Result<(), UblkError
     let read_only = (dev.tgt.params.basic.attrs & libublk::sys::UBLK_ATTR_READ_ONLY) != 0;
     let dev = dev.clone();
 
-    let rt = UblkRuntime::new()?;
+    let rt = crate::Rt::new()?;
     rt.block_on(async move {
         let q = Rc::new(UblkQueue::new(qid, &dev)?);
         let cq_rc = Rc::new(
@@ -380,7 +380,7 @@ fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, db: Arc<DB>) -> Result<(), UblkError
         for tag in 0..depth {
             let cq = cq_rc.clone();
             let db = db.clone();
-            f_vec.push(libublk::tokio::task::spawn_local(async move {
+            f_vec.push(libublk::spawn_local(async move {
                 match handle_queue_tag_async_compress(&cq, tag, db, lbs, read_only).await {
                     Err(UblkError::QueueIsDown) | Ok(_) => {}
                     Err(e) => log::error!(
@@ -393,7 +393,7 @@ fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, db: Arc<DB>) -> Result<(), UblkError
         }
 
         let cq = cq_rc.clone();
-        let event_task = libublk::tokio::task::spawn_local(async move {
+        let event_task = libublk::spawn_local(async move {
             if let Err(e) = handle_eventfd(&cq).await {
                 log::error!("handle_eventfd failed: {}", e);
             }
