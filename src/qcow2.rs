@@ -5,7 +5,6 @@ use libublk::helpers::IoBuf;
 use libublk::io::{BufDesc, UblkDev, UblkQueue};
 use libublk::ops::{self, TgtFd};
 use libublk::UblkError;
-use libublk::UblkRuntime;
 use qcow2_rs::dev::{Qcow2Dev, Qcow2DevParams};
 use qcow2_rs::error::Qcow2Result;
 use qcow2_rs::ops::*;
@@ -319,7 +318,7 @@ pub(crate) fn ublk_add_qcow2(
 
     let depth = ctrl.dev_info().queue_depth;
     let comm = comm_arc.clone();
-    let rt = UblkRuntime::new()?;
+    let rt = crate::Rt::new()?;
     rt.block_on(async move {
         let q_rc = Rc::new(UblkQueue::new(0, &dev_rc)?);
 
@@ -329,7 +328,7 @@ pub(crate) fn ublk_add_qcow2(
             let q = q_rc.clone();
             let tgt = tgt_rc.clone();
 
-            f_vec.push(libublk::tokio::task::spawn_local(async move {
+            f_vec.push(libublk::spawn_local(async move {
                 match ublk_qcow2_io_fn(&tgt, &q, tag).await {
                     Err(UblkError::QueueIsDown) | Ok(_) => {}
                     Err(e) => log::error!("ublk_qcow2_io_fn failed for tag {}: {}", tag, e),
@@ -358,7 +357,7 @@ pub(crate) fn ublk_add_qcow2(
         // Flush qcow2 meta with a 50ms delay, matching the old executor's
         // delayed flush task
         let flush_tgt = tgt_rc.clone();
-        let flush_task = libublk::tokio::task::spawn_local(async move {
+        let flush_task = libublk::spawn_local(async move {
             loop {
                 match libublk::ops::sleep(std::time::Duration::from_millis(50)) {
                     Ok(op) => {
@@ -378,7 +377,7 @@ pub(crate) fn ublk_add_qcow2(
             let _ = f.await;
         }
         log::info!("qcow2: queue is down");
-        flush_task.abort();
+        flush_task.cancel();
 
         // flushing meta final time
         tgt_rc.qdev.flush_meta().await.unwrap();

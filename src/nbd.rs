@@ -17,7 +17,7 @@ use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDesc, UblkDev, UblkQueue};
 use libublk::ops::{self, TgtFd};
-use libublk::{UblkError, UblkRuntime};
+use libublk::UblkError;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -758,7 +758,7 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>, tflags: u16, send_zc: bool) -> Result<(), 
     let sock_raw = dev.tgt.fds[(qid + 1) as usize];
     let dev = dev.clone();
 
-    let rt = UblkRuntime::new()?;
+    let rt = crate::Rt::new()?;
     rt.block_on(async move {
         let q = Rc::new(UblkQueue::new(qid, &dev)?);
         let bufs = if zc {
@@ -782,7 +782,7 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>, tflags: u16, send_zc: bool) -> Result<(), 
         let mut handles = Vec::new();
         for tag in 0..depth {
             let nq = nq.clone();
-            handles.push(libublk::tokio::task::spawn_local(async move {
+            handles.push(libublk::spawn_local(async move {
                 match nbd_io_task(&nq, tag, tflags).await {
                     Err(UblkError::QueueIsDown) | Ok(_) => {}
                     Err(e) => log::error!("nbd io task failed for tag {}: {}", tag, e),
@@ -790,11 +790,9 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>, tflags: u16, send_zc: bool) -> Result<(), 
             }));
         }
         let recv_nq = nq.clone();
-        let recv_task =
-            libublk::tokio::task::spawn_local(async move { nbd_recv_task(&recv_nq).await });
+        let recv_task = libublk::spawn_local(async move { nbd_recv_task(&recv_nq).await });
         let send_nq = nq.clone();
-        let send_task =
-            libublk::tokio::task::spawn_local(async move { nbd_send_task(&send_nq).await });
+        let send_task = libublk::spawn_local(async move { nbd_send_task(&send_nq).await });
 
         for handle in handles {
             let _ = handle.await;
