@@ -1307,7 +1307,7 @@ pub(crate) fn ublk_add_zoned(
 
     let q_handler = move |qid: u16, dev: &Arc<UblkDev>| {
         let ztgt = zoned_tgt.clone();
-        if let Err(e) = libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+        if let Err(e) = crate::Rt::run_io_tasks(dev, qid, move |q, tag| {
             let ztgt_io = ztgt.clone();
             async move { handle_queue_tag_async_zoned(q, ztgt_io, tag).await }
         }) {

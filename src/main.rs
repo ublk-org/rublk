@@ -30,6 +30,10 @@ mod qcow2;
 mod vram;
 mod zoned;
 
+/// The executor every target runs on. Selected at compile time; the
+/// smol arm is added by the `smol-rt` feature (see src/smol_rt.rs).
+pub(crate) type Rt = libublk::UblkRuntime;
+
 #[derive(Parser)]
 #[command(version)]
 struct Cli {

@@ -2,7 +2,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue},
-    UblkError, UblkRuntime,
+    UblkError,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -138,7 +138,7 @@ async fn handle_queue_tag_async_null(
 }
 
 fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, user_copy: bool) -> Result<(), UblkError> {
-    UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+    crate::Rt::run_io_tasks(dev, qid, move |q, tag| {
         handle_queue_tag_async_null(q, tag, user_copy)
     })
 }

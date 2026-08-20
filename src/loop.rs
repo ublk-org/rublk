@@ -2,7 +2,7 @@ use anyhow::Context;
 use io_uring::{opcode, squeue, types};
 use libublk::io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::ops::{self, TgtFd};
-use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError, UblkRuntime};
+use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
@@ -398,7 +398,7 @@ async fn handle_queue_tag_async(q: Rc<UblkQueue>, tag: u16) -> Result<(), UblkEr
 }
 
 fn q_a_fn(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
-    UblkRuntime::run_io_tasks(dev, qid, handle_queue_tag_async)
+    crate::Rt::run_io_tasks(dev, qid, handle_queue_tag_async)
 }
 
 pub(crate) fn ublk_add_loop(

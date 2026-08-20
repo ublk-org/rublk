@@ -3,7 +3,7 @@ use libublk::{
     ctrl::UblkCtrl,
     helpers::IoBuf,
     io::{UblkDev, UblkQueue},
-    UblkError, UblkRuntime,
+    UblkError,
 };
 use std::sync::Arc;
 
@@ -153,7 +153,7 @@ async fn io_task(q: &UblkQueue, tag: u16, vrams: Arc<Vec<VRamBuffer>>) -> Result
 }
 
 fn q_fn(qid: u16, dev: &Arc<UblkDev>, vrams: Arc<Vec<VRamBuffer>>) {
-    if let Err(e) = UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+    if let Err(e) = crate::Rt::run_io_tasks(dev, qid, move |q, tag| {
         let use_vram = vrams.clone();
         async move { io_task(&q, tag, use_vram).await }
     }) {
