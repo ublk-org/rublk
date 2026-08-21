@@ -319,10 +319,68 @@ fn build_req(
     hdr
 }
 
+/// Bounded non-blocking recv(2) fast path: the bytes we want are
+/// usually already queued on the socket, so drain them with plain
+/// syscalls and skip the ring round-trip (SQE/CQE/waker per op) -- the
+/// same trick as ublksrv's nbd_do_recv. Spinning continues only while
+/// data is flowing; an empty socket costs one failed recv.
+///
+/// Returns the bytes consumed (possibly 0), or a negative errno on a
+/// hard failure (peer close included).
+///
+/// # Safety (caller contract)
+///
+/// `[ptr, ptr + len)` must be valid for writes for the whole call.
+#[inline]
+fn sync_recv_some(sock_raw: RawFd, ptr: *mut u8, len: u32) -> i32 {
+    let mut done = 0u32;
+    let mut spins: u32 = if len < 512 { 16 } else { 32 };
+    while done < len && spins > 0 {
+        spins -= 1;
+        // SAFETY: per the caller contract above
+        let res = unsafe {
+            libc::recv(
+                sock_raw,
+                ptr.wrapping_add(done as usize) as *mut libc::c_void,
+                (len - done) as usize,
+                libc::MSG_DONTWAIT | libc::MSG_WAITALL,
+            )
+        };
+        if res > 0 {
+            done += res as u32;
+        } else if res == 0 {
+            return -libc::ENOTCONN;
+        } else {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if err == libc::EINTR {
+                continue;
+            }
+            if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
+                return -err;
+            }
+            // Nothing there yet: only keep spinning when a reply is
+            // already flowing (partial bytes consumed).
+            if done == 0 {
+                break;
+            }
+        }
+    }
+    done as i32
+}
+
 /// Receive exactly `len` bytes into caller-managed memory. Returns 0,
 /// or a negative errno (peer close included).
-async fn recv_all(sock: TgtFd, ptr: *mut u8, len: u32) -> i32 {
-    let mut done = 0u32;
+///
+/// Fast path first ([`sync_recv_some`]); only an empty socket falls
+/// back to an io_uring recv, resuming at the consumed offset.
+async fn recv_all(sock: TgtFd, sock_raw: RawFd, ptr: *mut u8, len: u32) -> i32 {
+    let drained = sync_recv_some(sock_raw, ptr, len);
+    if drained < 0 {
+        return drained;
+    }
+    let mut done = drained as u32;
     while done < len {
         // SAFETY: caller guarantees the memory outlives the await
         let res = match unsafe {
@@ -677,7 +735,7 @@ async fn send_batch_zc_chain(nq: &NbdQueue, batch: &[SendItem]) -> bool {
 async fn nbd_recv_task(nq: &NbdQueue) {
     let mut hdr = [0u8; NBD_REPLY_LEN];
     loop {
-        let res = recv_all(nq.sock, hdr.as_mut_ptr(), NBD_REPLY_LEN as u32).await;
+        let res = recv_all(nq.sock, nq.sock_raw, hdr.as_mut_ptr(), NBD_REPLY_LEN as u32).await;
         if res < 0 {
             // Connection gone (or shutdown at queue teardown): fail
             // whatever is still waiting.
@@ -715,7 +773,13 @@ async fn nbd_recv_task(nq: &NbdQueue) {
             let res = if nq.zc {
                 recv_all_fixed(nq.sock, tag, read_len).await
             } else {
-                recv_all(nq.sock, nq.bufs[tag as usize].as_mut_ptr(), read_len).await
+                recv_all(
+                    nq.sock,
+                    nq.sock_raw,
+                    nq.bufs[tag as usize].as_mut_ptr(),
+                    read_len,
+                )
+                .await
             };
             if res < 0 {
                 nq.complete_all(res);
