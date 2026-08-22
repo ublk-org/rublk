@@ -498,6 +498,23 @@ async fn nbd_handle_io(nq: &NbdQueue, tag: u16, tflags: u16) -> i32 {
 /// without a global order can interleave mid-frame the moment one of
 /// them blocks on socket pressure (ublksrv's nbd chains its sends for
 /// the same reason).
+///
+/// KNOWN ISSUE (scheduling order): by design this task should run only
+/// after every currently-runnable io task has run, so a full round of
+/// pushes lands in the backlog before one drain. The current
+/// implementation does not guarantee that, and Tokio actively inverts
+/// it: the wake from the round's FIRST push lands this task in the
+/// scheduler's LIFO slot, running it ahead of the remaining io tasks
+/// (measured: ~1.2 items per drain at q=1). It is tolerable today only
+/// because of pipeline equilibrium -- pushes made while a send is in
+/// flight accumulate wake-free and drain together on completion, and
+/// an experimental run-last variant (yield_now before the drain, which
+/// re-queues behind the woken io tasks and cannot stall since yield
+/// self-wakes) measured neutral to -1.6%. The clean fix is a
+/// customized executor via libublk's UblkExecutor trait: one without a
+/// LIFO slot (plain FIFO, as smol's LocalExecutor behaves) or with an
+/// explicit low-priority lane for this task, making run-last a
+/// scheduling property instead of a per-wake workaround.
 async fn nbd_send_task(nq: &NbdQueue) {
     let mut chain_ops = ChunkOps::default();
     loop {
