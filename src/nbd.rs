@@ -499,6 +499,7 @@ async fn nbd_handle_io(nq: &NbdQueue, tag: u16, tflags: u16) -> i32 {
 /// them blocks on socket pressure (ublksrv's nbd chains its sends for
 /// the same reason).
 async fn nbd_send_task(nq: &NbdQueue) {
+    let mut chain_ops = ChunkOps::default();
     loop {
         // Wait for work
         let more = std::future::poll_fn(|cx| {
@@ -529,7 +530,7 @@ async fn nbd_send_task(nq: &NbdQueue) {
         // ordering holds without a lock.
         let batch: Vec<SendItem> = nq.sendq.borrow_mut().items.drain(..).collect();
         let failed = if nq.zc {
-            send_batch_zc_chain(nq, &batch).await
+            send_batch_zc_chain(nq, &batch, &mut chain_ops).await
         } else {
             send_batch_gather(nq, &batch).await
         };
@@ -597,137 +598,167 @@ async fn send_batch_gather(nq: &NbdQueue, batch: &[SendItem]) -> bool {
     false
 }
 
-/// Ship one `-z` batch as IO_LINK chains: a write's payload has no
-/// userspace address (it lives in the ublk-registered kernel buffer),
-/// so it cannot join a gather iovec; instead each header is linked
-/// before its fixed-buffer send and every element of a chunk is linked
-/// to the next, giving the same total stream order.
-///
-/// A link chain only holds together inside ONE ring submission: the
-/// kernel's link state ends with each io_uring_enter, and libublk's
-/// SQE push flushes the ring mid-loop when the SQ fills. A flushed
-/// half-chain executes concurrently with the rest and interleaves
-/// mid-frame on the socket. So the batch is shipped in chunks sized to
-/// the SQ space that is free right now, and each chunk is awaited to
-/// completion before the next is pushed -- completion, like the
-/// cross-batch case, preserves stream order.
-async fn send_batch_zc_chain(nq: &NbdQueue, batch: &[SendItem]) -> bool {
-    let TgtFd::Fixed(idx) = nq.sock else {
-        unreachable!()
-    };
-    let mut start = 0usize;
-    let mut failed = false;
-    while start < batch.len() && !failed {
-        // Free SQ slots at this instant; nothing else can push between
-        // here and our own pushes on this single-threaded executor.
-        let mut free = libublk::io::with_task_io_ring_mut(|r| {
+/// One chunk's in-flight sends, awaited by [`await_chunk_sends`].
+/// Allocated once per queue in [`nbd_send_task`]; the await drains the
+/// vectors in place, so their capacity is reused chunk after chunk.
+#[derive(Default)]
+struct ChunkOps {
+    /// (op, expected byte count) for headers and non-ZC payload sends
+    plain: Vec<(ops::RawOp, i32)>,
+    /// (op, expected byte count) for `--send-zc` payload sends
+    zc: Vec<(ops::SendZcOp, i32)>,
+}
+
+/// Free SQ slots after guaranteeing at least `min`, flushing the ring
+/// once if needed (the caller must have no open link chain). `None`
+/// means the ring is broken.
+fn ensure_sq_room(min: usize) -> Option<usize> {
+    let free_slots = || {
+        libublk::io::with_task_io_ring_mut(|r| {
             let sq = r.submission();
             sq.capacity() - sq.len()
-        });
-        if free < 2 {
-            // Safe to flush at a chunk boundary: no chain is open.
-            if libublk::io::with_task_io_ring_mut(|r| r.submit()).is_err() {
-                return true;
-            }
-            free = libublk::io::with_task_io_ring_mut(|r| {
-                let sq = r.submission();
-                sq.capacity() - sq.len()
-            });
-            if free < 2 {
-                return true;
-            }
-        }
+        })
+    };
+    let free = free_slots();
+    if free >= min {
+        return Some(free);
+    }
+    libublk::io::with_task_io_ring_mut(|r| r.submit()).ok()?;
+    let free = free_slots();
+    (free >= min).then_some(free)
+}
 
-        // Take items while their SQEs (header, plus payload for
-        // writes) fit in the free slots; `free >= 2` guarantees
-        // progress.
-        let mut end = start;
-        let mut sqes = 0usize;
-        while end < batch.len() {
-            let need = 1 + batch[end].payload.is_some() as usize;
-            if sqes + need > free {
-                break;
-            }
-            sqes += need;
-            end += 1;
+/// How many leading `batch` items fit in `free` SQ slots (a header SQE
+/// each, plus a payload SQE for writes). `free >= 2` guarantees at
+/// least one.
+fn chunk_items(batch: &[SendItem], free: usize) -> usize {
+    let mut sqes = 0;
+    for (i, item) in batch.iter().enumerate() {
+        sqes += 1 + item.payload.is_some() as usize;
+        if sqes > free {
+            return i;
         }
-        let chunk = &batch[start..end];
-        start = end;
+    }
+    batch.len()
+}
 
-        let last = chunk.len() - 1;
-        let mut plain_ops = Vec::with_capacity(chunk.len());
-        let mut zc_ops = Vec::new();
-        for (i, item) in chunk.iter().enumerate() {
-            let link_hdr = item.payload.is_some() || i != last;
-            let hdr_sqe = {
-                let sqe = opcode::Send::new(
-                    types::Fixed(idx as u32),
-                    item.hdr.as_ptr(),
-                    NBD_REQUEST_LEN as u32,
-                )
-                .flags(libc::MSG_WAITALL)
-                .build();
-                if link_hdr {
-                    sqe.flags(squeue::Flags::IO_LINK)
-                } else {
-                    sqe
-                }
-            };
-            // SAFETY: `batch` outlives the awaits below
-            match unsafe { ops::submit_sqe(hdr_sqe) } {
-                Ok(op) => plain_ops.push((op, NBD_REQUEST_LEN as i32)),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-            if let Some((_, len)) = item.payload {
-                // SAFETY: the ublk request buffer stays registered until
-                // the reply resolves and the io is committed
-                if nq.send_zc {
-                    match unsafe {
-                        ops::send_zc_fixed(nq.sock, item.tag, 0, len, libc::MSG_WAITALL, i != last)
-                    } {
-                        Ok(op) => zc_ops.push((op, len as i32)),
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    }
-                } else {
-                    match unsafe {
-                        ops::send_fixed(nq.sock, item.tag, 0, len, libc::MSG_WAITALL, i != last)
-                    } {
-                        Ok(op) => plain_ops.push((op, len as i32)),
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+/// Build the header-send SQE for `item` on the fixed socket file `idx`,
+/// linked to the following SQE unless it terminates the chain.
+fn hdr_send_sqe(idx: u16, item: &SendItem, linked: bool) -> squeue::Entry {
+    let sqe = opcode::Send::new(
+        types::Fixed(idx as u32),
+        item.hdr.as_ptr(),
+        NBD_REQUEST_LEN as u32,
+    )
+    .flags(libc::MSG_WAITALL)
+    .build();
+    if linked {
+        sqe.flags(squeue::Flags::IO_LINK)
+    } else {
+        sqe
+    }
+}
 
-        // Await everything actually pushed -- also on the error path:
-        // the in-flight SQEs reference `batch`, which the caller frees
-        // as soon as this function returns.
-        for (op, expected) in plain_ops {
-            let res = op.await;
-            if res != expected {
-                log::error!("nbd: send returned {} (expected {})", res, expected);
-                failed = true;
-            }
+/// Push one chunk as a single IO_LINK chain: header before payload,
+/// every element linked to the next, the chunk's last element unlinked.
+/// Deliberately NOT async -- no await point can slip between the
+/// caller's SQ-space check and these pushes, which is what guarantees
+/// the chain reaches the kernel in one submission.
+///
+/// Returns the ops actually pushed plus whether a push failed; the
+/// caller must await the ops either way, since their SQEs reference
+/// `chunk`'s memory.
+fn push_chunk_chain(nq: &NbdQueue, idx: u16, chunk: &[SendItem], ops_out: &mut ChunkOps) -> bool {
+    debug_assert!(ops_out.plain.is_empty() && ops_out.zc.is_empty());
+    let last = chunk.len() - 1;
+    for (i, item) in chunk.iter().enumerate() {
+        let link_hdr = item.payload.is_some() || i != last;
+        // SAFETY: the caller awaits every pushed op before `chunk` dies
+        match unsafe { ops::submit_sqe(hdr_send_sqe(idx, item, link_hdr)) } {
+            Ok(op) => ops_out.plain.push((op, NBD_REQUEST_LEN as i32)),
+            Err(_) => return true,
         }
-        for (mut op, expected) in zc_ops {
-            let sent = op.sent().await;
-            op.into_notif().await;
-            if sent != expected {
-                log::error!("nbd: zc send returned {} (expected {})", sent, expected);
-                failed = true;
+        let Some((_, len)) = item.payload else {
+            continue;
+        };
+        // SAFETY: the ublk request buffer stays registered until the
+        // reply resolves and the io is committed
+        if nq.send_zc {
+            match unsafe {
+                ops::send_zc_fixed(nq.sock, item.tag, 0, len, libc::MSG_WAITALL, i != last)
+            } {
+                Ok(op) => ops_out.zc.push((op, len as i32)),
+                Err(_) => return true,
+            }
+        } else {
+            match unsafe {
+                ops::send_fixed(nq.sock, item.tag, 0, len, libc::MSG_WAITALL, i != last)
+            } {
+                Ok(op) => ops_out.plain.push((op, len as i32)),
+                Err(_) => return true,
             }
         }
     }
+    false
+}
+
+/// Await every send of one chunk, draining `ops` in place (the vector
+/// capacity survives for the next chunk); true if any send failed or
+/// fell short.
+async fn await_chunk_sends(ops: &mut ChunkOps) -> bool {
+    let mut failed = false;
+    for (op, expected) in ops.plain.drain(..) {
+        let res = op.await;
+        if res != expected {
+            log::error!("nbd: send returned {} (expected {})", res, expected);
+            failed = true;
+        }
+    }
+    for (mut op, expected) in ops.zc.drain(..) {
+        let sent = op.sent().await;
+        op.into_notif().await;
+        if sent != expected {
+            log::error!("nbd: zc send returned {} (expected {})", sent, expected);
+            failed = true;
+        }
+    }
     failed
+}
+
+/// Ship one `-z` batch as IO_LINK chains: a write's payload has no
+/// userspace address (it lives in the ublk-registered kernel buffer),
+/// so it cannot join a gather iovec; instead each header is linked
+/// before its fixed-buffer send.
+///
+/// A link chain only holds together inside ONE ring submission: the
+/// kernel's link state ends with each io_uring_enter, and libublk's
+/// SQE push flushes the ring mid-loop when the SQ fills -- a flushed
+/// half-chain executes concurrently with the rest and interleaves
+/// mid-frame on the socket. So the batch is shipped in chunks sized by
+/// [`ensure_sq_room`]/[`chunk_items`] to what fits in one submission,
+/// and each chunk is awaited to completion before the next is pushed;
+/// completion, like the cross-batch case, preserves stream order.
+async fn send_batch_zc_chain(nq: &NbdQueue, batch: &[SendItem], ops: &mut ChunkOps) -> bool {
+    let TgtFd::Fixed(idx) = nq.sock else {
+        unreachable!()
+    };
+    let mut rest = batch;
+    while !rest.is_empty() {
+        let Some(free) = ensure_sq_room(2) else {
+            return true;
+        };
+        let (chunk, tail) = rest.split_at(chunk_items(rest, free));
+        rest = tail;
+
+        let push_failed = push_chunk_chain(nq, idx, chunk, ops);
+        // Await also on the push-error path: the in-flight SQEs
+        // reference `batch`, which the caller frees on return.
+        let send_failed = await_chunk_sends(ops).await;
+        if push_failed || send_failed {
+            return true;
+        }
+    }
+    false
 }
 
 /// The queue's receive task: demux simple replies (and read payloads)
