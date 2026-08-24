@@ -89,6 +89,18 @@ fn lo_make_discard_sqe(op: u32, flags: u32, off: u64, bytes: u32) -> io_uring::s
         .flags(squeue::Flags::FIXED_FILE)
 }
 
+/// RWF_DSYNC when this request is a FUA write, else 0.
+#[inline]
+fn lo_write_rw_flags(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
+    if (iod.op_flags & 0xff) == libublk::sys::UBLK_IO_OP_WRITE
+        && (iod.op_flags & libublk::sys::UBLK_IO_F_FUA) != 0
+    {
+        libc::RWF_DSYNC as i32
+    } else {
+        0
+    }
+}
+
 fn __lo_make_io_sqe_zc(
     iod: &libublk::sys::ublksrv_io_desc,
     buf_index: u16,
@@ -110,6 +122,7 @@ fn __lo_make_io_sqe_zc(
         libublk::sys::UBLK_IO_OP_WRITE => {
             opcode::WriteFixed::new(types::Fixed(1), std::ptr::null(), bytes, buf_index)
                 .offset(off)
+                .rw_flags(lo_write_rw_flags(iod))
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
         }
@@ -136,6 +149,7 @@ fn __lo_make_io_sqe(
             .build(),
         libublk::sys::UBLK_IO_OP_WRITE => opcode::Write::new(types::Fixed(1), buf_addr, bytes)
             .offset(off)
+            .rw_flags(lo_write_rw_flags(iod))
             .build(),
         libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
             lo_make_discard_sqe(op, iod.op_flags >> 8, off, bytes)
@@ -183,7 +197,12 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, opt: Option<LoopArgs>) -> Result
     tgt.nr_fds = nr_fds + 1;
 
     let sz = crate::ublk_file_size(&lo.back_file).map_err(|_| UblkError::OtherError(-libc::EIO))?;
-    let attrs = libublk::sys::UBLK_ATTR_VOLATILE_CACHE;
+    // Write-back cache with FUA passthrough: a REQ_FUA write reaches the
+    // handlers as UBLK_IO_F_FUA and is issued RWF_DSYNC on the backing
+    // file (same mapping as ublksrv's loop target); without the attr the
+    // block layer emulates every FUA write as write-then-FLUSH, costing
+    // an extra round trip per durable write.
+    let attrs = libublk::sys::UBLK_ATTR_VOLATILE_CACHE | libublk::sys::UBLK_ATTR_FUA;
 
     tgt.dev_size = sz.0;
     //todo: figure out correct block size
