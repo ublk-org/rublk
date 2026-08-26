@@ -17,6 +17,7 @@ use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDesc, UblkDev, UblkQueue};
 use libublk::ops::{self, TgtFd};
+use libublk::ShmemBufs;
 use libublk::UblkError;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -205,6 +206,10 @@ struct Slot {
     /// Payload length the receive task must read for an in-flight
     /// `NBD_CMD_READ`; 0 for every other command.
     read_len: u32,
+    /// Where that payload goes when the request was matched to a
+    /// registered shared buffer; null means the tag's own buffer (or the
+    /// fixed buffer in `-z` mode).
+    read_buf: *mut u8,
     /// Staleness guard: replies must echo the cookie of the request.
     cookie: u32,
 }
@@ -213,8 +218,9 @@ struct Slot {
 /// the payload source for writes.
 struct SendItem {
     hdr: [u8; NBD_REQUEST_LEN],
-    /// `(ptr, len)` of the write payload; ptr is null in `-z` mode
-    /// (fixed-buffer send from the registered buffer `tag`).
+    /// `(ptr, len)` of the write payload: the tag's own buffer, or the
+    /// shared mapping for a request the driver matched to one; null in
+    /// `-z` mode (fixed-buffer send from the registered buffer `tag`).
     payload: Option<(*const u8, u32)>,
     tag: u16,
 }
@@ -236,6 +242,9 @@ struct NbdQueue {
     /// Per-tag IO buffers; empty in `-z` mode, where reads and writes
     /// use the ublk-registered kernel buffers instead.
     bufs: Vec<IoBuf<u8>>,
+    /// Shared buffers registered for UBLK_F_SHMEM_ZC; requests matched to
+    /// one are served from it whatever the queue's own buffer mode.
+    shmem: Arc<ShmemBufs>,
     zc: bool,
     send_zc: bool,
     slots: RefCell<Vec<Slot>>,
@@ -248,12 +257,13 @@ impl NbdQueue {
     }
 
     /// Arm `tag`'s slot for one request; returns its handle.
-    fn arm(&self, tag: u16, read_len: u32) -> u64 {
+    fn arm(&self, tag: u16, read_len: u32, read_buf: *mut u8) -> u64 {
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots[tag as usize];
         slot.cookie = slot.cookie.wrapping_add(1);
         slot.result = None;
         slot.read_len = read_len;
+        slot.read_buf = read_buf;
         drop(slots);
         self.handle(tag)
     }
@@ -453,7 +463,19 @@ async fn nbd_handle_io(nq: &NbdQueue, tag: u16, tflags: u16) -> i32 {
         return -libc::EOPNOTSUPP;
     }
 
-    let handle = nq.arm(tag, if data_in { bytes } else { 0 });
+    // A request the driver matched to a registered shared buffer has its
+    // data in the daemon's mapping, whatever this queue's buffer mode.
+    let shmem_buf = nq.shmem.resolve(iod);
+    if shmem_buf.is_none() && iod.op_flags & libublk::sys::UBLK_IO_F_SHMEM_ZC != 0 {
+        return -libc::EINVAL;
+    }
+
+    let (read_len, read_buf) = if data_in {
+        (bytes, shmem_buf.unwrap_or(std::ptr::null_mut()))
+    } else {
+        (0, std::ptr::null_mut())
+    };
+    let handle = nq.arm(tag, read_len, read_buf);
     // NBD_CMD_FLUSH must carry zero offset and length
     let (req_off, req_len) = if cmd == NBD_CMD_FLUSH {
         (0, 0)
@@ -463,11 +485,12 @@ async fn nbd_handle_io(nq: &NbdQueue, tag: u16, tflags: u16) -> i32 {
     let hdr = build_req(cmd, 0, handle, req_off, req_len);
 
     let payload = if data_out {
-        if nq.zc {
-            Some((std::ptr::null(), bytes))
-        } else {
-            Some((nq.bufs[tag as usize].as_mut_ptr() as *const u8, bytes))
-        }
+        let ptr = match shmem_buf {
+            Some(p) => p as *const u8,
+            None if nq.zc => std::ptr::null(),
+            None => nq.bufs[tag as usize].as_mut_ptr() as *const u8,
+        };
+        Some((ptr, bytes))
     } else {
         None
     };
@@ -659,16 +682,14 @@ fn chunk_items(batch: &[SendItem], free: usize) -> usize {
     batch.len()
 }
 
-/// Build the header-send SQE for `item` on the fixed socket file `idx`,
-/// linked to the following SQE unless it terminates the chain.
-fn hdr_send_sqe(idx: u16, item: &SendItem, linked: bool) -> squeue::Entry {
-    let sqe = opcode::Send::new(
-        types::Fixed(idx as u32),
-        item.hdr.as_ptr(),
-        NBD_REQUEST_LEN as u32,
-    )
-    .flags(libc::MSG_WAITALL)
-    .build();
+/// Build a plain send SQE for `len` bytes at `ptr` on the fixed socket
+/// file `idx`, linked to the following SQE unless it terminates the
+/// chain. Used for every header, and for a payload that has a userspace
+/// address (a request matched to a shared buffer) inside a `-z` chain.
+fn send_sqe(idx: u16, ptr: *const u8, len: u32, linked: bool) -> squeue::Entry {
+    let sqe = opcode::Send::new(types::Fixed(idx as u32), ptr, len)
+        .flags(libc::MSG_WAITALL)
+        .build();
     if linked {
         sqe.flags(squeue::Flags::IO_LINK)
     } else {
@@ -691,13 +712,32 @@ fn push_chunk_chain(nq: &NbdQueue, idx: u16, chunk: &[SendItem], ops_out: &mut C
     for (i, item) in chunk.iter().enumerate() {
         let link_hdr = item.payload.is_some() || i != last;
         // SAFETY: the caller awaits every pushed op before `chunk` dies
-        match unsafe { ops::submit_sqe(hdr_send_sqe(idx, item, link_hdr)) } {
+        let hdr = send_sqe(idx, item.hdr.as_ptr(), NBD_REQUEST_LEN as u32, link_hdr);
+        match unsafe { ops::submit_sqe(hdr) } {
             Ok(op) => ops_out.plain.push((op, NBD_REQUEST_LEN as i32)),
             Err(_) => return true,
         }
-        let Some((_, len)) = item.payload else {
+        let Some((ptr, len)) = item.payload else {
             continue;
         };
+        if !ptr.is_null() {
+            // Shared-buffer payload: it has an address, so it is sent
+            // like a copy-mode payload, keeping its place in the chain.
+            // SAFETY: the mapping stays registered, hence mapped, until
+            // the reply resolves and the io is committed
+            if nq.send_zc {
+                match unsafe { ops::send_zc(nq.sock, ptr, len, libc::MSG_WAITALL, i != last) } {
+                    Ok(op) => ops_out.zc.push((op, len as i32)),
+                    Err(_) => return true,
+                }
+            } else {
+                match unsafe { ops::submit_sqe(send_sqe(idx, ptr, len, i != last)) } {
+                    Ok(op) => ops_out.plain.push((op, len as i32)),
+                    Err(_) => return true,
+                }
+            }
+            continue;
+        }
         // SAFETY: the ublk request buffer stays registered until the
         // reply resolves and the io is committed
         if nq.send_zc {
@@ -742,10 +782,11 @@ async fn await_chunk_sends(ops: &mut ChunkOps) -> bool {
     failed
 }
 
-/// Ship one `-z` batch as IO_LINK chains: a write's payload has no
-/// userspace address (it lives in the ublk-registered kernel buffer),
+/// Ship one `-z` batch as IO_LINK chains: a write's payload normally has
+/// no userspace address (it lives in the ublk-registered kernel buffer),
 /// so it cannot join a gather iovec; instead each header is linked
-/// before its fixed-buffer send.
+/// before its fixed-buffer send. A payload matched to a shared buffer
+/// does have one and rides the same chain as a plain send.
 ///
 /// A link chain only holds together inside ONE ring submission: the
 /// kernel's link state ends with each io_uring_enter, and libublk's
@@ -812,13 +853,20 @@ async fn nbd_recv_task(nq: &NbdQueue) {
             }
         }
 
-        let read_len = nq.slots.borrow()[tag as usize].read_len;
+        let (read_len, read_buf) = {
+            let slot = &nq.slots.borrow()[tag as usize];
+            (slot.read_len, slot.read_buf)
+        };
         if error != 0 {
             nq.complete(tag, -(error.min(libc::EIO as u32 * 25) as i32));
             continue;
         }
         if read_len > 0 {
-            let res = if nq.zc {
+            let res = if !read_buf.is_null() {
+                // matched to a shared buffer: land the payload in the
+                // mapping the application reads it from
+                recv_all(nq.sock, nq.sock_raw, read_buf, read_len).await
+            } else if nq.zc {
                 recv_all_fixed(nq.sock, tag, read_len).await
             } else {
                 recv_all(
@@ -864,7 +912,13 @@ async fn nbd_io_task(nq: &NbdQueue, tag: u16, tflags: u16) -> Result<(), UblkErr
     }
 }
 
-fn q_fn(qid: u16, dev: &Arc<UblkDev>, tflags: u16, send_zc: bool) -> Result<(), UblkError> {
+fn q_fn(
+    qid: u16,
+    dev: &Arc<UblkDev>,
+    tflags: u16,
+    send_zc: bool,
+    shmem: Arc<ShmemBufs>,
+) -> Result<(), UblkError> {
     let depth = dev.dev_info.queue_depth;
     let zc = (dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
     let sock_raw = dev.tgt.fds[(qid + 1) as usize];
@@ -885,6 +939,7 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>, tflags: u16, send_zc: bool) -> Result<(), 
             sock: TgtFd::Fixed(qid + 1),
             sock_raw,
             bufs,
+            shmem,
             zc,
             send_zc,
             slots: RefCell::new((0..depth).map(|_| Slot::default()).collect()),
@@ -981,6 +1036,10 @@ pub(crate) fn ublk_add_nbd(
     if json.send_zc && !send_zc {
         log::warn!("nbd: --send-zc disabled on unix socket");
     }
+
+    let shmem = crate::shmem::Shmem::new(&ctrl, opt.as_ref().map(|o| &o.gen_arg))?;
+    let shmem_bufs = shmem.bufs.clone();
+
     let tgt_init = |dev: &mut UblkDev| {
         let tgt = &mut dev.tgt;
         for sock in &socks {
@@ -1041,6 +1100,7 @@ pub(crate) fn ublk_add_nbd(
         }
 
         dev.set_target_json(serde_json::json!({"nbd": json }));
+        shmem.save_json(dev);
         Ok(())
     };
 
@@ -1048,7 +1108,7 @@ pub(crate) fn ublk_add_nbd(
     ctrl.run_target(
         tgt_init,
         move |qid, dev: &Arc<UblkDev>| {
-            if let Err(e) = q_fn(qid, dev, tflags, send_zc) {
+            if let Err(e) = q_fn(qid, dev, tflags, send_zc, shmem_bufs.clone()) {
                 log::error!("nbd queue {} failed: {}", qid, e);
             }
         },

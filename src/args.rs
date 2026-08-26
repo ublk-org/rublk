@@ -198,7 +198,7 @@ impl GenAddArgs {
         }
 
         if self.shmem_zc {
-            if name != "null" && name != "loop" {
+            if name != "null" && name != "loop" && name != "nbd" {
                 anyhow::bail!("Target {} doesn't support shmem zero copy", name);
             }
             // A device created with the flag on a kernel without it fails
