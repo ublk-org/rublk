@@ -2,7 +2,7 @@ use anyhow::Context;
 use io_uring::{opcode, squeue, types};
 use libublk::io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::ops::{self, TgtFd};
-use libublk::{ctrl::UblkCtrl, helpers::IoBuf, UblkError};
+use libublk::{ctrl::UblkCtrl, helpers::IoBuf, ShmemBufs, UblkError};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
@@ -123,12 +123,11 @@ fn __lo_make_io_sqe_zc(
 
 fn __lo_make_io_sqe(
     iod: &libublk::sys::ublksrv_io_desc,
-    buf: Option<&[u8]>,
+    buf_addr: *mut u8,
 ) -> io_uring::squeue::Entry {
     let op = iod.op_flags & 0xff;
     let off = iod.start_sector << 9;
     let bytes = iod.nr_sectors << 9;
-    let buf_addr = buf.map_or(std::ptr::null(), |b| b.as_ptr()) as *mut u8;
 
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => opcode::Fsync::new(types::Fixed(1)).build(),
@@ -145,7 +144,32 @@ fn __lo_make_io_sqe(
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) -> i32 {
+/// Where a request's data lives, in the order the driver dictates: a
+/// request matched to a registered shared buffer is served from that
+/// mapping (the kernel copied nothing), otherwise from this tag's own
+/// buffer, or -- `None`, zero-copy mode -- from the ublk-registered fixed
+/// buffer. A match to a buffer this device does not hold is `EINVAL`.
+#[inline]
+fn lo_io_buf(
+    iod: &libublk::sys::ublksrv_io_desc,
+    buf: Option<&[u8]>,
+    shmem: &ShmemBufs,
+) -> Result<Option<*mut u8>, i32> {
+    if let Some(p) = shmem.resolve(iod) {
+        return Ok(Some(p));
+    }
+    if iod.op_flags & libublk::sys::UBLK_IO_F_SHMEM_ZC != 0 {
+        return Err(-libc::EINVAL);
+    }
+    Ok(buf.map(|b| b.as_ptr() as *mut u8))
+}
+
+async fn lo_handle_io_cmd_async(
+    q: &UblkQueue,
+    tag: u16,
+    buf: Option<&[u8]>,
+    shmem: &ShmemBufs,
+) -> i32 {
     /// The backing file registered at fixed-file index 1 by lo_init_tgt()
     const BACK_FILE: TgtFd = TgtFd::Fixed(1);
 
@@ -154,26 +178,28 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, buf: Option<&[u8]>) -> 
     if res < 0 {
         return res;
     }
+    let data = match lo_io_buf(iod, buf, shmem) {
+        Ok(data) => data,
+        Err(e) => return e,
+    };
 
     let op = iod.op_flags & 0xff;
     let off = iod.start_sector << 9;
     let bytes = iod.nr_sectors << 9;
 
     for _ in 0..4 {
-        // SAFETY: the queue-slot buffer (or the fixed-buffer slot for
-        // zero copy) outlives the await below.
+        // SAFETY: the queue-slot buffer, the registered shared mapping,
+        // or the fixed-buffer slot for zero copy outlives the await below.
         let f = match op {
             libublk::sys::UBLK_IO_OP_FLUSH => ops::fsync(BACK_FILE, false),
-            libublk::sys::UBLK_IO_OP_READ => match buf {
-                Some(b) => unsafe {
-                    ops::read_at_raw(BACK_FILE, b.as_ptr() as *mut u8, bytes, off)
-                },
+            libublk::sys::UBLK_IO_OP_READ => match data {
+                Some(p) => unsafe { ops::read_at_raw(BACK_FILE, p, bytes, off) },
                 None => unsafe {
                     ops::read_at_fixed(BACK_FILE, tag, std::ptr::null_mut(), bytes, off)
                 },
             },
-            libublk::sys::UBLK_IO_OP_WRITE => match buf {
-                Some(b) => unsafe { ops::write_at_raw(BACK_FILE, b.as_ptr(), bytes, off) },
+            libublk::sys::UBLK_IO_OP_WRITE => match data {
+                Some(p) => unsafe { ops::write_at_raw(BACK_FILE, p, bytes, off) },
                 None => unsafe {
                     ops::write_at_fixed(BACK_FILE, tag, std::ptr::null(), bytes, off)
                 },
@@ -266,6 +292,7 @@ fn __lo_handle_io_cmd_sync(
     i: &UblkIOCtx,
     buf_desc: BufDesc,
     buf: Option<&[u8]>,
+    shmem: &ShmemBufs,
 ) -> Result<(), UblkError> {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
@@ -286,15 +313,17 @@ fn __lo_handle_io_cmd_sync(
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
         q.complete_io_cmd_unified(tag, buf_desc, res)?;
-    } else {
-        let zc = buf.is_none();
-        let sqe = if zc {
-            __lo_make_io_sqe_zc(iod, tag)
-        } else {
-            __lo_make_io_sqe(iod, buf)
-        };
-        q.ublk_submit_sqe_sync(sqe, data)?;
+        return Ok(());
     }
+    let sqe = match lo_io_buf(iod, buf, shmem) {
+        Ok(Some(p)) => __lo_make_io_sqe(iod, p),
+        Ok(None) => __lo_make_io_sqe_zc(iod, tag),
+        Err(e) => {
+            q.complete_io_cmd_unified(tag, buf_desc, e)?;
+            return Ok(());
+        }
+    };
+    q.ublk_submit_sqe_sync(sqe, data)?;
     Ok(())
 }
 
@@ -303,15 +332,16 @@ fn lo_handle_io_cmd_sync(
     tag: u16,
     i: &UblkIOCtx,
     buf: Option<&[u8]>,
+    shmem: &ShmemBufs,
 ) -> Result<(), UblkError> {
     let buf_desc = match buf {
         Some(slice) => BufDesc::Slice(slice),
         None => BufDesc::Slice(&[]),
     };
-    __lo_handle_io_cmd_sync(q, tag, i, buf_desc, buf)
+    __lo_handle_io_cmd_sync(q, tag, i, buf_desc, buf, shmem)
 }
 
-fn q_sync_fn_zc(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
+fn q_sync_fn_zc(qid: u16, dev: &Arc<UblkDev>, shmem: Arc<ShmemBufs>) -> Result<(), UblkError> {
     let auto_buf_reg_list_rc = Rc::new(
         (0..dev.dev_info.queue_depth)
             .map(|tag| libublk::sys::ublk_auto_buf_reg {
@@ -325,7 +355,7 @@ fn q_sync_fn_zc(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     let auto_buf_reg_list = auto_buf_reg_list_rc.clone();
     let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
         let buf_desc = BufDesc::AutoReg(auto_buf_reg_list[tag as usize]);
-        if let Err(e) = __lo_handle_io_cmd_sync(q, tag, io, buf_desc, None) {
+        if let Err(e) = __lo_handle_io_cmd_sync(q, tag, io, buf_desc, None, &shmem) {
             log::error!("handle_io_cmd failed {}/{}: {}", qid, tag, e);
         }
     };
@@ -336,13 +366,13 @@ fn q_sync_fn_zc(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     Ok(())
 }
 
-fn q_sync_fn_buf(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
+fn q_sync_fn_buf(qid: u16, dev: &Arc<UblkDev>, shmem: Arc<ShmemBufs>) -> Result<(), UblkError> {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
     let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
         let bufs = bufs.clone();
         let buf_slice = &*bufs[tag as usize];
-        if let Err(e) = lo_handle_io_cmd_sync(q, tag, io, Some(buf_slice)) {
+        if let Err(e) = lo_handle_io_cmd_sync(q, tag, io, Some(buf_slice), &shmem) {
             log::error!("handle_io_cmd failed {}/{}: {}", qid, tag, e);
         }
     };
@@ -353,12 +383,12 @@ fn q_sync_fn_buf(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
     Ok(())
 }
 
-fn q_sync_fn(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
+fn q_sync_fn(qid: u16, dev: &Arc<UblkDev>, shmem: Arc<ShmemBufs>) -> Result<(), UblkError> {
     let flags = dev.dev_info.flags;
     if (flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-        q_sync_fn_zc(qid, dev)
+        q_sync_fn_zc(qid, dev, shmem)
     } else {
-        q_sync_fn_buf(qid, dev)
+        q_sync_fn_buf(qid, dev, shmem)
     }
 }
 
@@ -367,6 +397,7 @@ async fn __handle_queue_tag_async(
     q: Rc<UblkQueue>,
     tag: u16,
     buf: Option<&IoBuf<u8>>,
+    shmem: &ShmemBufs,
 ) -> Result<(), UblkError> {
     let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
         index: tag,
@@ -382,23 +413,29 @@ async fn __handle_queue_tag_async(
     q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, buf).await?;
 
     loop {
-        let res = lo_handle_io_cmd_async(&q, tag, buf_ref).await;
+        let res = lo_handle_io_cmd_async(&q, tag, buf_ref, shmem).await;
         q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
     }
 }
 
-async fn handle_queue_tag_async(q: Rc<UblkQueue>, tag: u16) -> Result<(), UblkError> {
+async fn handle_queue_tag_async(
+    q: Rc<UblkQueue>,
+    tag: u16,
+    shmem: Arc<ShmemBufs>,
+) -> Result<(), UblkError> {
     if q.support_auto_buf_zc() {
-        __handle_queue_tag_async(q, tag, None).await
+        __handle_queue_tag_async(q, tag, None, &shmem).await
     } else {
         let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
-        __handle_queue_tag_async(q, tag, Some(&buf)).await
+        __handle_queue_tag_async(q, tag, Some(&buf), &shmem).await
     }
 }
 
-fn q_a_fn(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
-    crate::Rt::run_io_tasks(dev, qid, handle_queue_tag_async)
+fn q_a_fn(qid: u16, dev: &Arc<UblkDev>, shmem: Arc<ShmemBufs>) -> Result<(), UblkError> {
+    crate::Rt::run_io_tasks(dev, qid, move |q, tag| {
+        handle_queue_tag_async(q, tag, shmem.clone())
+    })
 }
 
 pub(crate) fn ublk_add_loop(
@@ -454,14 +491,22 @@ pub(crate) fn ublk_add_loop(
         return Err(anyhow::anyhow!("loop doesn't support user copy"));
     }
 
+    let shmem = crate::shmem::Shmem::new(&ctrl, opt.as_ref().map(|o| &o.gen_arg))?;
+    let shmem_bufs = shmem.bufs.clone();
+
     let comm = comm_rc.clone();
     match ctrl.run_target(
-        |dev: &mut UblkDev| lo_init_tgt(dev, &lo, opt),
+        |dev: &mut UblkDev| {
+            lo_init_tgt(dev, &lo, opt)?;
+            shmem.save_json(dev);
+            Ok(())
+        },
         move |qid, dev: &Arc<UblkDev>| {
+            let shmem = shmem_bufs.clone();
             let result = if lo.json.async_await {
-                q_a_fn(qid, dev)
+                q_a_fn(qid, dev, shmem)
             } else {
-                q_sync_fn(qid, dev)
+                q_sync_fn(qid, dev, shmem)
             };
             if let Err(e) = result {
                 log::error!("Queue handler failed for queue {}: {}", qid, e);
