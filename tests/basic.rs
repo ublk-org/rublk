@@ -921,4 +921,369 @@ mod integration {
         let ctrl = UblkCtrl::new_simple(id).unwrap();
         run_rublk_del_dev(ctrl, false);
     }
+
+    // ---- --shmem-zc ---------------------------------------------------------
+
+    /// hugetlb setup touches global state (nr_hugepages); one test at a time.
+    static HUGETLB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn support_shmem_zc() -> bool {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_SHMEM_ZC as u64 == 0 {
+            return false;
+        }
+        libublk::ctrl::UblkCtrlBuilder::default()
+            .name("shmem_zc_test")
+            .depth(4)
+            .nr_queues(1)
+            .id(-1)
+            .ctrl_flags(sys::UBLK_F_SHMEM_ZC.into())
+            .dev_flags(libublk::UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .is_ok()
+    }
+
+    fn has_fio() -> bool {
+        Command::new("fio")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A file on a private hugetlbfs mount, with the hugepages it needs
+    /// reserved; everything is torn down (file, mount, reservation) on drop.
+    struct HugetlbFile {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        mnt: tempfile::TempDir,
+        path: std::path::PathBuf,
+        size: usize,
+        prev_nr_hugepages: String,
+    }
+
+    impl HugetlbFile {
+        const CTL: &'static str = "/proc/sys/vm/nr_hugepages";
+
+        /// `None` (with a message) when hugepages cannot be had here.
+        fn new(pages: usize) -> Option<Self> {
+            let guard = HUGETLB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let kb: usize = meminfo
+                .lines()
+                .find(|l| l.starts_with("Hugepagesize:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            let size = pages * (kb << 10);
+
+            let mnt = tempfile::TempDir::new().ok()?;
+            let prev = std::fs::read_to_string(Self::CTL).ok()?;
+            let have: usize = prev.trim().parse().ok()?;
+            std::fs::write(Self::CTL, format!("{}\n", have.max(pages))).ok()?;
+            let mounted = Command::new("mount")
+                .args(["-t", "hugetlbfs", "none"])
+                .arg(mnt.path())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !mounted {
+                let _ = std::fs::write(Self::CTL, &prev);
+                eprintln!("skipping: cannot mount hugetlbfs");
+                return None;
+            }
+            // from here on Drop undoes the mount and the reservation
+            let this = Self {
+                _guard: guard,
+                path: mnt.path().join("ublk_shmem_buf"),
+                mnt,
+                size,
+                prev_nr_hugepages: prev,
+            };
+
+            // fallocate takes the pages from the pool right away, so a
+            // pool that is too small (or held by someone else) shows up
+            // here as a skip rather than as a failed mmap in the daemon
+            use std::os::fd::AsRawFd;
+            let file = std::fs::File::create(&this.path).ok()?;
+            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+                eprintln!(
+                    "skipping: cannot reserve {} hugepages: {}",
+                    pages,
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+            Some(this)
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for HugetlbFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = Command::new("umount")
+                .arg(self.mnt.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::fs::write(Self::CTL, &self.prev_nr_hugepages);
+        }
+    }
+
+    /// O_DIRECT IO on the device issued straight from the hugetlbfs file the
+    /// daemon registered -- the same pages, so the driver's match fires --
+    /// cross-checked against IO through an ordinary heap buffer.
+    /// `verify` is false for targets that do not keep data (null).
+    fn shmem_zc_io_check(ctrl: &UblkCtrl, htlb: &HugetlbFile, verify: bool) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&htlb.path)
+            .unwrap();
+        let shmem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                htlb.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(
+            shmem,
+            libc::MAP_FAILED,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let shmem = shmem as *mut u8;
+
+        let bdev = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(ctrl.get_bdev_path())
+            .unwrap();
+        let fd = bdev.as_raw_fd();
+        let pwrite = |buf: *const u8, len: usize, off: u64| {
+            let n = unsafe { libc::pwrite(fd, buf as *const _, len, off as libc::off_t) };
+            assert_eq!(
+                n as usize,
+                len,
+                "pwrite: {}",
+                std::io::Error::last_os_error()
+            );
+        };
+        let pread = |buf: *mut u8, len: usize, off: u64| {
+            let n = unsafe { libc::pread(fd, buf as *mut _, len, off as libc::off_t) };
+            assert_eq!(
+                n as usize,
+                len,
+                "pread: {}",
+                std::io::Error::last_os_error()
+            );
+        };
+        let fill = |buf: *mut u8, len: usize, seed: u8| {
+            for i in 0..len {
+                unsafe { *buf.add(i) = seed.wrapping_add((i / 512) as u8) ^ (i as u8) };
+            }
+        };
+        let equal = |a: *const u8, b: *const u8, len: usize| unsafe {
+            !verify || std::slice::from_raw_parts(a, len) == std::slice::from_raw_parts(b, len)
+        };
+
+        let io_len = 256_usize << 10;
+        assert!(htlb.size >= 4 * io_len);
+        let heap = libublk::helpers::IoBuf::<u8>::new(io_len);
+        let heap_ptr = heap.as_mut_ptr();
+        let zc_a = unsafe { shmem.add(4096) };
+        let zc_b = unsafe { shmem.add(htlb.size - io_len) };
+
+        // shmem -> device -> heap
+        fill(zc_a, io_len, 0x11);
+        pwrite(zc_a, io_len, 1 << 20);
+        fill(heap_ptr, io_len, 0);
+        pread(heap_ptr, io_len, 1 << 20);
+        assert!(equal(zc_a, heap_ptr, io_len));
+
+        // heap -> device -> shmem
+        fill(heap_ptr, io_len, 0x77);
+        pwrite(heap_ptr, io_len, 8 << 20);
+        fill(zc_b, io_len, 0);
+        pread(zc_b, io_len, 8 << 20);
+        assert!(equal(heap_ptr, zc_b, io_len));
+
+        // shmem -> device -> shmem, 4k at a time
+        for i in 0..8_u64 {
+            let p = unsafe { zc_a.add(i as usize * 4096) };
+            fill(p, 4096, 0xa0 + i as u8);
+            pwrite(p, 4096, (16 << 20) + i * 4096);
+        }
+        pread(zc_b, 8 * 4096, 16 << 20);
+        assert!(equal(zc_a, zc_b, 8 * 4096));
+
+        unsafe { libc::munmap(shmem as *mut _, htlb.size) };
+    }
+
+    /// fio over the same hugetlbfs file (`--mem=mmaphuge`): a short randrw
+    /// burst, then a write/verify pass when the target keeps data.
+    fn shmem_zc_fio(ctrl: &UblkCtrl, htlb: &HugetlbFile, verify: bool) {
+        if !has_fio() {
+            return;
+        }
+        let dev = ctrl.get_bdev_path();
+        let mem = format!("--mem=mmaphuge:{}", htlb.path_str());
+        let common = [
+            "--ioengine=libaio",
+            "--direct=1",
+            "--bs=4k",
+            "--iodepth=32",
+            "--numjobs=1",
+            "--size=16M",
+        ];
+        let run = |args: &[&str]| {
+            let status = Command::new("fio")
+                .args(common)
+                .arg(&mem)
+                .arg(format!("--filename={}", dev))
+                .args(args)
+                .stdout(Stdio::null())
+                .status()
+                .expect("run fio");
+            assert!(status.success(), "fio {:?} failed", args);
+        };
+        run(&[
+            "--name=randrw",
+            "--rw=randrw",
+            "--runtime=2",
+            "--time_based",
+        ]);
+        if verify {
+            run(&[
+                "--name=write",
+                "--rw=write",
+                "--verify=crc32c",
+                "--do_verify=0",
+            ]);
+            run(&[
+                "--name=verify",
+                "--rw=read",
+                "--verify=crc32c",
+                "--verify_only",
+            ]);
+        }
+    }
+
+    fn __test_ublk_null_shmem_zc(htlb: &HugetlbFile, extra: &[&str]) {
+        let htlb_path = htlb.path_str();
+        let mut cmd_line = ["add", "null", "--shmem-zc", "--htlb", &htlb_path].to_vec();
+        cmd_line.extend_from_slice(extra);
+        let ctrl = run_rublk_add_dev(cmd_line);
+        shmem_zc_io_check(&ctrl, htlb, false);
+        shmem_zc_fio(&ctrl, htlb, false);
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    #[test]
+    fn test_ublk_null_shmem_zc() {
+        if !support_ublk() || !support_shmem_zc() {
+            return;
+        }
+        let Some(htlb) = HugetlbFile::new(8) else {
+            return;
+        };
+        __test_ublk_null_shmem_zc(&htlb, &[]);
+        __test_ublk_null_shmem_zc(&htlb, &["-a"]);
+        __test_ublk_null_shmem_zc(&htlb, &["-a", "-z"]);
+    }
+
+    fn __test_ublk_loop_shmem_zc<F>(htlb: &HugetlbFile, extra: &[&str], f: F)
+    where
+        F: Fn(&UblkCtrl),
+    {
+        let tmp_file = tempfile::NamedTempFile::new().unwrap();
+        create_file_with_size(tmp_file.path(), 64 << 20).unwrap();
+        let file = tmp_file.path().to_string_lossy().to_string();
+        let htlb_path = htlb.path_str();
+
+        let mut cmd_line = [
+            "add",
+            "loop",
+            "-f",
+            &file,
+            "--shmem-zc",
+            "--htlb",
+            &htlb_path,
+        ]
+        .to_vec();
+        cmd_line.extend_from_slice(extra);
+        let ctrl = run_rublk_add_dev(cmd_line);
+        f(&ctrl);
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    #[test]
+    fn test_ublk_loop_shmem_zc() {
+        if !support_ublk() || !support_shmem_zc() {
+            return;
+        }
+        let Some(htlb) = HugetlbFile::new(8) else {
+            return;
+        };
+        let tf = |ctrl: &UblkCtrl| {
+            shmem_zc_io_check(ctrl, &htlb, true);
+            shmem_zc_fio(ctrl, &htlb, true);
+        };
+        __test_ublk_loop_shmem_zc(&htlb, &[], tf);
+        __test_ublk_loop_shmem_zc(&htlb, &["-a"], tf);
+        __test_ublk_loop_shmem_zc(&htlb, &["-z"], tf);
+        __test_ublk_loop_shmem_zc(&htlb, &["-a", "-z"], tf);
+    }
+
+    /// The registration outlives the daemon: after `kill -9` and `recover`
+    /// the new daemon adopts the buffer under its old index, and IO from the
+    /// hugetlbfs file keeps working with the data written before.
+    #[test]
+    fn test_ublk_loop_shmem_zc_recover() {
+        if !support_ublk() || !support_shmem_zc() {
+            return;
+        }
+        let Some(htlb) = HugetlbFile::new(8) else {
+            return;
+        };
+        __test_ublk_loop_shmem_zc(&htlb, &["-a", "-r"], |ctrl| {
+            shmem_zc_io_check(ctrl, &htlb, true);
+            run_ublk_recover(ctrl);
+            shmem_zc_io_check(ctrl, &htlb, true);
+            shmem_zc_fio(ctrl, &htlb, true);
+        });
+    }
+
+    #[test]
+    fn test_ublk_nbd_shmem_zc() {
+        if !support_ublk() || !support_shmem_zc() || !support_nbd() {
+            return;
+        }
+        let Some(htlb) = HugetlbFile::new(8) else {
+            return;
+        };
+        let htlb_path = htlb.path_str();
+        let tf = |ctrl: &UblkCtrl, _bs: u32, _size: usize| {
+            shmem_zc_io_check(ctrl, &htlb, true);
+            shmem_zc_fio(ctrl, &htlb, true);
+        };
+        __test_ublk_add_del_nbd(&["--shmem-zc", "--htlb", &htlb_path], false, tf);
+        __test_ublk_add_del_nbd(&["--shmem-zc", "--htlb", &htlb_path, "-z"], false, tf);
+        __test_ublk_add_del_nbd(
+            &["--shmem-zc", "--htlb", &htlb_path, "-z", "--send-zc"],
+            false,
+            tf,
+        );
+    }
 }
