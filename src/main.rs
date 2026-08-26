@@ -26,6 +26,7 @@ mod null;
 #[cfg(feature = "vram")]
 mod opencl;
 mod qcow2;
+mod shmem;
 #[cfg(feature = "vram")]
 mod vram;
 mod zoned;
@@ -350,6 +351,11 @@ const FEATURES_TABLE: &[&str] = &[
     "QUIESCE",
     "PER_IO_DAEMON",
     "BUF_REG_OFF_DAEMON",
+    "BATCH_IO",
+    "INTEGRITY",
+    "SAFE_STOP_DEV",
+    "NO_AUTO_PART_SCAN",
+    "SHMEM_ZC",
 ];
 
 #[allow(clippy::needless_range_loop)]

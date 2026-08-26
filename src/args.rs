@@ -72,6 +72,16 @@ pub(crate) struct GenAddArgs {
     #[clap(long, default_value_t = false)]
     pub mlock: bool,
 
+    /// Enable shared-memory zero copy (UBLK_F_SHMEM_ZC): requests issued
+    /// from a registered shared mapping are served without any copy
+    #[clap(long, default_value_t = false)]
+    pub shmem_zc: bool,
+
+    /// hugetlbfs file to map and register for --shmem-zc; applications map
+    /// the same file for zero copy (e.g. fio --mem=mmaphuge:FILE)
+    #[clap(long, requires = "shmem_zc")]
+    pub htlb: Option<PathBuf>,
+
     /// Used to resolve relative paths for backing files.
     /// `RefCell` is used to allow deferred initialization of this field
     /// from an immutable `GenAddArgs` reference, which is necessary
@@ -185,6 +195,25 @@ impl GenAddArgs {
 
         if self.user_copy {
             ctrl_flags |= libublk::sys::UBLK_F_USER_COPY;
+        }
+
+        if self.shmem_zc {
+            if name != "null" {
+                anyhow::bail!("Target {} doesn't support shmem zero copy", name);
+            }
+            // A device created with the flag on a kernel without it fails
+            // deep inside ADD_DEV; check the feature bit for a clear error.
+            if UblkCtrl::get_features().unwrap_or_default() & libublk::sys::UBLK_F_SHMEM_ZC as u64
+                == 0
+            {
+                anyhow::bail!("UBLK_F_SHMEM_ZC not supported by kernel");
+            }
+            // hugetlbfs is the only buffer source so far; without one the
+            // flag would silently do nothing
+            if self.htlb.is_none() {
+                anyhow::bail!("--shmem-zc needs --htlb <FILE>");
+            }
+            ctrl_flags |= libublk::sys::UBLK_F_SHMEM_ZC;
         }
 
         // Validate --mlock flag
