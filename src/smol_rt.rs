@@ -92,6 +92,47 @@ impl UblkExecutor for SmolRuntime {
             }
         })
     }
+
+    // Override the provided default with a specialized join loop: spawn
+    // the per-tag futures directly on the concrete executor (no
+    // `spawn_boxed` boxing), and instead of parking a root join future in
+    // `block_on`, drive the executor with a plain `is_finished()` check —
+    // no root-future poll per park wake. This is the measured-fastest
+    // shape (matches rublk main's historical loop within noise).
+    fn run_io_tasks<F, Fut>(
+        dev: &std::sync::Arc<libublk::io::UblkDev>,
+        qid: u16,
+        io_task: F,
+    ) -> Result<(), UblkError>
+    where
+        F: Fn(std::rc::Rc<libublk::io::UblkQueue>, u16) -> Fut + 'static,
+        Fut: Future<Output = Result<(), UblkError>> + 'static,
+    {
+        let rt = <Self as UblkExecutor>::new()?;
+        let dev = dev.clone();
+        libublk::with_ambient_spawner(&rt, || {
+            let q = std::rc::Rc::new(libublk::io::UblkQueue::new(qid, &dev)?);
+            let tasks: Vec<smol::Task<()>> = (0..dev.dev_info.queue_depth)
+                .map(|tag| {
+                    let task = io_task(q.clone(), tag);
+                    rt.exe.spawn(async move {
+                        match task.await {
+                            Err(UblkError::QueueIsDown) | Ok(_) => {}
+                            Err(e) => log::error!("io task failed for tag {}: {}", tag, e),
+                        }
+                    })
+                })
+                .collect();
+            while !tasks.iter().all(|t| t.is_finished()) {
+                while rt.exe.try_tick() {}
+                // Park in io_uring_enter until a CQE (or the reactor's
+                // safety timeout) wakes a task; re-entering is naturally
+                // live per the reactor docs.
+                let _ = libublk::reactor::wait_and_reap_events();
+            }
+            Ok(())
+        })
+    }
 }
 
 // Inherent delegates to the trait items above, so call sites that use
