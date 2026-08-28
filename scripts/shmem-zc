@@ -1,0 +1,285 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Create or remove a rublk device with shared-memory zero copy (--shmem-zc),
+# and print the fio command line that exercises the zero-copy path.
+#
+# Zero copy here is a *page* match: the daemon mmaps and registers the --htlb
+# file, and only IO issued from that same memory is served without a copy.  So
+# fio has to take its IO buffers from the very same file, which is what
+# --mem=mmaphuge:FILE does.
+#
+# Nothing is cleaned up on exit: the buffer file outlives the device (it can
+# be shared by several of them, and a recovered device needs the same inode),
+# so 'add-htlb'/'del-htlb' own it and 'remove' leaves it alone.
+#
+#   ./scripts/shmem-zc add-htlb --size 64M buf1
+#   ./scripts/shmem-zc add -t loop -f /dev/nvme0n1 --htlb buf1
+#   ./scripts/shmem-zc add -t nbd --unix /tmp/nbd.sock -x "-z --send-zc"
+#   ./scripts/shmem-zc remove 0
+#   ./scripts/shmem-zc del-htlb buf1
+
+HTLB_DIR=${HTLB_DIR:-/dev/hugepages}
+HTLB_SIZE=${HTLB_SIZE:-16M}
+NR_HP_CTL=/proc/sys/vm/nr_hugepages
+RUN_DIR=/run/ublksrvd
+RUBLK=${RUBLK:-}
+
+usage()
+{
+	cat <<EOF
+Usage: ${0##*/} add-htlb [--size SIZE] [--dir DIR] [NAME]
+       ${0##*/} del-htlb [-f] FILE|NAME
+       ${0##*/} add [options]
+       ${0##*/} remove DEV_ID
+
+add-htlb: allocate a hugetlbfs buffer file (NAME default: rublk-shmem-zc.PID)
+del-htlb: delete one; refused while a live device still has it registered (-f
+          overrides)
+
+add options:
+  -t TARGET     loop, nbd or null (default: loop)
+  -f FILE       loop backing file (required for loop)
+  -q N          nr_hw_queues (default: 1)
+  -d N          queue depth (default: 128)
+  -x "FLAGS"    extra 'rublk add' flags, e.g. "-z --send-zc -a"
+  --htlb F      buffer file from add-htlb (default: allocate a fresh one)
+  --unix PATH   nbd server unix socket
+  --host H      nbd server host (default: rublk's own 127.0.0.1)
+  --port P      nbd server port
+  --dir DIR     hugetlbfs mount holding the buffer (default: $HTLB_DIR)
+  --size SIZE   size of a freshly allocated buffer (default: $HTLB_SIZE)
+
+Env: RUBLK, HTLB_DIR, HTLB_SIZE
+EOF
+}
+
+die() { echo "${0##*/}: $*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "needs root"; }
+
+find_rublk()
+{
+	[ -n "$RUBLK" ] && { [ -x "$RUBLK" ] || die "$RUBLK is not executable"; return; }
+
+	local top c
+	top=$(cd "$(dirname "$0")/.." && pwd)
+	for c in "$top/target/release/rublk" "$top/target/debug/rublk" \
+		 "$(command -v rublk 2>/dev/null)"; do
+		[ -n "$c" ] && [ -x "$c" ] && { RUBLK=$c; return; }
+	done
+	die "no rublk binary found; build it or set RUBLK="
+}
+
+check_env()
+{
+	need_root
+	[ -c /dev/ublk-control ] || modprobe ublk_drv 2>/dev/null
+	[ -c /dev/ublk-control ] || die "/dev/ublk-control missing, 'modprobe ublk_drv' failed"
+	"$RUBLK" features | grep -q SHMEM_ZC || die "kernel has no UBLK_F_SHMEM_ZC"
+}
+
+huge_page_size() { echo $(( $(awk '/^Hugepagesize:/{print $2}' /proc/meminfo) * 1024 )); }
+
+pool_hint() { echo "hugepage pool left at $(cat $NR_HP_CTL) ('echo N > $NR_HP_CTL' to shrink)"; }
+
+# a bare NAME lives in $HTLB_DIR, anything with a slash is taken as given
+htlb_path()
+{
+	case $1 in
+	*/*)	echo "$1";;
+	*)	echo "$HTLB_DIR/$1";;
+	esac
+}
+
+# grow the pool if it cannot cover $1 pages; the reservation is left in place
+reserve_huge_pages()
+{
+	local need_pages=$1 free have
+	free=$(awk '/^HugePages_Free:/{print $2}' /proc/meminfo)
+	[ "$free" -ge "$need_pages" ] && return
+
+	have=$(cat $NR_HP_CTL)
+	echo $((have + need_pages - free)) > $NR_HP_CTL || die "cannot write $NR_HP_CTL"
+	free=$(awk '/^HugePages_Free:/{print $2}' /proc/meminfo)
+	[ "$free" -ge "$need_pages" ] ||
+		die "only $free free hugepages, need $need_pages (memory too fragmented?)"
+	echo "hugepages: pool grown to $(cat $NR_HP_CTL) (was $have)" >&2
+}
+
+# allocate a $2-byte hugetlbfs file at $1; everything goes to stderr so the
+# callers that want the path can capture stdout
+create_htlb_file()
+{
+	local file=$1 bytes=$2 dir=${1%/*}
+
+	findmnt -t hugetlbfs "$dir" >/dev/null ||
+		die "$dir is not a hugetlbfs mount ('mount -t hugetlbfs none $dir')"
+	[ -e "$file" ] && die "$file already exists; pick another name or del-htlb it"
+	reserve_huge_pages $(( bytes / $(huge_page_size) ))
+
+	# fallocate takes the pages now, so a pool that is too small fails here
+	# instead of as a mysterious mmap failure inside the daemonized rublk
+	fallocate -l "$bytes" "$file" || die "cannot allocate $bytes bytes in $dir"
+	echo "allocated $file ($((bytes / $(huge_page_size))) hugepages)" >&2
+}
+
+# the htlb file device $1 has registered, from its run-time json
+htlb_of_dev()
+{
+	local json
+	json=$(printf '%s/%04d.json' "$RUN_DIR" "$1")
+	[ -r "$json" ] || return 0
+	grep -o '"htlb"[[:space:]]*:[[:space:]]*"[^"]*"' "$json" | head -1 | cut -d'"' -f4
+}
+
+# ids of the live devices that have $1 registered
+devs_using_htlb()
+{
+	local json id
+	for json in "$RUN_DIR"/*.json; do
+		[ -r "$json" ] || continue
+		grep -qF "\"$1\"" "$json" || continue
+		id=${json##*/}; id=${id%.json}
+		echo $((10#$id))
+	done
+}
+
+print_fio_cmd()
+{
+	local dev=$1 htlb=$2
+	cat <<EOF
+
+fio over the registered buffer -- rw/numjobs/runtime are yours to change:
+
+  fio --name=shmem-zc --filename=$dev \\
+	--ioengine=libaio --direct=1 --mem=mmaphuge:$htlb \\
+	--bs=4k --iodepth=32 --numjobs=1 \\
+	--rw=randread --runtime=30 --time_based --group_reporting
+
+  (bs * iodepth has to fit in the buffer; every job maps the file at offset 0,
+   so jobs share buffers -- don't add --verify.  --mem=malloc instead runs the
+   same job without zero copy.)
+EOF
+}
+
+do_add_htlb()
+{
+	local name= size=$HTLB_SIZE file
+
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--size)	size=$2; shift 2;;
+		--dir)	HTLB_DIR=$2; shift 2;;
+		-*)	usage >&2; die "unknown add-htlb option '$1'";;
+		*)	name=$1; shift;;
+		esac
+	done
+
+	need_root
+	file=$(htlb_path "${name:-rublk-shmem-zc.$$}")
+	create_htlb_file "$file" "$(numfmt --from=iec "${size%[bB]}")" || exit 1
+	echo "$file"
+}
+
+do_del_htlb()
+{
+	local force=0 file ids
+
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-f)	force=1; shift;;
+		-*)	usage >&2; die "unknown del-htlb option '$1'";;
+		*)	file=$(htlb_path "$1"); shift;;
+		esac
+	done
+	[ -n "${file:-}" ] || { usage >&2; die "del-htlb needs a file name"; }
+	need_root
+	[ -e "$file" ] || die "$file does not exist"
+
+	ids=$(devs_using_htlb "$file" | tr '\n' ' ')
+	if [ -n "${ids// /}" ] && [ "$force" = 0 ]; then
+		die "device(s) ${ids% } still have $file registered; 'remove' them first (or -f)"
+	fi
+
+	rm -f "$file" || die "cannot remove $file"
+	echo "removed $file"
+	pool_hint
+}
+
+do_add()
+{
+	local target=loop file= queues=1 depth=128 htlb= extra=() nbd=() dev_id out
+
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-t)	target=$2; shift 2;;
+		-f)	file=$2; shift 2;;
+		-q)	queues=$2; shift 2;;
+		-d)	depth=$2; shift 2;;
+		-x)	read -r -a extra <<< "$2"; shift 2;;
+		--htlb)	htlb=$2; shift 2;;
+		--unix)	nbd+=(--unix "$2"); shift 2;;
+		--host)	nbd+=(--host "$2"); shift 2;;
+		--port)	nbd+=(--port "$2"); shift 2;;
+		--dir)	HTLB_DIR=$2; shift 2;;
+		--size)	HTLB_SIZE=$2; shift 2;;
+		*)	usage >&2; die "unknown add option '$1'";;
+		esac
+	done
+
+	case $target in
+	loop)	[ -n "$file" ] || die "loop needs -f FILE";;
+	nbd|null) [ -z "$file" ] || die "-f is only for loop";;
+	*)	die "--shmem-zc is only supported by loop, nbd and null";;
+	esac
+
+	check_env
+	if [ -n "$htlb" ]; then
+		htlb=$(htlb_path "$htlb")
+		[ -s "$htlb" ] || die "$htlb is missing or empty; make it with add-htlb"
+	else
+		htlb=$(htlb_path "rublk-shmem-zc.$$")
+		create_htlb_file "$htlb" "$(numfmt --from=iec "${HTLB_SIZE%[bB]}")" || exit 1
+	fi
+
+	local args=(add "$target" --shmem-zc --htlb "$htlb" -q "$queues" -d "$depth")
+	[ -n "$file" ] && args+=(-f "$(readlink -f "$file")")
+	args+=("${nbd[@]}" "${extra[@]}")
+
+	echo "+ $RUBLK ${args[*]}"
+	out=$("$RUBLK" "${args[@]}") ||
+		die "add failed; re-run with --foreground in -x for the real error"
+	echo "$out"
+
+	dev_id=$(sed -n 's/^dev id \([0-9]\+\).*/\1/p' <<< "$out" | head -1)
+	[ -n "$dev_id" ] || die "cannot parse dev id out of rublk output"
+	print_fio_cmd "/dev/ublkb$dev_id" "$htlb"
+}
+
+do_remove()
+{
+	local id=$1 htlb
+
+	[ -n "${id:-}" ] || { usage >&2; die "remove needs a device id"; }
+	check_env
+
+	# read it before the daemon goes away and takes its json with it
+	htlb=$(htlb_of_dev "$id")
+
+	"$RUBLK" del -n "$id" || die "rublk del -n $id failed"
+	echo "removed /dev/ublkb$id"
+	[ -n "$htlb" ] &&
+		echo "buffer file kept: ${0##*/} del-htlb $htlb"
+	pool_hint
+}
+
+find_rublk
+case ${1:-} in
+add-htlb)	shift; do_add_htlb "$@";;
+del-htlb)	shift; do_del_htlb "$@";;
+add)		shift; do_add "$@";;
+remove|del)	shift; do_remove "$@";;
+-h|--help|"")	usage;;
+*)		usage >&2; die "unknown command '$1'";;
+esac
