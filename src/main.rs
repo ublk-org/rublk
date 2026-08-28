@@ -35,6 +35,12 @@ mod zoned;
 mod smol_rt;
 
 /// The executor every target runs on, selected at compile time.
+///
+/// Any runtime wired in here must also expose INHERENT `new`, `block_on`
+/// and `run_io_tasks` methods delegating to its `UblkExecutor` impl:
+/// targets deliberately do not import the trait (a trait import would be
+/// an unused-import warning under the other alias arm), so trait-only
+/// methods would not resolve. See src/smol_rt.rs for the pattern.
 #[cfg(feature = "smol-rt")]
 pub(crate) type Rt = crate::smol_rt::SmolRuntime;
 #[cfg(not(feature = "smol-rt"))]
