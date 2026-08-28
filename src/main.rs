@@ -31,8 +31,13 @@ mod shmem;
 mod vram;
 mod zoned;
 
-/// The executor every target runs on. Selected at compile time; the
-/// smol arm is added by the `smol-rt` feature (see src/smol_rt.rs).
+#[cfg(feature = "smol-rt")]
+mod smol_rt;
+
+/// The executor every target runs on, selected at compile time.
+#[cfg(feature = "smol-rt")]
+pub(crate) type Rt = crate::smol_rt::SmolRuntime;
+#[cfg(not(feature = "smol-rt"))]
 pub(crate) type Rt = libublk::UblkRuntime;
 
 #[derive(Parser)]
