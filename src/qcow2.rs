@@ -72,7 +72,7 @@ qcow2_rs::qcow2_setup_dev_fn_sync!(UblkQcow2Io, ulbk_qcow2_setup_dev);
 
 #[allow(dead_code)]
 impl UblkQcow2Io {
-    fn new(path: &Path, ro: bool, dio: bool) -> UblkQcow2Io {
+    fn new(path: &Path, ro: bool, dio: bool) -> Qcow2Result<UblkQcow2Io> {
         log::info!(
             "qcow2: setup ublk qcow2 IO path {:?} readonly {} direct io {}",
             path,
@@ -83,7 +83,10 @@ impl UblkQcow2Io {
             .read(true)
             .write(!ro)
             .open(path)
-            .unwrap();
+            .map_err(|e| {
+                log::error!("qcow2: failed to open {:?}: {}", path, e);
+                e
+            })?;
         let fd = file.as_raw_fd();
 
         if dio {
@@ -91,7 +94,7 @@ impl UblkQcow2Io {
                 libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
             }
         }
-        UblkQcow2Io { _file: file, fd }
+        Ok(UblkQcow2Io { _file: file, fd })
     }
 }
 
@@ -208,18 +211,33 @@ async fn qcow2_handle_io_cmd_async<T: Qcow2IoOps>(
     log::trace!("ublk_io: {} op {} offset {:x} len {}", tag, op, off, bytes);
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => {
-            qdev.fsync_range(0, qdev.info.virtual_size() as usize)
-                .await
-                .unwrap();
-            qdev.flush_meta().await.unwrap();
+            if let Err(e) = qdev.fsync_range(0, qdev.info.virtual_size() as usize).await {
+                log::error!("qcow2 flush failed: {}", e);
+                return -libc::EIO;
+            }
+            if let Err(e) = qdev.flush_meta().await {
+                log::error!("qcow2 flush_meta failed: {}", e);
+                return -libc::EIO;
+            }
             0
         }
-        libublk::sys::UBLK_IO_OP_READ => {
-            let res = qdev.read_at(&mut buf[..bytes], off).await.unwrap();
-            res as i32
-        }
+        libublk::sys::UBLK_IO_OP_READ => match qdev.read_at(&mut buf[..bytes], off).await {
+            Ok(res) => res as i32,
+            Err(e) => {
+                log::error!("qcow2 read failed at offset {:x} len {}: {}", off, bytes, e);
+                -libc::EIO
+            }
+        },
         libublk::sys::UBLK_IO_OP_WRITE => {
-            qdev.write_at(&buf[..bytes], off).await.unwrap();
+            if let Err(e) = qdev.write_at(&buf[..bytes], off).await {
+                log::error!(
+                    "qcow2 write failed at offset {:x} len {}: {}",
+                    off,
+                    bytes,
+                    e
+                );
+                return -libc::EIO;
+            }
             bytes as i32
         }
         _ => -libc::EINVAL,
@@ -243,9 +261,9 @@ fn qcow2_init_tgt<T: Qcow2IoOps>(
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .open(&qcow2.back_file_path)
-        .unwrap();
-    let sz = crate::ublk_file_size(&file).unwrap();
+        .open(&qcow2.back_file_path)?;
+    let sz = crate::ublk_file_size(&file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     tgt.dev_size = size;
     //todo: figure out correct block size
@@ -310,8 +328,15 @@ fn ublk_qcow2_start<'a, T: Qcow2IoOps + 'a>(
 
     // Prepare qcow2 for handling IO
     let tgt = tgt_rc.clone();
-    let task = exe.spawn(async move { tgt.qdev.qcow2_prep_io().await.unwrap() });
+    let task = exe.spawn(async move {
+        if let Err(e) = tgt.qdev.qcow2_prep_io().await {
+            log::error!("qcow2 prep_io failed: {}", e);
+            return Err(UblkError::OtherError(-libc::EIO));
+        }
+        Ok(())
+    });
     ublk_run_io_task(exe, &task, q, 1)?;
+    smol::block_on(exe.run(task))?;
 
     //setup single cpu affinity
     if dev_clone
@@ -342,7 +367,9 @@ fn ublk_qcow2_shutdown<'a, T: Qcow2IoOps + 'a>(
     // flushing meta final time
     let tgt = tgt_rc.clone();
     let task = exe.spawn(async move {
-        tgt.qdev.flush_meta().await.unwrap();
+        if let Err(e) = tgt.qdev.flush_meta().await {
+            log::error!("qcow2 final flush_meta failed: {}", e);
+        }
     });
 
     ublk_run_io_task(exe, &task, q, 0)?;
@@ -356,7 +383,9 @@ async fn ublk_qcow2_flush_meta<T: Qcow2IoOps>(tgt: &Qcow2Tgt<T>, q: &UblkQueue<'
 
     log::debug!("ublk_qcow2_flush_meta: wait for flushing meta");
     q.ublk_submit_sqe(timeout_e).await;
-    tgt.qdev.flush_meta().await.unwrap();
+    if let Err(e) = tgt.qdev.flush_meta().await {
+        log::error!("qcow2 periodic flush_meta failed: {}", e);
+    }
 }
 
 fn ublk_qcow2_drive_exec<'a, T: Qcow2IoOps + 'a>(
@@ -389,7 +418,9 @@ fn ublk_qcow2_drive_exec<'a, T: Qcow2IoOps + 'a>(
         }
     }
 
-    ublk_run_io_task(exe, &flush_task, q_rc, 0).unwrap();
+    if let Err(e) = ublk_run_io_task(exe, &flush_task, q_rc, 0) {
+        log::error!("qcow2 final flush io task failed: {}", e);
+    }
     smol::block_on(exe.run(flush_task));
 }
 
@@ -429,7 +460,8 @@ pub(crate) fn ublk_add_qcow2(
     log::info!("qcow2: add: path {}", &file_path);
 
     let p = qcow2_rs::qcow2_default_params!(false, dio);
-    let qdev = ulbk_qcow2_setup_dev(file.as_path(), &p).unwrap();
+    let qdev = ulbk_qcow2_setup_dev(file.as_path(), &p)
+        .map_err(|e| anyhow::anyhow!("qcow2 setup failed for {}: {}", file_path, e))?;
     let dev_size = qdev.info.virtual_size();
     let tgt_rc = Rc::new(Qcow2Tgt {
         direct_io: i32::from(dio),
@@ -439,10 +471,16 @@ pub(crate) fn ublk_add_qcow2(
 
     let tgt_clone = tgt_rc.clone();
     let tgt_init = move |dev: &mut UblkDev| qcow2_init_tgt(dev, &tgt_clone, opt, dev_size);
-    let dev_rc = Rc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
+    let dev_rc = Rc::new(
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)
+            .map_err(|e| anyhow::anyhow!("ublk device creation failed: {}", e))?,
+    );
 
     let this_dev = dev_rc.clone();
-    let q_rc = Rc::new(UblkQueue::new(0, &this_dev).unwrap());
+    let q_rc = Rc::new(
+        UblkQueue::new(0, &this_dev)
+            .map_err(|e| anyhow::anyhow!("ublk queue creation failed: {}", e))?,
+    );
     let q = q_rc.clone();
     let qp = &*q as *const UblkQueue;
     set_thread_local_queue(qp as *const ());
@@ -471,7 +509,9 @@ pub(crate) fn ublk_add_qcow2(
     log::info!("qcow2: device started");
 
     // Tell parent we are up
-    comm_arc.send_dev_id(dev_id).unwrap();
+    comm_arc
+        .send_dev_id(dev_id)
+        .map_err(|e| anyhow::anyhow!("failed to signal parent: {}", e))?;
 
     // Drive IO tasks for moving on
     ublk_qcow2_drive_exec(&exe, &tgt_rc, &q_rc);
