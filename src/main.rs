@@ -151,12 +151,10 @@ pub(crate) fn ublk_file_size(f: &std::fs::File) -> anyhow::Result<(u64, u8, u8)>
 
             Ok((cap, ssz.log2() as u8, pbsz.log2() as u8))
         } else if meta.file_type().is_file() {
-            let m = f.metadata().unwrap();
-            Ok((
-                m.len(),
-                m.st_blksize().log2() as u8,
-                m.st_blksize().log2() as u8,
-            ))
+            // st_blksize is a preferred I/O size, not a sector size. Some
+            // filesystems report sizes larger than the block layer supports.
+            let shift = (meta.st_blksize().log2() as u8).clamp(9, 12);
+            Ok((meta.len(), shift, shift))
         } else {
             Err(anyhow::anyhow!("unsupported file"))
         }

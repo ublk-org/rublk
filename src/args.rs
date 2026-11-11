@@ -113,6 +113,8 @@ impl GenAddArgs {
         if let Some(bs) = self.physical_block_size {
             dev.tgt.params.basic.physical_bs_shift = bs.log2() as u8;
         }
+        let basic = &mut dev.tgt.params.basic;
+        basic.physical_bs_shift = basic.physical_bs_shift.max(basic.logical_bs_shift);
     }
 
     pub fn apply_read_only(&self, dev: &mut UblkDev) {

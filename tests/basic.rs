@@ -143,6 +143,7 @@ mod integration {
 
         let bs = 1_u32 << params.basic.logical_bs_shift;
         assert!(bs == exp_bs);
+        assert!(params.basic.physical_bs_shift >= params.basic.logical_bs_shift);
     }
 
     fn dd_rw_file(dir: &String, write: bool, bs: u32, count: u32) {
@@ -486,6 +487,40 @@ mod integration {
             write_ublk_disk(ctrl, bs, file_size);
             check_block_size(ctrl, bs);
         });
+    }
+
+    #[test]
+    fn test_ublk_default_block_sizes() {
+        if !support_ublk() {
+            return;
+        }
+
+        for target in ["loop", "qcow2"] {
+            let tmp_file = tempfile::NamedTempFile::new().unwrap();
+            let size = 32 * 1024 * 1024;
+            if target == "qcow2" {
+                create_qcow2_image(tmp_file.path(), size);
+            } else {
+                create_file_with_size(tmp_file.path(), size as u64).unwrap();
+            }
+            let path = tmp_file.path().to_str().unwrap();
+            let ctrl = run_rublk_add_dev(vec!["add", target, "-f", path]);
+            let mut params: sys::ublk_params = Default::default();
+            ctrl.get_params(&mut params).unwrap();
+            for shift in [
+                params.basic.logical_bs_shift,
+                params.basic.physical_bs_shift,
+                params.basic.io_min_shift,
+                params.basic.io_opt_shift,
+            ] {
+                assert!((9..=12).contains(&shift));
+            }
+            let bs = 1_u32 << params.basic.logical_bs_shift;
+            check_block_size(&ctrl, bs);
+            read_ublk_disk(&ctrl);
+            write_ublk_disk(&ctrl, bs, size);
+            run_rublk_del_dev(ctrl, false);
+        }
     }
 
     #[test]

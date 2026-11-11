@@ -467,7 +467,17 @@ pub(crate) fn ublk_add_qcow2(
     }
 
     // Start ublk-qcow2 device
-    ublk_qcow2_start(&exe, &ctrl, &dev_rc, &tgt_rc, &q_rc)?;
+    if let Err(e) = ublk_qcow2_start(&exe, &ctrl, &dev_rc, &tgt_rc, &q_rc) {
+        log::error!("qcow2: failed to start device: {e}");
+
+        // Cancel outstanding UBLK_IO_FETCH_REQ commands before
+        // UblkQueue::drop() unregisters the fixed file.
+        if let Err(stop_err) = ctrl.stop_dev() {
+            log::error!("qcow2: STOP_DEV failed during startup cleanup: {stop_err}");
+        }
+
+        return Err(e.into());
+    }
     log::info!("qcow2: device started");
 
     // Tell parent we are up
