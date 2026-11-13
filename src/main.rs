@@ -340,6 +340,12 @@ const FEATURES_TABLE: &[&str] = &[
     "QUIESCE",
     "PER_IO_DAEMON",
     "BUF_REG_OFF_DAEMON",
+    "BATCH_IO",
+    "INTEGRITY",
+    "SAFE_STOP_DEV",
+    "NO_AUTO_PART_SCAN",
+    "SHMEM_ZC",
+    "IO_DESC_SIZE",
 ];
 
 #[allow(clippy::needless_range_loop)]
