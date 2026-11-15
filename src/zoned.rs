@@ -139,6 +139,18 @@ impl TgtCfg {
             pre_alloc_size: (p as u64) << 20,
         }
     }
+    /// Parse a size argument (default unit MiB) into whole MiB; sizes
+    /// that aren't a multiple of 1MiB would otherwise be truncated.
+    fn parse_mib(name: &str, val: &str) -> anyhow::Result<u32> {
+        let cfg = parse_size::Config::new().with_default_factor(1_048_576);
+        let bytes = cfg.parse_size(val)?;
+
+        if bytes % (1 << 20) != 0 {
+            bail!("{} {} is not a multiple of 1MiB", name, val);
+        }
+        u32::try_from(bytes >> 20).map_err(|_| anyhow::anyhow!("{} {} is too big", name, val))
+    }
+
     fn from_argument(a: &ZonedAddArgs) -> anyhow::Result<Self> {
         let p = match a.path.clone() {
             Some(p) => {
@@ -150,14 +162,9 @@ impl TgtCfg {
             }
             _ => None,
         };
-        let cfg = parse_size::Config::new().with_default_factor(1_048_576);
-        let s = (cfg.parse_size(a.size.clone())? >> 20).try_into().unwrap();
-        let zs = (cfg.parse_size(a.zone_size.clone())? >> 20)
-            .try_into()
-            .unwrap();
-        let za = (cfg.parse_size(a.pre_alloc_size.clone())? >> 20)
-            .try_into()
-            .unwrap();
+        let s = Self::parse_mib("size", &a.size)?;
+        let zs = Self::parse_mib("zone_size", &a.zone_size)?;
+        let za = Self::parse_mib("pre_alloc_size", &a.pre_alloc_size)?;
         let ma_zones = a.max_active_zones;
         let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, ma_zones, p, za);
 
@@ -166,12 +173,7 @@ impl TgtCfg {
 
     fn get_pre_alloc_size(zo: Option<&ZonedAddArgs>) -> anyhow::Result<u32> {
         let za = match zo {
-            Some(a) => {
-                let cfg = parse_size::Config::new().with_default_factor(1_048_576);
-                (cfg.parse_size(a.pre_alloc_size.clone())? >> 20)
-                    .try_into()
-                    .unwrap()
-            }
+            Some(a) => Self::parse_mib("pre_alloc_size", &a.pre_alloc_size)?,
             _ => Self::DEF_ZONE_PRE_ALLOC_MB,
         };
         Ok(za)
@@ -1167,7 +1169,7 @@ pub(crate) struct ZonedAddArgs {
         long,
         default_value = "256MiB",
         help = "zone size, default unit is MiB, with common suffixes supported\n\
-        ([B|KiB|MiB|GiB]), has to be aligned with logical block size"
+        ([B|KiB|MiB|GiB]), has to be a power of 2 and at least 1MiB"
     )]
     zone_size: String,
 
@@ -1249,7 +1251,12 @@ pub(crate) fn ublk_add_zoned(
         },
     };
 
-    if cfg.size < cfg.zone_size || (cfg.size % cfg.zone_size) != 0 || (cfg.zone_size % 512) != 0 {
+    if cfg.zone_size == 0
+        || !cfg.zone_size.is_power_of_two()
+        || cfg.size < cfg.zone_size
+        || (cfg.size % cfg.zone_size) != 0
+        || (cfg.zone_size % 512) != 0
+    {
         return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
     }
 
