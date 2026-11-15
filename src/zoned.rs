@@ -1252,6 +1252,7 @@ pub(crate) fn ublk_add_zoned(
     };
 
     if cfg.zone_size == 0
+        || !cfg.zone_size.is_power_of_two()
         || cfg.size < cfg.zone_size
         || (cfg.size % cfg.zone_size) != 0
         || (cfg.zone_size % 512) != 0
