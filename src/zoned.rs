@@ -1532,10 +1532,12 @@ pub(crate) fn ublk_add_zoned(
     };
 
     let comm = comm_arc.clone();
+    // Return the failure to caller, so that the parent of daemon can be
+    // notified, instead of waiting for the device forever.
     ctrl.run_target(tgt_init, q_handler, move |ctrl: &_| {
         comm.send_dev_id(ctrl.dev_info().dev_id).unwrap();
     })
-    .unwrap();
+    .map_err(|e| anyhow::anyhow!("run zoned target failed: {:?}", e))?;
 
     Ok(0)
 }
