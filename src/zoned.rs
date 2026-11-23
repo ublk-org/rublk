@@ -121,9 +121,11 @@ struct TgtCfg {
 
 impl TgtCfg {
     const DEF_ZONE_PRE_ALLOC_MB: u32 = 256;
+    #[allow(clippy::too_many_arguments)]
     fn new(
         s: u32,
         zs: u32,
+        zc: u32,
         conv: u32,
         m_open: u32,
         m_act: u32,
@@ -133,7 +135,7 @@ impl TgtCfg {
         TgtCfg {
             size: (s as u64) << 20,
             zone_size: (zs as u64) << 20,
-            zone_capacity: (zs as u64) << 20,
+            zone_capacity: (zc as u64) << 20,
             zone_nr_conv: conv,
             zone_max_open: m_open,
             zone_max_active: m_act,
@@ -166,9 +168,14 @@ impl TgtCfg {
         };
         let s = Self::parse_mib("size", &a.size)?;
         let zs = Self::parse_mib("zone_size", &a.zone_size)?;
+        // zone capacity is same with zone size if it isn't specified
+        let zc = match a.zone_capacity {
+            Some(ref c) => Self::parse_mib("zone_capacity", c)?,
+            None => zs,
+        };
         let za = Self::parse_mib("pre_alloc_size", &a.pre_alloc_size)?;
         let ma_zones = a.max_active_zones;
-        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, ma_zones, p, za);
+        let tcfg = Self::new(s, zs, zc, a.conv_zones, a.max_open_zones, ma_zones, p, za);
 
         Ok(tcfg)
     }
@@ -223,7 +230,7 @@ impl TgtCfg {
                 .collect();
             let base = p.parent().expect("no parent?").to_path_buf();
             let za = Self::get_pre_alloc_size(zo)?;
-            let c = TgtCfg::new(n[0], n[1], n[2], n[3], n[4], Some(base), za);
+            let c = TgtCfg::new(n[0], n[1], n[1], n[2], n[3], n[4], Some(base), za);
             return Ok(c);
         }
         anyhow::bail!("faile to create TgtCfg from file")
@@ -417,7 +424,12 @@ impl ZonedTgt {
 
         let zones: Vec<Zone> = (0..nr_zones as usize)
             .map(|i| Zone {
-                capacity: zone_cap as u32,
+                // only sequential zone can have smaller capacity than its size
+                capacity: if i < cfg.zone_nr_conv as usize {
+                    (cfg.zone_size >> 9) as u32
+                } else {
+                    zone_cap as u32
+                },
                 len: (cfg.zone_size >> 9) as u32,
                 r#type: if i < cfg.zone_nr_conv as usize {
                     BLK_ZONE_TYPE_CONVENTIONAL
@@ -567,9 +579,10 @@ impl ZonedTgt {
         let start = (sector << 9) & (zsize - 1);
         let end = start + ((nr_sects << 9) as u64);
         let za_start = super::args::round_up(start, za_size);
-        let za_end = super::args::round_up(end, za_size);
+        // nothing can be written behind zone capacity
+        let za_end = super::args::round_up(end, za_size).min(self.cfg.zone_capacity);
 
-        if za_start == za_end {
+        if za_start >= za_end {
             return;
         }
 
@@ -800,7 +813,10 @@ impl ZonedTgt {
 
         if !self.ram_backed() {
             let zno = self.get_zone_no(sector);
-            if let Err(e) = self.back_file_truncate(zno, self.cfg.zone_size) {
+            // The zone file can't be bigger than zone capacity, and write
+            // pointer is figured out from the file size when the device is
+            // setup again.
+            if let Err(e) = self.back_file_truncate(zno, self.cfg.zone_capacity) {
                 bail!(zs.set_seq_err(format!("truncate zone {zno} file, err {e:?}")));
             }
         }
@@ -1293,6 +1309,15 @@ pub(crate) struct ZonedAddArgs {
 
     #[clap(
         long,
+        help = "zone capacity of sequential zones, the writable part from the\n\
+        start of each zone, default unit is MiB, with common suffixes supported\n\
+        ([B|KiB|MiB|GiB]), has to be a multiple of 1MiB and can't be bigger\n\
+        than zone size. Default: same as zone size"
+    )]
+    zone_capacity: Option<String>,
+
+    #[clap(
+        long,
         default_value = "256MiB",
         help = "how many bytes preallocated before appending data to zone, default\n\
         unit is MiB, with common suffixes supported([B|KiB|MiB|GiB]), can't be\n\
@@ -1378,6 +1403,17 @@ pub(crate) fn ublk_add_zoned(
         return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
     }
 
+    if cfg.zone_capacity == 0
+        || cfg.zone_capacity > cfg.zone_size
+        || (cfg.zone_capacity % (1 << 20)) != 0
+    {
+        bail!(
+            "zone_capacity {} is invalid: it has to be a multiple of 1MiB and not bigger than zone_size {}",
+            cfg.zone_capacity,
+            cfg.zone_size
+        );
+    }
+
     if ((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
         return Err(anyhow::anyhow!("Too many conventioanl zones"));
     }
@@ -1394,7 +1430,7 @@ pub(crate) fn ublk_add_zoned(
         dev.tgt.params.zoned = libublk::sys::ublk_param_zoned {
             max_open_zones: cfg_i.zone_max_open,
             max_active_zones: cfg_i.zone_max_active,
-            max_zone_append_sectors: (cfg_i.zone_size >> 9) as u32,
+            max_zone_append_sectors: (cfg_i.zone_capacity >> 9) as u32,
             ..Default::default()
         };
 
