@@ -1620,6 +1620,217 @@ mod integration {
         __test_ublk_add_del_zoned(4096, 2, Some(&path_str), false, tf);
     }
 
+    fn has_fio() -> bool {
+        match Command::new("fio")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(res) => res.success(),
+            _ => false,
+        }
+    }
+
+    /// Write `io_mb` MiB to random offsets of the ublk disk with fio, then
+    /// read every written block back and verify its checksum.
+    ///
+    /// `seed` selects both the offsets and the data, so running this twice
+    /// over one device with different seeds makes sure that data from the
+    /// earlier run is really replaced. `extra` is appended to fio's command
+    /// line, for target specific options such as `--zonemode=zbd`.
+    ///
+    /// Return bytes verified.
+    fn fio_randwrite_verify(ctrl: &UblkCtrl, io_mb: u64, seed: u32, extra: &[&str]) -> u64 {
+        let bdev = ctrl.get_bdev_path();
+        // The whole `io_size` has to be written and verified, so don't limit
+        // runtime of fio, and `timeout` is for avoiding to hang forever.
+        let res = Command::new("timeout")
+            .args(["600", "fio"])
+            .args(["--name=randwrite_verify", "--output-format=json"])
+            .arg(format!("--filename={}", bdev))
+            .args(["--direct=1", "--ioengine=libaio", "--iodepth=16"])
+            .args(["--rw=randwrite", "--bsrange=4k-128k"])
+            .arg(format!("--io_size={}M", io_mb))
+            .arg(format!("--randseed={}", seed))
+            .args(["--verify=crc32c", "--do_verify=1", "--verify_fatal=1"])
+            .arg("--verify_state_save=0")
+            .args(extra)
+            .output()
+            .expect("Failed to execute fio");
+        let out = String::from_utf8_lossy(&res.stdout).to_string();
+        let err = String::from_utf8_lossy(&res.stderr).to_string();
+
+        assert!(
+            res.status.code() != Some(124),
+            "fio isn't done on {} {:?} in 600 seconds",
+            bdev,
+            extra
+        );
+        // any verify failure or io error makes fio exit with failure
+        assert!(
+            res.status.success(),
+            "fio failed on {} {:?}: {}\n{}",
+            bdev,
+            extra,
+            res.status,
+            err
+        );
+
+        // fio may log something before the json document
+        let json: serde_json::Value =
+            serde_json::from_str(&out[out.find('{').expect("no fio json output")..]).unwrap();
+        let job = &json["jobs"][0];
+        let written = job["write"]["io_bytes"].as_u64().unwrap();
+        let read = job["read"]["io_bytes"].as_u64().unwrap();
+
+        println!(
+            "fio randwrite & verify {} {:?}: write {} bytes/{} ios, verify read {} bytes/{} ios, err {}",
+            bdev,
+            extra,
+            written,
+            job["write"]["total_ios"],
+            read,
+            job["read"]["total_ios"],
+            job["error"]
+        );
+
+        assert_eq!(job["error"].as_i64(), Some(0));
+        assert_eq!(job["total_err"].as_u64().unwrap_or(0), 0);
+        // the workload is really run, and each written byte is verified
+        assert!(
+            written + (128 << 10) >= io_mb << 20,
+            "short write {}",
+            written
+        );
+        assert_eq!(read, written);
+
+        read
+    }
+
+    #[test]
+    fn test_ublk_fio_verify_loop() {
+        if !support_ublk() {
+            return;
+        }
+        if !has_fio() {
+            return;
+        }
+
+        let tf = |ctrl: &UblkCtrl, _bs: u32, file_size: usize, _path: &str| {
+            let io_mb = (file_size >> 20) as u64 / 2;
+
+            fio_randwrite_verify(ctrl, io_mb, 1, &[]);
+            fio_randwrite_verify(ctrl, io_mb, 2, &[]);
+        };
+
+        __test_ublk_add_del_loop(4096, false, false, false, tf);
+        __test_ublk_add_del_loop(512, true, false, false, tf);
+    }
+
+    #[test]
+    fn test_ublk_fio_verify_qcow2() {
+        if !support_ublk() {
+            return;
+        }
+        if !has_fio() {
+            return;
+        }
+
+        __test_ublk_add_del_qcow2(4096, false, |ctrl, _bs, file_size| {
+            let io_mb = (file_size >> 20) as u64 / 2;
+
+            fio_randwrite_verify(ctrl, io_mb, 1, &[]);
+            fio_randwrite_verify(ctrl, io_mb, 2, &[]);
+        });
+    }
+
+    /// Run fio random write & verify in zbd mode over one zoned device of 16
+    /// zones, in which each zone is `zs_mb` MiB with `zc_mb` MiB capacity.
+    ///
+    /// In zbd mode, fio turns a random write into one write at the write
+    /// pointer of a randomly chosen sequential zone, so writes are spread
+    /// over many zones, each of which is filled gradually up to its
+    /// capacity, and at most `max_open` (if it isn't zero) zones are written
+    /// at the same time. Conventional zones are written in place.
+    fn __test_ublk_fio_verify_zoned(
+        zs_mb: u64,
+        zc_mb: u64,
+        conv: u32,
+        max_open: u32,
+        dir: Option<&String>,
+    ) {
+        const NR_ZONES: u64 = 16;
+        let size = (NR_ZONES * zs_mb).to_string();
+        let zs_str = zs_mb.to_string();
+        let zc_str = zc_mb.to_string();
+        let conv_str = conv.to_string();
+        let max_open_str = max_open.to_string();
+        let mut cmdline = [
+            "add",
+            "zoned",
+            "--size",
+            &size,
+            "--zone-size",
+            &zs_str,
+            "--zone-capacity",
+            &zc_str,
+            "--conv-zones",
+            &conv_str,
+            "--max-open-zones",
+            &max_open_str,
+        ]
+        .to_vec();
+        if let Some(d) = dir {
+            cmdline.extend(["--path", d]);
+        }
+
+        let fio_max_open = format!("--max_open_zones={}", max_open);
+        let mut fio_args = ["--zonemode=zbd"].to_vec();
+        if max_open > 0 {
+            fio_args.push(&fio_max_open);
+        }
+
+        // Write 3/4 of the writable space each time, so the 2nd run can't
+        // complete without resetting and rewriting zones filled by the 1st
+        // one: fio resets the zones before writing if verify is enabled.
+        let io_mb = (conv as u64 * zs_mb + (NR_ZONES - conv as u64) * zc_mb) * 3 / 4;
+
+        let ctrl = run_rublk_add_dev(cmdline);
+        fio_randwrite_verify(&ctrl, io_mb, 1, &fio_args);
+        fio_randwrite_verify(&ctrl, io_mb, 2, &fio_args);
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    #[test]
+    fn test_ublk_fio_verify_zoned() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_fio() {
+            return;
+        }
+
+        // (zone size, zone capacity, conventional zones, max open zones)
+        let cfgs = [(4, 4, 0, 0), (4, 3, 0, 4), (4, 3, 1, 2)];
+
+        // ram-backed
+        for (zs, zc, conv, max_open) in cfgs {
+            __test_ublk_fio_verify_zoned(zs, zc, conv, max_open, None);
+        }
+
+        // file-backed
+        for (zs, zc, conv, max_open) in cfgs {
+            let path_dir = tempfile::TempDir::new().unwrap();
+            let path_str = path_dir.path().to_string_lossy().to_string();
+
+            __test_ublk_fio_verify_zoned(zs, zc, conv, max_open, Some(&path_str));
+        }
+    }
+
     fn run_ublk_recover(ctrl: &UblkCtrl) {
         let id = ctrl.dev_info().dev_id.to_string();
         let pid = ctrl.dev_info().ublksrv_pid.to_string();
