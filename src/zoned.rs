@@ -883,12 +883,32 @@ async fn handle_read(
         let zf_offset = (iod.start_sector << 9) & (tgt.cfg.zone_size - 1);
 
         //read to temp buffer from backed-file
-        let sqe = opcode::Read::new(types::Fd(zfd), buf_addr as *mut u8, bytes as u32)
-            .offset(zf_offset)
+        //
+        // The backing file ends at the write pointer of this zone, so the
+        // read is short if it covers anything behind. Read again after a
+        // short read: 0 tells that the end of file is really reached, and
+        // any other reason of the short read shows up as one failure.
+        let mut done = 0_usize;
+        while done < bytes {
+            let sqe = opcode::Read::new(
+                types::Fd(zfd),
+                unsafe { (buf_addr as *mut u8).add(done) },
+                (bytes - done) as u32,
+            )
+            .offset(zf_offset + done as u64)
             .build();
-        let res = q.ublk_submit_sqe(sqe).await;
-        if res < 0 {
-            return Err(anyhow::anyhow!("io uring read failure {}", res));
+            let res = q.ublk_submit_sqe(sqe).await;
+            if res < 0 {
+                return Err(anyhow::anyhow!("io uring read failure {}", res));
+            }
+            if res == 0 {
+                break;
+            }
+            done += res as usize;
+        }
+        // what is behind the end of file is read as zero
+        if done < bytes {
+            unsafe { memset(buf_addr.add(done), 0, bytes - done) };
         }
         //write data from temp buffer to ublkc request
         handle_read_copy(fd, bytes, offset, buf_addr, cond == BLK_ZONE_COND_EMPTY)

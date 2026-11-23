@@ -433,6 +433,67 @@ mod integration {
         __test_ublk_add_del_zoned(4096, 1, None, false, tf);
     }
 
+    /// Reading the unwritten part of one zone has to return zeroes.
+    #[test]
+    fn test_ublk_zoned_read_unwritten() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        let tf = |ctrl: &UblkCtrl, _bs: u32, _file_size: usize| {
+            const BS: usize = 64 << 10;
+            let dev = ctrl.get_bdev_path();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let pattern = tmp_dir.path().join("pattern");
+            let out = tmp_dir.path().join("out");
+
+            // write the 1st 64k of zone 0
+            std::fs::write(&pattern, vec![0xaa_u8; BS]).unwrap();
+            let res = Command::new("dd")
+                .arg(format!("if={}", pattern.display()))
+                .arg(format!("of={}", dev))
+                .args(["bs=64k", "count=1", "oflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+
+            // read the 1st 128k by one IO, and its 2nd half isn't written
+            let res = Command::new("dd")
+                .arg(format!("if={}", dev))
+                .arg(format!("of={}", out.display()))
+                .args(["bs=128k", "count=1", "iflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+
+            let data = std::fs::read(&out).unwrap();
+            assert!(data.len() == 2 * BS);
+            assert!(data[..BS].iter().all(|b| *b == 0xaa));
+            assert!(data[BS..].iter().all(|b| *b == 0));
+
+            // and read the 2nd 64k only, which is behind the write pointer
+            let res = Command::new("dd")
+                .arg(format!("if={}", dev))
+                .arg(format!("of={}", out.display()))
+                .args(["bs=64k", "skip=1", "count=1", "iflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+
+            let data = std::fs::read(&out).unwrap();
+            assert!(data.len() == BS);
+            assert!(data.iter().all(|b| *b == 0));
+        };
+        __test_ublk_add_del_zoned(4096, 1, None, false, tf);
+
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+
+        __test_ublk_add_del_zoned(4096, 1, Some(&path_str), false, tf);
+    }
+
     fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, recover: bool, zc: bool, f: F)
     where
         F: Fn(&UblkCtrl, u32, usize, &str),
