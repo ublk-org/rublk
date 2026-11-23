@@ -891,7 +891,9 @@ fn handle_report_zones(
     let blkz_sz = core::mem::size_of::<libublk::sys::blk_zone>() as u32;
 
     // USER_COPY is enabled, so we have to allocate buffer for report_zones
-    let buf = IoBuf::<u8>::new((blkz_sz * zones) as usize);
+    // and it has to be zeroed, since not all fields of `blk_zone` are filled
+    let mut buf = IoBuf::<u8>::new((blkz_sz * zones) as usize);
+    buf.zero_buf();
     let buf_addr = buf.as_mut_ptr();
     let mut off = buf_addr as u64;
 
