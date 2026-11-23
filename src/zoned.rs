@@ -20,11 +20,13 @@ use bitflags::bitflags;
 use io_uring::{opcode, types};
 use libc::{c_void, memset, pread, pwrite};
 use log::trace;
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock, RwLockReadGuard as RLGuard, RwLockWriteGuard as WLGuard};
 
 bitflags! {
@@ -242,6 +244,9 @@ struct ZonedTgt {
     zfiles: Vec<File>,
     cfg: TgtCfg,
     base_file: Option<File>,
+    // queue of the flush thread, each flush sends the eventfd to be
+    // written when it is done
+    flush_tx: Option<Sender<Arc<EventFd>>>,
 }
 
 impl Drop for ZonedTgt {
@@ -267,6 +272,75 @@ impl ZonedTgt {
         if let Some(ref h) = self.base_file {
             unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_UN) };
         }
+    }
+
+    /// All flushes of this device are handled by one thread, so syncfs()
+    /// isn't called from the queue threads.
+    ///
+    /// The thread takes all the flushes which are waiting, calls syncfs()
+    /// once for them, then writes the eventfd of each one: 1 for success,
+    /// 1 + errno for failure. One flush which comes when syncfs() is
+    /// running has to wait for the next round, since the running one may
+    /// not cover the writes completed before this flush.
+    fn flush_thread_fn(zf: File, rx: Receiver<Arc<EventFd>>) {
+        // syncfs() used to be called from the queue thread, which is one
+        // IO flusher, and the same is needed here: memory reclaim in this
+        // thread must not wait for IO of this ublk device.
+        UblkCtrl::init_queue_thread();
+
+        while let Ok(first) = rx.recv() {
+            let mut efds = vec![first];
+            while let Ok(efd) = rx.try_recv() {
+                efds.push(efd);
+            }
+
+            let val: u64 = if unsafe { libc::syncfs(zf.as_raw_fd()) } < 0 {
+                1 + std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO) as u64
+            } else {
+                1
+            };
+
+            for efd in efds {
+                // can't fail: the counter is zero and the value is small
+                let _ = nix::unistd::write(&*efd, &val.to_ne_bytes());
+            }
+        }
+    }
+
+    /// Flush is handled from the queue thread if this thread can't be
+    /// started.
+    fn start_flush_thread(&mut self) {
+        // Not one dup of zfiles[0]: syncfs() reports one writeback error
+        // once for each open file, and the flush handled from the queue
+        // thread uses zfiles[0].
+        let zf = match self.back_file_path(0).and_then(|p| Ok(File::open(p)?)) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("zoned: no flush thread, fail to open zone file: {}", e);
+                return;
+            }
+        };
+        let (tx, rx) = channel();
+
+        match std::thread::Builder::new()
+            .name("zoned_flush".to_string())
+            .spawn(move || Self::flush_thread_fn(zf, rx))
+        {
+            Ok(_) => self.flush_tx = Some(tx),
+            Err(e) => eprintln!("zoned: fail to start flush thread: {}", e),
+        }
+    }
+
+    /// Queue one flush to the flush thread, and return the eventfd which
+    /// is written when this flush is done.
+    fn queue_flush(&self) -> Option<Arc<EventFd>> {
+        let tx = self.flush_tx.as_ref()?;
+        let efd = Arc::new(EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC).ok()?);
+
+        tx.send(efd.clone()).ok()?;
+        Some(efd)
     }
 
     fn install_zone_files(&mut self, new_dev: bool) -> anyhow::Result<()> {
@@ -374,6 +448,7 @@ impl ZonedTgt {
             zfiles: Vec::new(),
             cfg,
             base_file: None,
+            flush_tx: None,
         };
 
         if !ram_backed {
@@ -391,6 +466,7 @@ impl ZonedTgt {
                     }
                 }
             }
+            dev.start_flush_thread();
         }
 
         Ok(dev)
@@ -962,21 +1038,43 @@ async fn handle_plain_write(
     Ok(res as i32)
 }
 
-fn handle_flush(
+async fn handle_flush(
     tgt: &ZonedTgt,
-    _q: &UblkQueue<'_>,
+    q: &UblkQueue<'_>,
     _tag: u16,
     _iod: &libublk::sys::ublksrv_io_desc,
 ) -> anyhow::Result<i32> {
-    let res = if !tgt.ram_backed() {
-        unsafe { libc::syncfs(tgt.__get_zone_fd(0)) }
-    } else {
-        0
+    if tgt.ram_backed() {
+        return Ok(0);
+    }
+
+    // syncfs() may take long, and no other IO of this queue is handled
+    // if it is called from the queue thread. So hand it to the flush
+    // thread, and wait via io_uring for the eventfd written by it.
+    let efd = match tgt.queue_flush() {
+        Some(efd) => efd,
+        None => {
+            // no flush thread, or the flush can't be queued
+            let res = unsafe { libc::syncfs(tgt.__get_zone_fd(0)) };
+
+            return if res < 0 {
+                Err(anyhow::anyhow!("fail to syncfs {}", res))
+            } else {
+                Ok(0)
+            };
+        }
     };
-    if res < 0 {
-        Err(anyhow::anyhow!("fail to syncfs {}", res))
-    } else {
-        Ok(res)
+
+    let mut buf = [0u8; 8];
+    let sqe = opcode::Read::new(types::Fd(efd.as_raw_fd()), buf.as_mut_ptr(), 8).build();
+    let res = q.ublk_submit_sqe(sqe).await;
+
+    if res != 8 {
+        return Err(anyhow::anyhow!("fail to read flush eventfd {}", res));
+    }
+    match u64::from_ne_bytes(buf) {
+        1 => Ok(0),
+        val => Err(anyhow::anyhow!("fail to syncfs, errno {}", val - 1)),
     }
 }
 
@@ -1136,7 +1234,7 @@ async fn zoned_handle_io(
     );
 
     match op {
-        UBLK_IO_OP_FLUSH => bytes = handle_flush(tgt, q, tag, iod)?,
+        UBLK_IO_OP_FLUSH => bytes = handle_flush(tgt, q, tag, iod).await?,
         UBLK_IO_OP_READ => bytes = handle_read(tgt, q, tag, iod).await?,
         UBLK_IO_OP_WRITE => (_, bytes) = handle_write(tgt, q, tag, iod, false).await?,
         UBLK_IO_OP_ZONE_APPEND => (sector, bytes) = handle_write(tgt, q, tag, iod, true).await?,
