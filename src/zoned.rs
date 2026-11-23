@@ -143,6 +143,40 @@ impl TgtCfg {
             pre_alloc_size: (p as u64) << 20,
         }
     }
+    /// Check parameters from command line or `superblock.json`
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.zone_size == 0
+            || !self.zone_size.is_power_of_two()
+            || self.size < self.zone_size
+            || (self.size % self.zone_size) != 0
+            || (self.zone_size % 512) != 0
+        {
+            return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
+        }
+
+        if self.zone_capacity == 0
+            || self.zone_capacity > self.zone_size
+            || (self.zone_capacity % (1 << 20)) != 0
+        {
+            bail!(
+                "zone_capacity {} is invalid: it has to be a multiple of 1MiB and not bigger than zone_size {}",
+                self.zone_capacity,
+                self.zone_size
+            );
+        }
+
+        if ((self.zone_nr_conv as u64) * self.zone_size) >= self.size {
+            return Err(anyhow::anyhow!("Too many conventioanl zones"));
+        }
+
+        if self.pre_alloc_size > self.zone_size
+            && !super::args::is_power2_of(self.pre_alloc_size, 4096)
+        {
+            bail!(anyhow::anyhow!("bad pre_alloc_size"));
+        }
+        Ok(())
+    }
+
     /// Parse a size argument (default unit MiB) into whole MiB; sizes
     /// that aren't a multiple of 1MiB would otherwise be truncated.
     fn parse_mib(name: &str, val: &str) -> anyhow::Result<u32> {
@@ -1363,6 +1397,9 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
             Ok((c, false))
         } else {
             let c = TgtCfg::from_argument(zo)?;
+            // don't leave bad parameters in `superblock.json`, which can't
+            // be overridden from command line any more
+            c.validate()?;
             c.save_file_json(&zfj)?;
             Ok((c, true))
         }
@@ -1394,33 +1431,7 @@ pub(crate) fn ublk_add_zoned(
         },
     };
 
-    if cfg.zone_size == 0
-        || !cfg.zone_size.is_power_of_two()
-        || cfg.size < cfg.zone_size
-        || (cfg.size % cfg.zone_size) != 0
-        || (cfg.zone_size % 512) != 0
-    {
-        return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
-    }
-
-    if cfg.zone_capacity == 0
-        || cfg.zone_capacity > cfg.zone_size
-        || (cfg.zone_capacity % (1 << 20)) != 0
-    {
-        bail!(
-            "zone_capacity {} is invalid: it has to be a multiple of 1MiB and not bigger than zone_size {}",
-            cfg.zone_capacity,
-            cfg.zone_size
-        );
-    }
-
-    if ((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
-        return Err(anyhow::anyhow!("Too many conventioanl zones"));
-    }
-
-    if cfg.pre_alloc_size > cfg.zone_size && !super::args::is_power2_of(cfg.pre_alloc_size, 4096) {
-        bail!(anyhow::anyhow!("bad pre_alloc_size"));
-    }
+    cfg.validate()?;
 
     let cfg_i = cfg.clone();
     let tgt_init = |dev: &mut UblkDev| {
