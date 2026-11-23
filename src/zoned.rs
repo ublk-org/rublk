@@ -442,6 +442,7 @@ impl ZonedTgt {
             anyhow::bail!(ZIOError::UpdateSeq("file size 2big".to_string()));
         }
 
+        let old_cond = zs.cond;
         if secs == 0 {
             zs.cond = BLK_ZONE_COND_EMPTY;
             zs.wp = z.start;
@@ -452,8 +453,35 @@ impl ZonedTgt {
             zs.cond = BLK_ZONE_COND_CLOSED;
             zs.wp = z.start + secs;
         }
+        self.account_cond_change(old_cond, zs.cond);
         zs.clear_seq_err();
         Ok(())
+    }
+
+    /// Update open & closed zones counters after zone condition is changed
+    /// from `old` to `new`, both have to be called with the zone locked.
+    fn account_cond_change(
+        &self,
+        old: libublk::sys::blk_zone_cond,
+        new: libublk::sys::blk_zone_cond,
+    ) {
+        if old == new {
+            return;
+        }
+
+        let mut data = self.data.write().unwrap();
+        match old {
+            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
+            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
+            BLK_ZONE_COND_CLOSED => data.nr_zones_closed -= 1,
+            _ => {}
+        }
+        match new {
+            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open += 1,
+            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open += 1,
+            BLK_ZONE_COND_CLOSED => data.nr_zones_closed += 1,
+            _ => {}
+        }
     }
 
     fn update_seq_zone(&self, zno: u32) -> anyhow::Result<()> {
@@ -526,12 +554,9 @@ impl ZonedTgt {
                 if new_dev {
                     dev.setup_zone_backing_file(zno as u32)?;
                 }
+                // closed zones are counted when updating zone
                 if zno >= dev.cfg.zone_nr_conv.try_into().unwrap() {
                     dev.update_seq_zone(zno as u32)?;
-                    if dev.zones[zno].get_cond() == BLK_ZONE_COND_CLOSED {
-                        let mut data = dev.data.write().unwrap();
-                        data.nr_zones_closed += 1;
-                    }
                 }
             }
             dev.start_flush_thread();
@@ -728,25 +753,20 @@ impl ZonedTgt {
             return Err(anyhow::anyhow!("reset conventional zone"));
         }
 
-        match zs.cond {
+        let old_cond = zs.cond;
+        match old_cond {
             BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return Ok(0),
-            BLK_ZONE_COND_IMP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_imp_open -= 1;
-            }
-            BLK_ZONE_COND_EXP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_exp_open -= 1;
-            }
-            BLK_ZONE_COND_CLOSED => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_closed -= 1;
-            }
-            BLK_ZONE_COND_FULL => {}
+            BLK_ZONE_COND_IMP_OPEN
+            | BLK_ZONE_COND_EXP_OPEN
+            | BLK_ZONE_COND_CLOSED
+            | BLK_ZONE_COND_FULL => {}
             _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_reset", zs.cond)),
         }
 
+        // Zone condition isn't changed if discarding zone fails, so update
+        // the counters after it succeeds.
         self.discard_zone(self.get_zone_no(sector), &mut zs)?;
+        self.account_cond_change(old_cond, BLK_ZONE_COND_EMPTY);
 
         let start = z.start;
         zs.cond = BLK_ZONE_COND_EMPTY;
@@ -845,24 +865,12 @@ impl ZonedTgt {
             return Err(anyhow::anyhow!("finish conventional zone"));
         }
 
-        match zs.cond {
+        let old_cond = zs.cond;
+        match old_cond {
             // finish operation on full is not an error
-            BLK_ZONE_COND_FULL => {}
-            BLK_ZONE_COND_EMPTY => {
-                self.check_zone_resources(BLK_ZONE_COND_EMPTY)?;
-            }
-            BLK_ZONE_COND_IMP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_imp_open -= 1;
-            }
-            BLK_ZONE_COND_EXP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_exp_open -= 1;
-            }
-            BLK_ZONE_COND_CLOSED => {
-                self.check_zone_resources(BLK_ZONE_COND_CLOSED)?;
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_closed -= 1;
+            BLK_ZONE_COND_FULL | BLK_ZONE_COND_IMP_OPEN | BLK_ZONE_COND_EXP_OPEN => {}
+            BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_CLOSED => {
+                self.check_zone_resources(old_cond)?;
             }
             _ => return Err(anyhow::anyhow!("bad zone cond {}", zs.cond)),
         };
@@ -876,6 +884,9 @@ impl ZonedTgt {
                 bail!(zs.set_seq_err(format!("truncate zone {zno} file, err {e:?}")));
             }
         }
+        // Zone condition isn't changed if truncating zone file fails, so
+        // update the counters after it succeeds.
+        self.account_cond_change(old_cond, BLK_ZONE_COND_FULL);
         zs.cond = BLK_ZONE_COND_FULL;
         zs.wp = z.start + z.len as u64;
         zs.clear_seq_err();
@@ -1174,6 +1185,12 @@ async fn handle_write(
     let zone_end = z.start + z.capacity as u64;
     let (wp, sector) = {
         let mut zs = z.get_stat_mut();
+
+        // Zone condition and write pointer have to be updated first, before
+        // any of them is checked.
+        if zs.is_seq_err() {
+            tgt.__update_seq_zone(z, &mut zs)?;
+        }
         let cond = zs.cond;
 
         if cond == BLK_ZONE_COND_FULL
@@ -1190,10 +1207,6 @@ async fn handle_write(
 
         if zs.wp + iod.nr_sectors as u64 > zone_end {
             return Err(anyhow::anyhow!("write out of zone"));
-        }
-
-        if zs.is_seq_err() {
-            tgt.__update_seq_zone(z, &mut zs)?;
         }
 
         if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
@@ -1226,16 +1239,14 @@ async fn handle_write(
     if wp == zone_end {
         let mut zs = z.get_stat_mut();
 
-        if zs.cond != BLK_ZONE_COND_FULL {
-            if zs.cond == BLK_ZONE_COND_EXP_OPEN {
-                let mut data = tgt.data.write().unwrap();
-
-                data.nr_zones_exp_open -= 1;
-            } else if zs.cond == BLK_ZONE_COND_IMP_OPEN {
-                let mut data = tgt.data.write().unwrap();
-
-                data.nr_zones_imp_open -= 1;
-            }
+        // The zone isn't locked when this write is in progress, so it may
+        // have been closed, either explicitly or implicitly for opening
+        // another zone, and it may have been finished or reset too.
+        //
+        // So account from its current condition, and leave the zone alone
+        // if its write pointer has been moved.
+        if zs.wp == zone_end && zs.cond != BLK_ZONE_COND_FULL {
+            tgt.account_cond_change(zs.cond, BLK_ZONE_COND_FULL);
             zs.cond = BLK_ZONE_COND_FULL;
         }
     }
