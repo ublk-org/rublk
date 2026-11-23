@@ -384,7 +384,7 @@ impl ZonedTgt {
             zs.wp = z.start;
         } else if secs == (z.capacity as u64) {
             zs.cond = BLK_ZONE_COND_FULL;
-            zs.wp = z.start + self.cfg.zone_size;
+            zs.wp = z.start + z.len as u64;
         } else {
             zs.cond = BLK_ZONE_COND_CLOSED;
             zs.wp = z.start + secs;
