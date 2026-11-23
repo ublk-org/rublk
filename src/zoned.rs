@@ -1076,16 +1076,17 @@ async fn handle_queue_tag_async_zoned(
             }
             Err(e) => {
                 lba = 0;
-                if let Ok(ze) = e.downcast::<ZIOError>() {
-                    match ze {
-                        ZIOError::MaxOpenOverflow(_) => res = -libc::ETOOMANYREFS,
-                        ZIOError::MaxActiveOverflow(_) => res = -libc::EOVERFLOW,
-                        ZIOError::UpdateSeq(_) => res = -libc::EIO,
-                    };
-                } else {
-                    eprintln!("handle io failure");
-                    break;
-                }
+                res = match e.downcast::<ZIOError>() {
+                    Ok(ZIOError::MaxOpenOverflow(_)) => -libc::ETOOMANYREFS,
+                    Ok(ZIOError::MaxActiveOverflow(_)) => -libc::EOVERFLOW,
+                    Ok(ZIOError::UpdateSeq(_)) => -libc::EIO,
+                    // Any other failure is still a failure of this io
+                    // command only, which has to be completed.
+                    Err(e) => {
+                        eprintln!("zoned: io command of tag {} failed: {}", tag, e);
+                        -libc::EIO
+                    }
+                };
             }
         }
 
@@ -1093,7 +1094,6 @@ async fn handle_queue_tag_async_zoned(
         q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res)
             .await?;
     }
-    Ok(())
 }
 
 async fn zoned_handle_io(
