@@ -150,6 +150,8 @@ impl TgtCfg {
             || self.size < self.zone_size
             || (self.size % self.zone_size) != 0
             || (self.zone_size % 512) != 0
+            // zone size in sectors is stored in u32
+            || (self.zone_size >> 9) > u32::MAX as u64
         {
             return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
         }
@@ -246,14 +248,29 @@ impl TgtCfg {
 
     fn save_file_json(&self, p: &PathBuf) -> anyhow::Result<()> {
         let json_string = serde_json::to_string_pretty(self)?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(p)?;
-        f.write_all(json_string.as_bytes())?;
-        let _ = f.flush();
-        Ok(())
+
+        // Write to one temporary file first, then rename it, so partial
+        // content is never left in `p` if writing fails, such as no space,
+        // otherwise this directory can't be used any more.
+        let mut tmp = p.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let write = || -> anyhow::Result<()> {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(json_string.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, p)?;
+            Ok(())
+        };
+        let res = write();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     }
 
     fn is_parent_of(parent: &PathBuf, child: &PathBuf) -> bool {
@@ -1427,16 +1444,19 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool, Option<
         if !path.exists() {
             return Err(anyhow::anyhow!("base dir doesn't exist"));
         }
-        // `superblock.json` can be created, so the directory has to be
-        // locked first, otherwise the one of another live device may be
-        // overwritten.
+        // `superblock.json` can be created, and it is removed if setting up
+        // the new device fails, so the directory has to be locked first,
+        // otherwise the one of another live device may be overwritten or
+        // removed.
         let lock = Some(lock_base_dir(&path)?);
         let zf = path.join("superblock");
         let zfj = path.join("superblock.json");
         if zfj.exists() {
             Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false, lock))
         } else if zf.exists() {
-            let c = TgtCfg::from_file(&zf, Some(zo))?;
+            let mut c = TgtCfg::from_file(&zf, Some(zo))?;
+            c.validate()?;
+            c.adjust_zone_limits();
             c.save_file_json(&zfj)?;
             std::fs::remove_file(zf)?;
             Ok((c, false, lock))
@@ -1505,7 +1525,34 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(cfg, is_new, base_lock)?);
+    // `superblock.json` of new device is created already, and remove it if
+    // the device can't be setup, otherwise this directory can't be used any
+    // more because zone files are expected to exist next time.
+    let new_sb = match (is_new, &cfg.base) {
+        (true, Some(base)) => Some(base.join("superblock.json")),
+        _ => None,
+    };
+    // keep the base directory locked until `superblock.json` is removed
+    let sb_lock = match (&new_sb, &base_lock) {
+        (Some(sb), Some(l)) => match l.try_clone() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                let _ = std::fs::remove_file(sb);
+                return Err(e.into());
+            }
+        },
+        _ => None,
+    };
+    let zoned_tgt = match ZonedTgt::new(cfg, is_new, base_lock) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            if let Some(sb) = new_sb {
+                let _ = std::fs::remove_file(sb);
+            }
+            return Err(e);
+        }
+    };
+    drop(sb_lock);
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
