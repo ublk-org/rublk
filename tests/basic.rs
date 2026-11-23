@@ -494,6 +494,414 @@ mod integration {
         __test_ublk_add_del_zoned(4096, 1, Some(&path_str), false, tf);
     }
 
+    /// One zone parsed from `blkzone report`, everything is in 512b sectors
+    /// except for `cond`, and `wptr` is relative to `start`.
+    #[derive(Debug)]
+    struct ZoneRep {
+        start: u64,
+        len: u64,
+        cap: u64,
+        wptr: u64,
+        cond: u32,
+    }
+
+    const ZONE_COND_NOT_WP: u32 = 0;
+    const ZONE_COND_EMPTY: u32 = 1;
+    const ZONE_COND_IMP_OPEN: u32 = 2;
+    const ZONE_COND_CLOSED: u32 = 4;
+    const ZONE_COND_FULL: u32 = 14;
+
+    /// Report all zones, and `None` is returned if this `blkzone` is too old
+    /// to show zone capacity.
+    fn blkzone_report(ctrl: &UblkCtrl) -> Option<Vec<ZoneRep>> {
+        let res = Command::new("blkzone")
+            .args(["report", &ctrl.get_bdev_path()])
+            .output()
+            .unwrap();
+        assert!(res.status.success());
+
+        let out = String::from_utf8_lossy(&res.stdout).to_string();
+        let re = regex::Regex::new(
+            r"start: 0x([0-9a-f]+), len 0x([0-9a-f]+), cap 0x([0-9a-f]+), wptr 0x([0-9a-f]+) reset:(\d+) non-seq:(\d+).*zcond:\s*(\d+)\(",
+        )
+        .unwrap();
+        let hex = |s: &str| u64::from_str_radix(s, 16).unwrap();
+        let zones: Vec<ZoneRep> = re
+            .captures_iter(&out)
+            .map(|c| {
+                // both aren't supported, and have to be reported as zero
+                assert!(&c[5] == "0" && &c[6] == "0", "bad reset/non-seq: {}", &c[0]);
+                ZoneRep {
+                    start: hex(&c[1]),
+                    len: hex(&c[2]),
+                    cap: hex(&c[3]),
+                    wptr: hex(&c[4]),
+                    cond: c[7].parse().unwrap(),
+                }
+            })
+            .collect();
+
+        if zones.is_empty() {
+            eprintln!("blkzone doesn't report zone capacity: {}", out);
+            None
+        } else {
+            Some(zones)
+        }
+    }
+
+    fn blkzone_mgmt(ctrl: &UblkCtrl, op: &str, start: u64) -> bool {
+        Command::new("blkzone")
+            .args([op, "-o", &start.to_string(), "-c", "1"])
+            .arg(ctrl.get_bdev_path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Write `count` blocks of `bs_mb` MiB from `src` to the offset of `seek_mb` MiB
+    fn dd_write_dev(ctrl: &UblkCtrl, src: &str, bs_mb: u64, seek_mb: u64, count: u64) -> bool {
+        dd_write_dev_kb(ctrl, src, bs_mb << 10, seek_mb << 10, count)
+    }
+
+    /// Write `count` blocks of `bs_kb` KiB from `src` to the offset of `seek_kb` KiB
+    fn dd_write_dev_kb(ctrl: &UblkCtrl, src: &str, bs_kb: u64, seek_kb: u64, count: u64) -> bool {
+        Command::new("dd")
+            .arg(format!("if={}", src))
+            .arg(format!("of={}", ctrl.get_bdev_path()))
+            .arg(format!("bs={}K", bs_kb))
+            .arg(format!("seek={}", seek_kb << 10))
+            .arg(format!("count={}", count))
+            .arg("oflag=direct,seek_bytes")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    /// Verify zoned device with `zs_mb` zone size and `zc_mb` zone capacity,
+    /// which has 4 zones.
+    ///
+    /// The 1st zone is conventional if `conv` is 1, otherwise all zones are
+    /// sequential, such as ZNS SSD, and the 1st zone is just left as empty.
+    fn __test_ublk_zoned_capacity(zs_mb: u64, zc_mb: u64, conv: u32, dir: Option<&String>) {
+        const MB: u64 = (1 << 20) >> 9; // sectors
+        let size = (4 * zs_mb).to_string();
+        let zs_str = zs_mb.to_string();
+        let zc_str = zc_mb.to_string();
+        let conv_str = conv.to_string();
+        assert!(conv <= 1);
+        let mut cmdline = [
+            "add",
+            "zoned",
+            "--size",
+            &size,
+            "--zone-size",
+            &zs_str,
+            "--zone-capacity",
+            &zc_str,
+            "--conv-zones",
+            &conv_str,
+        ]
+        .to_vec();
+        if let Some(d) = dir {
+            cmdline.extend(["--path", d, "-r"]);
+        }
+        println!("zoned capacity: zone size {zs_mb}M capacity {zc_mb}M conv {conv} dir {dir:?}");
+
+        let ctrl = run_rublk_add_dev(cmdline);
+        let check_geometry = |zones: &Vec<ZoneRep>| {
+            assert!(zones.len() == 4);
+            for (i, z) in zones.iter().enumerate() {
+                assert!(z.start == i as u64 * zs_mb * MB, "{:?}", z);
+                assert!(z.len == zs_mb * MB, "{:?}", z);
+                // conventional zone is always writable completely
+                let cap = if (i as u32) < conv { zs_mb } else { zc_mb };
+                assert!(z.cap == cap * MB, "{:?}", z);
+            }
+            // the 1st zone is never written
+            let cond = if conv > 0 {
+                ZONE_COND_NOT_WP
+            } else {
+                ZONE_COND_EMPTY
+            };
+            assert!(zones[0].cond == cond, "{:?}", zones[0]);
+        };
+        let report = || blkzone_report(&ctrl).unwrap();
+
+        let zones = match blkzone_report(&ctrl) {
+            Some(z) => z,
+            None => {
+                run_rublk_del_dev(ctrl, false);
+                return;
+            }
+        };
+        check_geometry(&zones);
+        assert!(zones[1..].iter().all(|z| z.cond == ZONE_COND_EMPTY));
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let pattern = tmp_dir.path().join("pattern");
+        let pattern_str = pattern.to_string_lossy().to_string();
+        std::fs::write(&pattern, vec![0xaa_u8; 2 << 20]).unwrap();
+
+        // Zone 1: write until zone capacity is reached. Filling the whole
+        // capacity takes too long for big zone, which is covered by finish.
+        if zc_mb <= 256 {
+            if zc_mb > 1 {
+                assert!(dd_write_dev(&ctrl, "/dev/zero", 1, zs_mb, zc_mb - 1));
+            }
+            // and leave the last 128K of zone capacity unwritten
+            let cap_end_kb = (zs_mb + zc_mb) << 10;
+            assert!(dd_write_dev_kb(
+                &ctrl,
+                &pattern_str,
+                128,
+                cap_end_kb - 1024,
+                7
+            ));
+            let z = &report()[1];
+            assert!(z.wptr == zc_mb * MB - 256, "{:?}", z);
+
+            // one 256K write crosses zone capacity, and has to fail without
+            // moving write pointer
+            if zc_mb < zs_mb {
+                assert!(!dd_write_dev_kb(
+                    &ctrl,
+                    &pattern_str,
+                    256,
+                    cap_end_kb - 128,
+                    1
+                ));
+                let z = &report()[1];
+                assert!(z.wptr == zc_mb * MB - 256, "{:?}", z);
+            }
+
+            // the last 128K of zone capacity makes this zone full
+            assert!(dd_write_dev_kb(
+                &ctrl,
+                &pattern_str,
+                128,
+                cap_end_kb - 128,
+                1
+            ));
+            let z = &report()[1];
+            assert!(z.cond == ZONE_COND_FULL, "{:?}", z);
+
+            // no more write is allowed
+            if zc_mb < zs_mb {
+                assert!(!dd_write_dev(&ctrl, &pattern_str, 1, zs_mb + zc_mb, 1));
+            }
+            assert!(!dd_write_dev(&ctrl, &pattern_str, 1, zs_mb, 1));
+        }
+
+        // Zone 2: finish one partially written zone, then reset it
+        assert!(dd_write_dev(&ctrl, &pattern_str, 1, 2 * zs_mb, 1));
+        let z = &report()[2];
+        assert!(z.cond == ZONE_COND_IMP_OPEN && z.wptr == MB, "{:?}", z);
+
+        assert!(blkzone_mgmt(&ctrl, "finish", 2 * zs_mb * MB));
+        let z = &report()[2];
+        assert!(z.cond == ZONE_COND_FULL, "{:?}", z);
+        assert!(!dd_write_dev(&ctrl, &pattern_str, 1, 2 * zs_mb + 1, 1));
+        if let Some(d) = dir {
+            // zone file never grows over zone capacity
+            let zf = Path::new(d).join("seq-000002");
+            assert!(std::fs::metadata(&zf).unwrap().len() == zc_mb << 20);
+        }
+
+        assert!(blkzone_mgmt(&ctrl, "reset", 2 * zs_mb * MB));
+        let z = &report()[2];
+        assert!(z.cond == ZONE_COND_EMPTY && z.wptr == 0, "{:?}", z);
+
+        // and finish it again for the following recovery
+        assert!(dd_write_dev(&ctrl, &pattern_str, 1, 2 * zs_mb, 1));
+        assert!(blkzone_mgmt(&ctrl, "finish", 2 * zs_mb * MB));
+
+        // Zone 3: partially written
+        assert!(dd_write_dev(&ctrl, &pattern_str, 1, 3 * zs_mb, 2));
+        let z = &report()[3];
+        assert!(z.cond == ZONE_COND_IMP_OPEN && z.wptr == 2 * MB, "{:?}", z);
+
+        // data is read back, and what is behind write pointer is zero
+        let read_mb = |skip_mb: u64, count: u64| {
+            let out = tmp_dir.path().join("out");
+            let res = Command::new("dd")
+                .arg(format!("if={}", ctrl.get_bdev_path()))
+                .arg(format!("of={}", out.display()))
+                .arg(format!("skip={}", skip_mb))
+                .arg(format!("count={}", count))
+                .args(["bs=1M", "iflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+            std::fs::read(&out).unwrap()
+        };
+        let check_data = || {
+            let data = read_mb(3 * zs_mb, 3);
+            assert!(data.len() == 3 << 20);
+            assert!(data[..2 << 20].iter().all(|b| *b == 0xaa));
+            assert!(data[2 << 20..].iter().all(|b| *b == 0));
+
+            // the hole between zone capacity and zone size is read as zero
+            if zc_mb < zs_mb {
+                let data = read_mb(2 * zs_mb + zc_mb, 1);
+                assert!(data.len() == 1 << 20);
+                assert!(data.iter().all(|b| *b == 0));
+            }
+        };
+        check_data();
+
+        // geometry and write pointers survive recovery
+        if dir.is_some() {
+            run_ublk_recover(&ctrl);
+
+            let zones = report();
+            check_geometry(&zones);
+            if zc_mb <= 256 {
+                assert!(zones[1].cond == ZONE_COND_FULL, "{:?}", zones[1]);
+            }
+            assert!(zones[2].cond == ZONE_COND_FULL, "{:?}", zones[2]);
+            let z = &zones[3];
+            assert!(z.wptr == 2 * MB, "{:?}", z);
+            assert!(
+                z.cond == ZONE_COND_CLOSED || z.cond == ZONE_COND_IMP_OPEN,
+                "{:?}",
+                z
+            );
+            check_data();
+
+            // the recovered zone can be written from its write pointer
+            assert!(dd_write_dev(&ctrl, &pattern_str, 1, 3 * zs_mb + 2, 1));
+            assert!(report()[3].wptr == 3 * MB);
+        }
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    /// Zone capacity can be smaller than zone size, such as ZNS SSD.
+    #[test]
+    fn test_ublk_zoned_capacity() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_blkzone() {
+            return;
+        }
+
+        // (zone size, zone capacity) in MiB:
+        // - 4/4: capacity is specified as same with zone size
+        // - 4/3: typical small setting for test, such as null_blk
+        // - 256/192: the default zone size
+        // - 2048/1077: WD ZN540 ZNS SSD
+        //
+        // Each one is covered with one conventional zone, and with
+        // sequential zones only, such as ZNS SSD.
+        for conv in [1, 0] {
+            for (zs, zc) in [(4, 4), (4, 3), (256, 192)] {
+                __test_ublk_zoned_capacity(zs, zc, conv, None);
+            }
+            for (zs, zc) in [(4, 3), (256, 192), (2048, 1077)] {
+                let path_dir = tempfile::TempDir::new().unwrap();
+                let path_str = path_dir.path().to_string_lossy().to_string();
+
+                __test_ublk_zoned_capacity(zs, zc, conv, Some(&path_str));
+            }
+        }
+    }
+
+    /// Bad zone capacity has to be rejected
+    #[test]
+    fn test_ublk_zoned_bad_capacity() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_blkzone() {
+            return;
+        }
+
+        let rublk = get_curr_bin_dir().unwrap().join("rublk");
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+
+        // bigger than zone size, zero, and not multiple of 1MiB
+        for zc in ["5", "0", "3584KiB"] {
+            for dir in [None, Some(&path_str)] {
+                // `timeout` avoids to hang if the bad capacity is accepted
+                let mut cmd = Command::new("timeout");
+                cmd.arg("30")
+                    .arg(&rublk)
+                    .args(["add", "zoned", "--foreground", "--zone-size", "4"])
+                    .args(["--zone-capacity", zc]);
+                if let Some(d) = dir {
+                    cmd.args(["--path", d]);
+                }
+                let res = cmd.output().unwrap();
+                let err = String::from_utf8_lossy(&res.stderr).to_string();
+
+                assert!(!res.status.success(), "zone capacity {} isn't rejected", zc);
+                assert!(
+                    err.contains("zone_capacity"),
+                    "zone capacity {}: unexpected failure {}",
+                    zc,
+                    err
+                );
+                // bad parameters can't be stored
+                assert!(!path_dir.path().join("superblock.json").exists());
+            }
+        }
+
+        // the same directory is still usable with good zone capacity
+        let cmdline = ["add", "zoned", "--zone-size", "4", "--zone-capacity", "3"];
+        let ctrl = run_rublk_add_dev([&cmdline[..], &["--path", &path_str]].concat());
+        if let Some(zones) = blkzone_report(&ctrl) {
+            assert!(zones.last().unwrap().cap == (3 << 20) >> 9);
+        }
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    /// btrfs works on zoned device with smaller zone capacity
+    #[test]
+    fn test_ublk_format_mount_zoned_capacity() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_mkfs_btrfs() {
+            return;
+        }
+
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+
+        for dir in [None, Some(&path_str)] {
+            let mut cmdline = ["add", "zoned", "--zone-size", "4", "--zone-capacity", "3"].to_vec();
+            cmdline.extend(["--logical-block-size", "4096", "--conv-zones", "0"]);
+            if let Some(d) = dir {
+                cmdline.extend(["--path", d]);
+            }
+
+            let ctrl = run_rublk_add_dev(cmdline);
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+
+            mkfs(&ctrl, "btrfs", ["-O", "zoned", "-f"].to_vec());
+            mount_fs_and_io(&ctrl, &tmp_dir, |dir| {
+                let tstr = dir.path().to_string_lossy().to_string();
+
+                dd_rw_file(&tstr, true, 8192, 16 * 1024);
+                dd_rw_file(&tstr, false, 8192, 16 * 1024);
+            });
+            run_rublk_del_dev(ctrl, false);
+        }
+    }
+
     fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, recover: bool, zc: bool, f: F)
     where
         F: Fn(&UblkCtrl, u32, usize, &str),
