@@ -169,10 +169,13 @@ impl TgtCfg {
             return Err(anyhow::anyhow!("Too many conventioanl zones"));
         }
 
-        if self.pre_alloc_size > self.zone_size
-            && !super::args::is_power2_of(self.pre_alloc_size, 4096)
-        {
-            bail!(anyhow::anyhow!("bad pre_alloc_size"));
+        // It is fine to be bigger than zone size, and preallocation is
+        // always capped by zone capacity.
+        if !super::args::is_power2_of(self.pre_alloc_size, 4096) {
+            bail!(
+                "pre_alloc_size {} is invalid: it has to be power of 2 and not less than 4096",
+                self.pre_alloc_size
+            );
         }
         Ok(())
     }
@@ -1356,8 +1359,8 @@ pub(crate) struct ZonedAddArgs {
         long,
         default_value = "256MiB",
         help = "how many bytes preallocated before appending data to zone, default\n\
-        unit is MiB, with common suffixes supported([B|KiB|MiB|GiB]), can't be\n\
-        bigger than zone size and has to be power2_of"
+        unit is MiB, with common suffixes supported([B|KiB|MiB|GiB]), has to\n\
+        be power of 2, and preallocation is capped by zone capacity"
     )]
     pre_alloc_size: String,
 
