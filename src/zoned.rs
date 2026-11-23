@@ -180,6 +180,25 @@ impl TgtCfg {
         Ok(())
     }
 
+    /// Max open & active zones can't be enforced if they aren't less than
+    /// sequential zones, and max open zones can't be bigger than max
+    /// active zones. Adjust them as null_blk does, otherwise the limits are
+    /// rejected by kernel.
+    ///
+    /// Has to be called after `validate()`.
+    fn adjust_zone_limits(&mut self) {
+        let nr_seq = (self.size / self.zone_size) as u32 - self.zone_nr_conv;
+
+        if self.zone_max_active >= nr_seq {
+            self.zone_max_active = 0;
+        }
+        if self.zone_max_active != 0 && self.zone_max_open > self.zone_max_active {
+            self.zone_max_open = self.zone_max_active;
+        } else if self.zone_max_open >= nr_seq {
+            self.zone_max_open = 0;
+        }
+    }
+
     /// Parse a size argument (default unit MiB) into whole MiB; sizes
     /// that aren't a multiple of 1MiB would otherwise be truncated.
     fn parse_mib(name: &str, val: &str) -> anyhow::Result<u32> {
@@ -1368,11 +1387,13 @@ pub(crate) struct ZonedAddArgs {
     #[clap(long, default_value_t = 2)]
     conv_zones: u32,
 
-    /// Max open zones allowed
+    /// Max open zones allowed, 0 means no limit. It is capped by max
+    /// active zones, and disabled if it isn't less than sequential zones
     #[clap(long, default_value_t = 0)]
     max_open_zones: u32,
 
-    /// Max active zones allowed
+    /// Max active zones allowed, 0 means no limit. It is disabled if it
+    /// isn't less than sequential zones
     #[clap(long, default_value_t = 0)]
     max_active_zones: u32,
 }
@@ -1401,10 +1422,11 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
             std::fs::remove_file(zf)?;
             Ok((c, false))
         } else {
-            let c = TgtCfg::from_argument(zo)?;
+            let mut c = TgtCfg::from_argument(zo)?;
             // don't leave bad parameters in `superblock.json`, which can't
             // be overridden from command line any more
             c.validate()?;
+            c.adjust_zone_limits();
             c.save_file_json(&zfj)?;
             Ok((c, true))
         }
@@ -1417,7 +1439,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (cfg, is_new) = match opt {
+    let (mut cfg, is_new) = match opt {
         Some(ref o) => parse_zone_params(o)?,
         None => match ctrl.get_target_data_from_json() {
             Some(val) => {
@@ -1437,6 +1459,8 @@ pub(crate) fn ublk_add_zoned(
     };
 
     cfg.validate()?;
+    // `superblock.json` may be created before the limits are adjusted
+    cfg.adjust_zone_limits();
 
     let cfg_i = cfg.clone();
     let tgt_init = |dev: &mut UblkDev| {
