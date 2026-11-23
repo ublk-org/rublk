@@ -1258,6 +1258,76 @@ mod integration {
         err
     }
 
+    /// The directory is still usable after setting up new device fails
+    #[test]
+    fn test_ublk_zoned_failed_setup() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+        let args = [
+            "--zone-size",
+            "4",
+            "--size",
+            "32",
+            "--conv-zones",
+            "0",
+            "--path",
+            &path_str,
+        ];
+
+        // zone file can't be created because one directory takes its name
+        let blocker = path_dir.path().join("seq-000001");
+        std::fs::create_dir(&blocker).unwrap();
+        add_zoned_expect_failure(&args);
+        assert!(!path_dir.path().join("superblock.json").exists());
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let ctrl = run_rublk_add_dev([&["add", "zoned"][..], &args[..]].concat());
+        read_ublk_disk(&ctrl);
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    /// The directory of one live device can't be used by another device, and
+    /// it isn't touched by the failed one.
+    #[test]
+    fn test_ublk_zoned_dir_in_use() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+        let sb = path_dir.path().join("superblock.json");
+        let args = ["--zone-size", "4", "--size", "32", "--path", &path_str];
+
+        let ctrl = run_rublk_add_dev([&["add", "zoned"][..], &args[..]].concat());
+        let sb_data = std::fs::read(&sb).unwrap();
+
+        // different geometry is ignored because of existing superblock,
+        // and the directory can't be locked
+        for extra in [&[][..], &["--zone-capacity", "3"][..]] {
+            let err = add_zoned_expect_failure(&[&args[..], extra].concat());
+            assert!(err.contains("fail to lock"), "unexpected failure: {}", err);
+            assert!(std::fs::read(&sb).unwrap() == sb_data);
+        }
+        read_ublk_disk(&ctrl);
+        run_rublk_del_dev(ctrl, false);
+
+        // and the directory is still usable
+        let ctrl = run_rublk_add_dev([&["add", "zoned"][..], &args[..]].concat());
+        read_ublk_disk(&ctrl);
+        run_rublk_del_dev(ctrl, false);
+    }
+
     /// Bad pre-alloc-size has to be rejected
     #[test]
     fn test_ublk_zoned_bad_pre_alloc_size() {
