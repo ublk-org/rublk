@@ -47,6 +47,15 @@ mod integration {
             .is_ok()
     }
 
+    fn has_blkzone() -> bool {
+        Command::new("blkzone")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
     fn support_zoned() -> bool {
         match UblkCtrl::get_features() {
             Some(f) => {
@@ -384,6 +393,105 @@ mod integration {
         };
         __test_ublk_add_del_zoned(512, 1, None, false, tf);
         __test_ublk_add_del_zoned(4096, 1, None, false, tf);
+    }
+
+    /// A zone management command rejected by the target has to fail,
+    /// instead of being left uncompleted forever.
+    #[test]
+    fn test_ublk_zoned_failed_mgmt_cmd() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_blkzone() {
+            return;
+        }
+        let tf = |ctrl: &UblkCtrl, _bs: u32, _file_size: usize| {
+            // closing one empty zone is rejected
+            let mut child = Command::new("blkzone")
+                .args(["close", "-o", "0", "-c", "1", &ctrl.get_bdev_path()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut status = None;
+            for _ in 0..100 {
+                status = child.try_wait().unwrap();
+                if status.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let status = status.expect("zone close isn't completed");
+            assert!(!status.success());
+
+            // the device still works
+            read_ublk_disk(ctrl);
+        };
+        __test_ublk_add_del_zoned(4096, 1, None, false, tf);
+    }
+
+    /// Reading the unwritten part of one zone has to return zeroes.
+    #[test]
+    fn test_ublk_zoned_read_unwritten() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        let tf = |ctrl: &UblkCtrl, _bs: u32, _file_size: usize| {
+            const BS: usize = 64 << 10;
+            let dev = ctrl.get_bdev_path();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let pattern = tmp_dir.path().join("pattern");
+            let out = tmp_dir.path().join("out");
+
+            // write the 1st 64k of zone 0
+            std::fs::write(&pattern, vec![0xaa_u8; BS]).unwrap();
+            let res = Command::new("dd")
+                .arg(format!("if={}", pattern.display()))
+                .arg(format!("of={}", dev))
+                .args(["bs=64k", "count=1", "oflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+
+            // read the 1st 128k by one IO, and its 2nd half isn't written
+            let res = Command::new("dd")
+                .arg(format!("if={}", dev))
+                .arg(format!("of={}", out.display()))
+                .args(["bs=128k", "count=1", "iflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+
+            let data = std::fs::read(&out).unwrap();
+            assert!(data.len() == 2 * BS);
+            assert!(data[..BS].iter().all(|b| *b == 0xaa));
+            assert!(data[BS..].iter().all(|b| *b == 0));
+
+            // and read the 2nd 64k only, which is behind the write pointer
+            let res = Command::new("dd")
+                .arg(format!("if={}", dev))
+                .arg(format!("of={}", out.display()))
+                .args(["bs=64k", "skip=1", "count=1", "iflag=direct"])
+                .output()
+                .unwrap();
+            assert!(res.status.success());
+
+            let data = std::fs::read(&out).unwrap();
+            assert!(data.len() == BS);
+            assert!(data.iter().all(|b| *b == 0));
+        };
+        __test_ublk_add_del_zoned(4096, 1, None, false, tf);
+
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+
+        __test_ublk_add_del_zoned(4096, 1, Some(&path_str), false, tf);
     }
 
     fn __test_ublk_add_del_loop<F>(bs: u32, aa: bool, recover: bool, zc: bool, f: F)
