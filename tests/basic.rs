@@ -550,8 +550,8 @@ mod integration {
     }
 
     fn blkzone_mgmt(ctrl: &UblkCtrl, op: &str, start: u64) -> bool {
-        Command::new("blkzone")
-            .args([op, "-o", &start.to_string(), "-c", "1"])
+        Command::new("timeout")
+            .args(["30", "blkzone", op, "-o", &start.to_string(), "-c", "1"])
             .arg(ctrl.get_bdev_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -567,7 +567,8 @@ mod integration {
 
     /// Write `count` blocks of `bs_kb` KiB from `src` to the offset of `seek_kb` KiB
     fn dd_write_dev_kb(ctrl: &UblkCtrl, src: &str, bs_kb: u64, seek_kb: u64, count: u64) -> bool {
-        Command::new("dd")
+        Command::new("timeout")
+            .args(["60", "dd"])
             .arg(format!("if={}", src))
             .arg(format!("of={}", ctrl.get_bdev_path()))
             .arg(format!("bs={}K", bs_kb))
@@ -776,6 +777,37 @@ mod integration {
             assert!(report()[3].wptr == 3 * MB);
         }
         run_rublk_del_dev(ctrl, false);
+
+        // Add the device again from the existing directory: parameters are
+        // always from `superblock.json`, and the ones from command line
+        // are ignored.
+        if let Some(d) = dir {
+            let ctrl = run_rublk_add_dev(
+                [
+                    "add",
+                    "zoned",
+                    "--path",
+                    d,
+                    "--zone-size",
+                    "8",
+                    "--zone-capacity",
+                    "8",
+                ]
+                .to_vec(),
+            );
+            let zones = blkzone_report(&ctrl).unwrap();
+
+            check_geometry(&zones);
+            assert!(zones[2].cond == ZONE_COND_FULL, "{:?}", zones[2]);
+            // 3M is written to zone 3
+            let z = &zones[3];
+            if zc_mb == 3 {
+                assert!(z.cond == ZONE_COND_FULL, "{:?}", z);
+            } else {
+                assert!(z.cond == ZONE_COND_CLOSED && z.wptr == 3 * MB, "{:?}", z);
+            }
+            run_rublk_del_dev(ctrl, false);
+        }
     }
 
     /// Zone capacity can be smaller than zone size, such as ZNS SSD.
@@ -821,30 +853,19 @@ mod integration {
         if !support_zoned() {
             return;
         }
-        if !has_blkzone() {
-            return;
-        }
 
-        let rublk = get_curr_bin_dir().unwrap().join("rublk");
         let path_dir = tempfile::TempDir::new().unwrap();
         let path_str = path_dir.path().to_string_lossy().to_string();
 
         // bigger than zone size, zero, and not multiple of 1MiB
         for zc in ["5", "0", "3584KiB"] {
             for dir in [None, Some(&path_str)] {
-                // `timeout` avoids to hang if the bad capacity is accepted
-                let mut cmd = Command::new("timeout");
-                cmd.arg("30")
-                    .arg(&rublk)
-                    .args(["add", "zoned", "--foreground", "--zone-size", "4"])
-                    .args(["--zone-capacity", zc]);
+                let mut args = ["--zone-size", "4", "--zone-capacity", zc].to_vec();
                 if let Some(d) = dir {
-                    cmd.args(["--path", d]);
+                    args.extend(["--path", d]);
                 }
-                let res = cmd.output().unwrap();
-                let err = String::from_utf8_lossy(&res.stderr).to_string();
+                let err = add_zoned_expect_failure(&args);
 
-                assert!(!res.status.success(), "zone capacity {} isn't rejected", zc);
                 assert!(
                     err.contains("zone_capacity"),
                     "zone capacity {}: unexpected failure {}",
@@ -859,8 +880,10 @@ mod integration {
         // the same directory is still usable with good zone capacity
         let cmdline = ["add", "zoned", "--zone-size", "4", "--zone-capacity", "3"];
         let ctrl = run_rublk_add_dev([&cmdline[..], &["--path", &path_str]].concat());
-        if let Some(zones) = blkzone_report(&ctrl) {
-            assert!(zones.last().unwrap().cap == (3 << 20) >> 9);
+        if has_blkzone() {
+            if let Some(zones) = blkzone_report(&ctrl) {
+                assert!(zones.last().unwrap().cap == (3 << 20) >> 9);
+            }
         }
         run_rublk_del_dev(ctrl, false);
     }
@@ -898,6 +921,428 @@ mod integration {
                 dd_rw_file(&tstr, true, 8192, 16 * 1024);
                 dd_rw_file(&tstr, false, 8192, 16 * 1024);
             });
+
+            // Zone append can't be issued from userspace directly, and btrfs
+            // uses it for writing data: some zones have to be filled up to
+            // zone capacity, and no one is written over it.
+            if has_blkzone() {
+                if let Some(zones) = blkzone_report(&ctrl) {
+                    let cap = (3 << 20) >> 9;
+                    assert!(zones.iter().any(|z| z.cond == ZONE_COND_FULL));
+                    assert!(zones
+                        .iter()
+                        .all(|z| z.cap == cap && (z.cond == ZONE_COND_FULL || z.wptr <= cap)));
+                }
+            }
+            run_rublk_del_dev(ctrl, false);
+        }
+    }
+
+    /// Add one zoned device with 4M zone size, 3M zone capacity and no
+    /// conventional zone
+    fn add_zoned_4m_3m(extra: &[&str]) -> UblkCtrl {
+        let cmdline = ["add", "zoned", "--zone-size", "4", "--zone-capacity", "3"];
+        let conv = ["--conv-zones", "0"];
+
+        run_rublk_add_dev([&cmdline[..], &conv[..], extra].concat())
+    }
+
+    /// Zone management commands and open/active zone limits, with smaller
+    /// zone capacity
+    #[test]
+    fn test_ublk_zoned_mgmt_limits() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_blkzone() {
+            return;
+        }
+
+        const MB: u64 = (1 << 20) >> 9; // sectors
+        const ZS: u64 = 4; // MiB
+        const ZONE_COND_EXP_OPEN: u32 = 3;
+        let limits = ["--max-open-zones", "2", "--max-active-zones", "3"];
+        let ctrl = add_zoned_4m_3m(&[&["--size", "32"][..], &limits[..]].concat());
+        if blkzone_report(&ctrl).is_none() {
+            run_rublk_del_dev(ctrl, false);
+            return;
+        }
+        let mgmt = |op: &str, zno: u64| blkzone_mgmt(&ctrl, op, zno * ZS * MB);
+        let write = |zno: u64, off_mb: u64, mbs: u64| {
+            dd_write_dev(&ctrl, "/dev/zero", 1, zno * ZS + off_mb, mbs)
+        };
+        let cond = |zno: usize| blkzone_report(&ctrl).unwrap()[zno].cond;
+
+        // max open zones is 2, and explicitly opened zone can't be closed
+        // implicitly
+        assert!(mgmt("open", 0) && mgmt("open", 1));
+        assert!(cond(0) == ZONE_COND_EXP_OPEN && cond(1) == ZONE_COND_EXP_OPEN);
+        assert!(!mgmt("open", 2));
+        assert!(cond(2) == ZONE_COND_EMPTY);
+
+        // closing one opened zone without any data makes it empty
+        assert!(mgmt("close", 0));
+        assert!(cond(0) == ZONE_COND_EMPTY);
+
+        // open: zone 1(exp) & zone 0(imp)
+        assert!(write(0, 0, 1));
+        assert!(cond(0) == ZONE_COND_IMP_OPEN);
+
+        // zone 0 is closed implicitly for writing to zone 2, then active
+        // zones are zone 0(closed), zone 1(exp) and zone 2(imp)
+        assert!(write(2, 0, 1));
+        assert!(cond(0) == ZONE_COND_CLOSED && cond(2) == ZONE_COND_IMP_OPEN);
+
+        // max active zones is 3
+        assert!(!write(3, 0, 1));
+        assert!(!mgmt("open", 3));
+        assert!(cond(3) == ZONE_COND_EMPTY);
+
+        // finish implicitly opened zone, which isn't active any more
+        assert!(mgmt("finish", 2));
+        assert!(cond(2) == ZONE_COND_FULL);
+        assert!(write(3, 0, 1));
+        assert!(!write(4, 0, 1));
+
+        // zone 3 becomes full after zone capacity is reached, and it isn't
+        // active any more too
+        assert!(write(3, 1, 2));
+        assert!(cond(3) == ZONE_COND_FULL);
+        assert!(write(4, 0, 1));
+
+        // active zones: zone 0(closed), zone 1(exp) and zone 4(imp)
+        assert!(mgmt("close", 1));
+        assert!(cond(1) == ZONE_COND_EMPTY);
+
+        // finish empty zone
+        assert!(mgmt("finish", 5));
+        assert!(cond(5) == ZONE_COND_FULL);
+        // finish full zone
+        assert!(mgmt("finish", 5));
+        assert!(cond(5) == ZONE_COND_FULL);
+
+        // finish explicitly opened zone
+        assert!(mgmt("open", 0));
+        assert!(cond(0) == ZONE_COND_EXP_OPEN);
+        assert!(mgmt("finish", 0));
+        assert!(cond(0) == ZONE_COND_FULL);
+
+        // finish closed zone, and now zone 4 is the only active one
+        assert!(write(6, 0, 1));
+        assert!(mgmt("close", 6));
+        assert!(cond(6) == ZONE_COND_CLOSED);
+        assert!(mgmt("finish", 6));
+        assert!(cond(6) == ZONE_COND_FULL);
+
+        // reset all zones
+        let res = Command::new("timeout")
+            .args(["30", "blkzone", "reset", &ctrl.get_bdev_path()])
+            .output()
+            .unwrap();
+        assert!(res.status.success());
+        let zones = blkzone_report(&ctrl).unwrap();
+        assert!(zones
+            .iter()
+            .all(|z| z.cond == ZONE_COND_EMPTY && z.wptr == 0));
+
+        // and all open & active zones are released
+        assert!(mgmt("open", 6) && mgmt("open", 7));
+        assert!(!mgmt("open", 5));
+        assert!(mgmt("reset", 6) && mgmt("reset", 7));
+        assert!(write(0, 0, 1) && write(1, 0, 1) && write(2, 0, 1));
+        assert!(!write(3, 0, 1));
+
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    /// Open/active zones accounting has to be correct after zone file
+    /// operation fails.
+    #[test]
+    fn test_ublk_zoned_accounting_after_failure() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+        if !has_blkzone() {
+            return;
+        }
+
+        const MB: u64 = (1 << 20) >> 9; // sectors
+        const ZS: u64 = 4; // MiB
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+
+        // Truncating append-only file fails, which is used for injecting
+        // failure to finish & reset zone
+        let chattr = |zno: u32, flag: &str| {
+            let zf = path_dir.path().join(format!("seq-{:06}", zno));
+            Command::new("chattr")
+                .arg(flag)
+                .arg(&zf)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let probe = path_dir.path().join("seq-000000");
+        std::fs::write(&probe, "").unwrap();
+        if !chattr(0, "+a") {
+            eprintln!("append-only file isn't supported in {}", path_str);
+            return;
+        }
+        assert!(chattr(0, "-a"));
+        std::fs::remove_file(&probe).unwrap();
+
+        let limits = ["--max-open-zones", "1", "--max-active-zones", "1"];
+        let ctrl =
+            add_zoned_4m_3m(&[&["--size", "32", "--path", &path_str][..], &limits[..]].concat());
+        if blkzone_report(&ctrl).is_none() {
+            run_rublk_del_dev(ctrl, false);
+            return;
+        }
+        let mgmt = |op: &str, zno: u64| blkzone_mgmt(&ctrl, op, zno * ZS * MB);
+        let write = |zno: u64, off_mb: u64, mbs: u64| {
+            dd_write_dev(&ctrl, "/dev/zero", 1, zno * ZS + off_mb, mbs)
+        };
+        let zone = |zno: usize| blkzone_report(&ctrl).unwrap().remove(zno);
+
+        // Zone 0: finish fails, then the zone is written & finished without
+        // reporting zones
+        assert!(write(0, 0, 1));
+        assert!(chattr(0, "+a"));
+        assert!(!mgmt("finish", 0));
+        assert!(chattr(0, "-a"));
+        assert!(write(0, 1, 1));
+        let z = zone(0);
+        assert!(z.cond == ZONE_COND_IMP_OPEN && z.wptr == 2 * MB, "{:?}", z);
+        assert!(mgmt("finish", 0));
+        assert!(zone(0).cond == ZONE_COND_FULL);
+
+        // Zone 1: finish fails, then zone state is updated from zone file by
+        // reporting zones
+        assert!(write(1, 0, 1));
+        assert!(chattr(1, "+a"));
+        assert!(!mgmt("finish", 1));
+        assert!(chattr(1, "-a"));
+        let z = zone(1);
+        assert!(z.cond == ZONE_COND_CLOSED && z.wptr == MB, "{:?}", z);
+        // it is the only active zone
+        assert!(!write(2, 0, 1));
+        assert!(write(1, 1, 1));
+        let z = zone(1);
+        assert!(z.cond == ZONE_COND_IMP_OPEN && z.wptr == 2 * MB, "{:?}", z);
+
+        // Zone 1: reset fails, and it is still the only active zone
+        assert!(chattr(1, "+a"));
+        assert!(!mgmt("reset", 1));
+        assert!(chattr(1, "-a"));
+        assert!(!write(2, 0, 1));
+        assert!(mgmt("reset", 1));
+        assert!(zone(1).cond == ZONE_COND_EMPTY);
+
+        // no zone is active now, and the limit of one active zone still
+        // works
+        assert!(write(2, 0, 1));
+        assert!(!write(3, 0, 1));
+        assert!(mgmt("finish", 2));
+        // kernel doesn't allow to write this zone until its write pointer
+        // is updated by reporting zones after the write failure
+        assert!(zone(3).cond == ZONE_COND_EMPTY);
+        assert!(write(3, 0, 3));
+        assert!(zone(3).cond == ZONE_COND_FULL);
+        assert!(write(4, 0, 1));
+        assert!(!write(5, 0, 1));
+
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    /// One zone may be closed implicitly when its last write is in progress,
+    /// and this zone has to be released from active zones after it becomes
+    /// full.
+    #[test]
+    fn test_ublk_zoned_full_after_implicit_close() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+
+        const NR_ZONES: u64 = 64;
+        const ZS: u64 = 4; // MiB
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let path_str = path_dir.path().to_string_lossy().to_string();
+        let size = (NR_ZONES * ZS).to_string();
+        // zone capacity is 1M, so one 1M write fills the whole zone
+        let ctrl = run_rublk_add_dev(
+            [
+                "add",
+                "zoned",
+                "--zone-size",
+                "4",
+                "--zone-capacity",
+                "1",
+                "--conv-zones",
+                "0",
+                "--io-buf-size",
+                "1MiB",
+                "--max-open-zones",
+                "1",
+                "--max-active-zones",
+                "2",
+                "--size",
+                &size,
+                "--path",
+                &path_str,
+            ]
+            .to_vec(),
+        );
+
+        // Fill two zones concurrently: only one zone can be open, so the
+        // 1st zone is closed implicitly by the write to the 2nd one, very
+        // likely before its only write is completed.
+        //
+        // Every write is failed for exceeding max active zones if any
+        // filled zone is still counted as active.
+        let bdev = ctrl.get_bdev_path();
+        for pair in 0..NR_ZONES / 2 {
+            let children: Vec<_> = (0..2)
+                .map(|i| {
+                    Command::new("timeout")
+                        .args(["60", "dd", "if=/dev/zero", "bs=1M", "count=1"])
+                        .arg(format!("of={}", bdev))
+                        .arg(format!("seek={}", (pair * 2 + i) * ZS))
+                        .arg("oflag=direct")
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            for (i, mut c) in children.into_iter().enumerate() {
+                assert!(
+                    c.wait().unwrap().success(),
+                    "write to zone {} fails",
+                    pair * 2 + i as u64
+                );
+            }
+        }
+
+        run_rublk_del_dev(ctrl, false);
+    }
+
+    /// Add zoned device and return its stderr if adding fails
+    fn add_zoned_expect_failure(args: &[&str]) -> String {
+        let rublk = get_curr_bin_dir().unwrap().join("rublk");
+        // `timeout` avoids to hang if the device is added
+        let res = Command::new("timeout")
+            .arg("30")
+            .arg(&rublk)
+            .args(["add", "zoned", "--foreground"])
+            .args(args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&res.stderr).to_string();
+
+        // the device is added if `timeout` expires
+        if res.status.code() == Some(124) {
+            panic!("{:?} is accepted", args);
+        }
+        assert!(!res.status.success(), "{:?} isn't rejected", args);
+        err
+    }
+
+    /// Bad pre-alloc-size has to be rejected
+    #[test]
+    fn test_ublk_zoned_bad_pre_alloc_size() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+
+        for sz in ["3MiB", "0", "2KiB"] {
+            let path_dir = tempfile::TempDir::new().unwrap();
+            let path_str = path_dir.path().to_string_lossy().to_string();
+            let args = [
+                "--zone-size",
+                "4",
+                "--path",
+                &path_str,
+                "--pre-alloc-size",
+                sz,
+            ];
+            let err = add_zoned_expect_failure(&args);
+
+            assert!(
+                err.contains("pre_alloc_size"),
+                "{}: unexpected failure {}",
+                sz,
+                err
+            );
+            assert!(!path_dir.path().join("superblock.json").exists());
+        }
+    }
+
+    /// Max open/active zones are adjusted if they can't be enforced
+    #[test]
+    fn test_ublk_zoned_adjust_limits() {
+        if !support_ublk() {
+            return;
+        }
+        if !support_zoned() {
+            return;
+        }
+
+        let read_limit = |ctrl: &UblkCtrl, name: &str| -> u32 {
+            let bdev = ctrl.get_bdev_path();
+            let disk = Path::new(&bdev)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let path = format!("/sys/block/{}/queue/{}", disk, name);
+
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+
+        // 8 sequential zones: (max open, max active) -> expected ones
+        for ((open, active), (exp_open, exp_active)) in [
+            ((2, 3), (2, 3)),
+            // max open zones can't be bigger than max active zones
+            ((6, 4), (4, 4)),
+            // the limit can't be enforced if it isn't less than zones
+            ((8, 0), (0, 0)),
+            ((100, 200), (0, 0)),
+            ((100, 4), (4, 4)),
+        ] {
+            let (open, active) = (open.to_string(), active.to_string());
+            let limits = ["--max-open-zones", &open, "--max-active-zones", &active];
+            let ctrl = add_zoned_4m_3m(&[&["--size", "32"][..], &limits[..]].concat());
+
+            assert!(
+                read_limit(&ctrl, "max_open_zones") == exp_open,
+                "{} {}",
+                open,
+                active
+            );
+            assert!(
+                read_limit(&ctrl, "max_active_zones") == exp_active,
+                "{} {}",
+                open,
+                active
+            );
             run_rublk_del_dev(ctrl, false);
         }
     }
