@@ -246,7 +246,11 @@ impl TgtCfg {
 
     fn save_file_json(&self, p: &PathBuf) -> anyhow::Result<()> {
         let json_string = serde_json::to_string_pretty(self)?;
-        let mut f = OpenOptions::new().create(true).write(true).open(p)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(p)?;
         f.write_all(json_string.as_bytes())?;
         let _ = f.flush();
         Ok(())
@@ -306,37 +310,29 @@ struct ZonedTgt {
     _buf: Option<IoBuf<u8>>,
     zfiles: Vec<File>,
     cfg: TgtCfg,
-    base_file: Option<File>,
+    // lock of the base directory, which is released when it is closed
+    _base_lock: Option<File>,
     // queue of the flush thread, each flush sends the eventfd to be
     // written when it is done
     flush_tx: Option<Sender<Arc<EventFd>>>,
 }
 
-impl Drop for ZonedTgt {
-    fn drop(&mut self) {
-        self.unlock_base();
+/// Lock the base directory, which is owned by one zoned device only. The
+/// lock is released when the returned file is closed.
+fn lock_base_dir(dir: &std::path::Path) -> anyhow::Result<File> {
+    let h = OpenOptions::new().read(true).open(dir)?;
+    let res = unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if res != 0 {
+        anyhow::bail!(
+            "fail to lock {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        );
     }
+    Ok(h)
 }
 
 impl ZonedTgt {
-    fn lock_base(&mut self) -> anyhow::Result<()> {
-        let base = self.cfg.base.clone();
-        if let Some(ref dir) = base {
-            let h = OpenOptions::new().read(true).open(dir)?;
-            let res = unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if res != 0 {
-                anyhow::bail!("fail to lock {}", dir.display());
-            }
-            self.base_file = Some(h);
-        }
-        Ok(())
-    }
-    fn unlock_base(&self) {
-        if let Some(ref h) = self.base_file {
-            unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-
     /// All flushes of this device are handled by one thread, so syncfs()
     /// isn't called from the queue threads.
     ///
@@ -492,7 +488,7 @@ impl ZonedTgt {
     }
 
     #[allow(clippy::uninit_vec)]
-    fn new(cfg: TgtCfg, new_dev: bool) -> anyhow::Result<ZonedTgt> {
+    fn new(cfg: TgtCfg, new_dev: bool, base_lock: Option<File>) -> anyhow::Result<ZonedTgt> {
         let ram_backed = cfg.base.is_none();
         let _buf = if ram_backed {
             Some(IoBuf::<u8>::new(cfg.size as usize))
@@ -543,12 +539,18 @@ impl ZonedTgt {
             _buf,
             zfiles: Vec::new(),
             cfg,
-            base_file: None,
+            _base_lock: base_lock,
             flush_tx: None,
         };
 
         if !ram_backed {
-            dev.lock_base()?;
+            // the base directory is locked already if `superblock.json` is
+            // read or created for adding device
+            if dev._base_lock.is_none() {
+                if let Some(ref dir) = dev.cfg.base {
+                    dev._base_lock = Some(lock_base_dir(dir)?);
+                }
+            }
             dev.install_zone_files(new_dev)?;
             for zno in 0..dev.nr_zones as usize {
                 if new_dev {
@@ -1409,13 +1411,15 @@ pub(crate) struct ZonedAddArgs {
     max_active_zones: u32,
 }
 
-fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
+/// Return zoned parameters, if the device is one new one, and the locked
+/// base directory for file-backed zoned.
+fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool, Option<File>)> {
     if zo.path.is_none() {
         if zo.gen_arg.user_recovery {
             return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
         }
 
-        Ok((TgtCfg::from_argument(zo)?, true))
+        Ok((TgtCfg::from_argument(zo)?, true, None))
     } else {
         let path = zo.path.clone().ok_or(PathBuf::new()).expect("path failure");
         let path = zo.gen_arg.build_abs_path(path);
@@ -1423,15 +1427,19 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
         if !path.exists() {
             return Err(anyhow::anyhow!("base dir doesn't exist"));
         }
+        // `superblock.json` can be created, so the directory has to be
+        // locked first, otherwise the one of another live device may be
+        // overwritten.
+        let lock = Some(lock_base_dir(&path)?);
         let zf = path.join("superblock");
         let zfj = path.join("superblock.json");
         if zfj.exists() {
-            Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false))
+            Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false, lock))
         } else if zf.exists() {
             let c = TgtCfg::from_file(&zf, Some(zo))?;
             c.save_file_json(&zfj)?;
             std::fs::remove_file(zf)?;
-            Ok((c, false))
+            Ok((c, false, lock))
         } else {
             let mut c = TgtCfg::from_argument(zo)?;
             // don't leave bad parameters in `superblock.json`, which can't
@@ -1439,7 +1447,7 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
             c.validate()?;
             c.adjust_zone_limits();
             c.save_file_json(&zfj)?;
-            Ok((c, true))
+            Ok((c, true, lock))
         }
     }
 }
@@ -1450,7 +1458,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (mut cfg, is_new) = match opt {
+    let (mut cfg, is_new, base_lock) = match opt {
         Some(ref o) => parse_zone_params(o)?,
         None => match ctrl.get_target_data_from_json() {
             Some(val) => {
@@ -1460,7 +1468,7 @@ pub(crate) fn ublk_add_zoned(
                 match tgt_data {
                     Ok(t) => {
                         let p = t.path.join("superblock.json");
-                        (TgtCfg::from_file_json(&p, None)?, false)
+                        (TgtCfg::from_file_json(&p, None)?, false, None)
                     }
                     Err(_) => return Err(anyhow::anyhow!("wrong json data")),
                 }
@@ -1497,7 +1505,7 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(cfg, is_new)?);
+    let zoned_tgt = Arc::new(ZonedTgt::new(cfg, is_new, base_lock)?);
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
