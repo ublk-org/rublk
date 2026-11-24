@@ -313,7 +313,9 @@ fn ublk_recover(opt: args::UblkArgs) -> anyhow::Result<i32> {
         daemonize::Outcome::Child(Ok(_)) => ublk_recover_work(opt),
         daemonize::Outcome::Parent(Ok(_)) => {
             let mut ctrl = UblkCtrl::new_simple(id)?;
-            ublk_state_wait_until(&mut ctrl, libublk::sys::UBLK_S_DEV_LIVE, 5000)?;
+            // recovering may take a while, such as replaying or scanning what
+            // is stored in the backing
+            ublk_state_wait_until(&mut ctrl, libublk::sys::UBLK_S_DEV_LIVE, 30000)?;
 
             if (ctrl.dev_info().ublksrv_flags & target_flags::TGT_QUIET) == 0 {
                 ctrl.dump();
@@ -375,10 +377,31 @@ fn __ublk_del(id: i32, async_del: bool) -> anyhow::Result<i32> {
     let ctrl = UblkCtrl::new_simple(id)?;
 
     ctrl.kill_dev()?;
-    match async_del {
-        false => ctrl.del_dev()?,
-        true => ctrl.del_dev_async()?,
+    let res = match async_del {
+        false => ctrl.del_dev(),
+        true => ctrl.del_dev_async(),
     };
+
+    // Stopping the device makes its daemon exit, and the daemon removes
+    // the json file and deletes the device by itself when exiting, so both
+    // race with this command.
+    match res {
+        Ok(_) => {}
+        // The device is deleted by this command, and the json file has been
+        // removed by the daemon.
+        Err(libublk::UblkError::IOError(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(0);
+        }
+        // The device may have been deleted by the daemon. Which error is
+        // returned depends on kernel config and device flags, so check if
+        // the device is still there, instead of relying on error code.
+        Err(e) => {
+            if ctrl.read_dev_info().is_ok() {
+                return Err(e.into());
+            }
+            return Ok(0);
+        }
+    }
 
     let run_path = ctrl.run_path();
     let json_path = std::path::Path::new(&run_path);

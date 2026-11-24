@@ -30,7 +30,13 @@ cargo fmt                         # .rustfmt.toml is enforced; several commits e
 
 ### Tests
 
-`tests/basic.rs` is the only test file. These are **integration tests that shell out to the built
+Each target has its own test file, `tests/null.rs`, `tests/loop.rs`, `tests/qcow2.rs`,
+`tests/zoned.rs` and `tests/compress.rs` (empty unless built with `--features compress`);
+`tests/basic.rs` holds the tests which aren't specific to one target, and
+`tests/common/mod.rs` holds the helpers shared by all of them (no tests). Each file is built as one
+test binary, and its test module is named after it, so `cargo test --test zoned` runs zoned tests only.
+
+These are **integration tests that shell out to the built
 `rublk` binary** (located via `current_exe()` → `target/debug/rublk`), create real ublk devices,
 run `dd`/`mkfs`/`mount`/`blkdiscard` against them, then delete them.
 
@@ -156,8 +162,9 @@ These are validated at add time; keep them in sync if you change target capabili
 4. Register the variant in `args.rs: AddCommands`; add any incompatibility checks to
    `new_ublk_ctrl` / `validate_mlock_compatibility`.
 5. Gate optional heavy dependencies behind a Cargo feature and `#[cfg(feature = "...")]` on every
-   touch point (see how `compress` and `vram` thread through `main.rs`, `args.rs`, `tests/basic.rs`).
-6. Add tests to `tests/basic.rs` using `run_rublk_add_dev` / `run_rublk_del_dev`, guarded by
+   touch point (see how `compress` and `vram` thread through `main.rs`, `args.rs`, `tests/compress.rs`).
+6. Add tests to a dedicated `tests/<name>.rs` (with `mod common;`, and link it in `ci/mkosi.build`) using
+   `run_rublk_add_dev` / `run_rublk_del_dev` from `tests/common/mod.rs`, guarded by
    `support_ublk()`.
 
 ## Conventions

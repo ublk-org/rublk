@@ -56,8 +56,10 @@ create_rublk_test()
     cargo test -v --no-run
     cd -
 
-    TB=`find $rs_dir/target/debug/deps/ -type f -executable -name "basic*"`
-    ln $TB $rs_dir/target/debug/test-basic
+    for t in basic null loop qcow2 zoned compress; do
+        TB=`find $rs_dir/target/debug/deps/ -type f -executable -name "$t-*"`
+        ln $TB $rs_dir/target/debug/test-$t
+    done
     ls -l $rs_dir/ci/
 }
 

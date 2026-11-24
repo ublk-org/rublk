@@ -121,9 +121,11 @@ struct TgtCfg {
 
 impl TgtCfg {
     const DEF_ZONE_PRE_ALLOC_MB: u32 = 256;
+    #[allow(clippy::too_many_arguments)]
     fn new(
         s: u32,
         zs: u32,
+        zc: u32,
         conv: u32,
         m_open: u32,
         m_act: u32,
@@ -133,7 +135,7 @@ impl TgtCfg {
         TgtCfg {
             size: (s as u64) << 20,
             zone_size: (zs as u64) << 20,
-            zone_capacity: (zs as u64) << 20,
+            zone_capacity: (zc as u64) << 20,
             zone_nr_conv: conv,
             zone_max_open: m_open,
             zone_max_active: m_act,
@@ -141,6 +143,64 @@ impl TgtCfg {
             pre_alloc_size: (p as u64) << 20,
         }
     }
+    /// Check parameters from command line or `superblock.json`
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.zone_size == 0
+            || !self.zone_size.is_power_of_two()
+            || self.size < self.zone_size
+            || (self.size % self.zone_size) != 0
+            || (self.zone_size % 512) != 0
+            // zone size in sectors is stored in u32
+            || (self.zone_size >> 9) > u32::MAX as u64
+        {
+            return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
+        }
+
+        if self.zone_capacity == 0
+            || self.zone_capacity > self.zone_size
+            || (self.zone_capacity % (1 << 20)) != 0
+        {
+            bail!(
+                "zone_capacity {} is invalid: it has to be a multiple of 1MiB and not bigger than zone_size {}",
+                self.zone_capacity,
+                self.zone_size
+            );
+        }
+
+        if ((self.zone_nr_conv as u64) * self.zone_size) >= self.size {
+            return Err(anyhow::anyhow!("Too many conventioanl zones"));
+        }
+
+        // It is fine to be bigger than zone size, and preallocation is
+        // always capped by zone capacity.
+        if !super::args::is_power2_of(self.pre_alloc_size, 4096) {
+            bail!(
+                "pre_alloc_size {} is invalid: it has to be power of 2 and not less than 4096",
+                self.pre_alloc_size
+            );
+        }
+        Ok(())
+    }
+
+    /// Max open & active zones can't be enforced if they aren't less than
+    /// sequential zones, and max open zones can't be bigger than max
+    /// active zones. Adjust them as null_blk does, otherwise the limits are
+    /// rejected by kernel.
+    ///
+    /// Has to be called after `validate()`.
+    fn adjust_zone_limits(&mut self) {
+        let nr_seq = (self.size / self.zone_size) as u32 - self.zone_nr_conv;
+
+        if self.zone_max_active >= nr_seq {
+            self.zone_max_active = 0;
+        }
+        if self.zone_max_active != 0 && self.zone_max_open > self.zone_max_active {
+            self.zone_max_open = self.zone_max_active;
+        } else if self.zone_max_open >= nr_seq {
+            self.zone_max_open = 0;
+        }
+    }
+
     /// Parse a size argument (default unit MiB) into whole MiB; sizes
     /// that aren't a multiple of 1MiB would otherwise be truncated.
     fn parse_mib(name: &str, val: &str) -> anyhow::Result<u32> {
@@ -166,9 +226,14 @@ impl TgtCfg {
         };
         let s = Self::parse_mib("size", &a.size)?;
         let zs = Self::parse_mib("zone_size", &a.zone_size)?;
+        // zone capacity is same with zone size if it isn't specified
+        let zc = match a.zone_capacity {
+            Some(ref c) => Self::parse_mib("zone_capacity", c)?,
+            None => zs,
+        };
         let za = Self::parse_mib("pre_alloc_size", &a.pre_alloc_size)?;
         let ma_zones = a.max_active_zones;
-        let tcfg = Self::new(s, zs, a.conv_zones, a.max_open_zones, ma_zones, p, za);
+        let tcfg = Self::new(s, zs, zc, a.conv_zones, a.max_open_zones, ma_zones, p, za);
 
         Ok(tcfg)
     }
@@ -183,10 +248,29 @@ impl TgtCfg {
 
     fn save_file_json(&self, p: &PathBuf) -> anyhow::Result<()> {
         let json_string = serde_json::to_string_pretty(self)?;
-        let mut f = OpenOptions::new().create(true).write(true).open(p)?;
-        f.write_all(json_string.as_bytes())?;
-        let _ = f.flush();
-        Ok(())
+
+        // Write to one temporary file first, then rename it, so partial
+        // content is never left in `p` if writing fails, such as no space,
+        // otherwise this directory can't be used any more.
+        let mut tmp = p.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let write = || -> anyhow::Result<()> {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(json_string.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, p)?;
+            Ok(())
+        };
+        let res = write();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     }
 
     fn is_parent_of(parent: &PathBuf, child: &PathBuf) -> bool {
@@ -223,7 +307,7 @@ impl TgtCfg {
                 .collect();
             let base = p.parent().expect("no parent?").to_path_buf();
             let za = Self::get_pre_alloc_size(zo)?;
-            let c = TgtCfg::new(n[0], n[1], n[2], n[3], n[4], Some(base), za);
+            let c = TgtCfg::new(n[0], n[1], n[1], n[2], n[3], n[4], Some(base), za);
             return Ok(c);
         }
         anyhow::bail!("faile to create TgtCfg from file")
@@ -235,45 +319,79 @@ struct ZoneJson {
     path: PathBuf,
 }
 
+/// Anonymous private mapping for holding data of ram-backed zoned.
+///
+/// Pages are allocated when they are written, and both unwritten pages and
+/// pages discarded by MADV_DONTNEED are guaranteed to be read as zero, which
+/// is required for reading behind write pointer and for resetting zone.
+struct RamBuf {
+    addr: usize,
+    len: usize,
+}
+
+impl RamBuf {
+    fn new(len: usize) -> anyhow::Result<Self> {
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            anyhow::bail!(
+                "fail to allocate {} bytes for ram-backed zoned: {}",
+                len,
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(RamBuf {
+            addr: addr as usize,
+            len,
+        })
+    }
+}
+
+impl Drop for RamBuf {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.addr as *mut c_void, self.len) };
+    }
+}
+
 struct ZonedTgt {
     start: u64,
     nr_zones: u32,
     zones: Vec<Zone>,
     data: RwLock<TgtData>,
-    _buf: Option<IoBuf<u8>>,
+    _buf: Option<RamBuf>,
     zfiles: Vec<File>,
     cfg: TgtCfg,
-    base_file: Option<File>,
+    // lock of the base directory, which is released when it is closed
+    _base_lock: Option<File>,
     // queue of the flush thread, each flush sends the eventfd to be
     // written when it is done
     flush_tx: Option<Sender<Arc<EventFd>>>,
 }
 
-impl Drop for ZonedTgt {
-    fn drop(&mut self) {
-        self.unlock_base();
+/// Lock the base directory, which is owned by one zoned device only. The
+/// lock is released when the returned file is closed.
+fn lock_base_dir(dir: &std::path::Path) -> anyhow::Result<File> {
+    let h = OpenOptions::new().read(true).open(dir)?;
+    let res = unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if res != 0 {
+        anyhow::bail!(
+            "fail to lock {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        );
     }
+    Ok(h)
 }
 
 impl ZonedTgt {
-    fn lock_base(&mut self) -> anyhow::Result<()> {
-        let base = self.cfg.base.clone();
-        if let Some(ref dir) = base {
-            let h = OpenOptions::new().read(true).open(dir)?;
-            let res = unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if res != 0 {
-                anyhow::bail!("fail to lock {}", dir.display());
-            }
-            self.base_file = Some(h);
-        }
-        Ok(())
-    }
-    fn unlock_base(&self) {
-        if let Some(ref h) = self.base_file {
-            unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-
     /// All flushes of this device are handled by one thread, so syncfs()
     /// isn't called from the queue threads.
     ///
@@ -368,6 +486,14 @@ impl ZonedTgt {
     }
 
     fn __update_seq_zone(&self, z: &Zone, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<()> {
+        // There isn't zone file for ram-backed zoned, and its zone condition
+        // and write pointer in memory are the only copy, which is always
+        // updated before any io is started.
+        if self.ram_backed() {
+            zs.clear_seq_err();
+            return Ok(());
+        }
+
         let zno = self.get_zone_no(z.start);
         let secs = match self.back_file_size(zno) {
             Ok(s) => s >> 9,
@@ -379,18 +505,46 @@ impl ZonedTgt {
             anyhow::bail!(ZIOError::UpdateSeq("file size 2big".to_string()));
         }
 
+        let old_cond = zs.cond;
         if secs == 0 {
             zs.cond = BLK_ZONE_COND_EMPTY;
             zs.wp = z.start;
         } else if secs == (z.capacity as u64) {
             zs.cond = BLK_ZONE_COND_FULL;
-            zs.wp = z.start + self.cfg.zone_size;
+            zs.wp = z.start + z.len as u64;
         } else {
             zs.cond = BLK_ZONE_COND_CLOSED;
             zs.wp = z.start + secs;
         }
+        self.account_cond_change(old_cond, zs.cond);
         zs.clear_seq_err();
         Ok(())
+    }
+
+    /// Update open & closed zones counters after zone condition is changed
+    /// from `old` to `new`, both have to be called with the zone locked.
+    fn account_cond_change(
+        &self,
+        old: libublk::sys::blk_zone_cond,
+        new: libublk::sys::blk_zone_cond,
+    ) {
+        if old == new {
+            return;
+        }
+
+        let mut data = self.data.write().unwrap();
+        match old {
+            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
+            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
+            BLK_ZONE_COND_CLOSED => data.nr_zones_closed -= 1,
+            _ => {}
+        }
+        match new {
+            BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open += 1,
+            BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open += 1,
+            BLK_ZONE_COND_CLOSED => data.nr_zones_closed += 1,
+            _ => {}
+        }
     }
 
     fn update_seq_zone(&self, zno: u32) -> anyhow::Result<()> {
@@ -401,23 +555,31 @@ impl ZonedTgt {
     }
 
     #[allow(clippy::uninit_vec)]
-    fn new(cfg: TgtCfg, new_dev: bool) -> anyhow::Result<ZonedTgt> {
+    fn new(cfg: TgtCfg, new_dev: bool, base_lock: Option<File>) -> anyhow::Result<ZonedTgt> {
         let ram_backed = cfg.base.is_none();
         let _buf = if ram_backed {
-            Some(IoBuf::<u8>::new(cfg.size as usize))
+            let size = usize::try_from(cfg.size).map_err(|_| {
+                anyhow::anyhow!("size {} is too big for ram-backed zoned", cfg.size)
+            })?;
+            Some(RamBuf::new(size)?)
         } else {
             None
         };
         let buf_addr = match _buf {
             None => 0,
-            Some(ref val) => val.as_mut_ptr() as u64,
+            Some(ref val) => val.addr as u64,
         };
         let zone_cap = cfg.zone_capacity >> 9;
         let nr_zones = cfg.size / cfg.zone_size;
 
         let zones: Vec<Zone> = (0..nr_zones as usize)
             .map(|i| Zone {
-                capacity: zone_cap as u32,
+                // only sequential zone can have smaller capacity than its size
+                capacity: if i < cfg.zone_nr_conv as usize {
+                    (cfg.zone_size >> 9) as u32
+                } else {
+                    zone_cap as u32
+                },
                 len: (cfg.zone_size >> 9) as u32,
                 r#type: if i < cfg.zone_nr_conv as usize {
                     BLK_ZONE_TYPE_CONVENTIONAL
@@ -447,23 +609,26 @@ impl ZonedTgt {
             _buf,
             zfiles: Vec::new(),
             cfg,
-            base_file: None,
+            _base_lock: base_lock,
             flush_tx: None,
         };
 
         if !ram_backed {
-            dev.lock_base()?;
+            // the base directory is locked already if `superblock.json` is
+            // read or created for adding device
+            if dev._base_lock.is_none() {
+                if let Some(ref dir) = dev.cfg.base {
+                    dev._base_lock = Some(lock_base_dir(dir)?);
+                }
+            }
             dev.install_zone_files(new_dev)?;
             for zno in 0..dev.nr_zones as usize {
                 if new_dev {
                     dev.setup_zone_backing_file(zno as u32)?;
                 }
+                // closed zones are counted when updating zone
                 if zno >= dev.cfg.zone_nr_conv.try_into().unwrap() {
                     dev.update_seq_zone(zno as u32)?;
-                    if dev.zones[zno].get_cond() == BLK_ZONE_COND_CLOSED {
-                        let mut data = dev.data.write().unwrap();
-                        data.nr_zones_closed += 1;
-                    }
                 }
             }
             dev.start_flush_thread();
@@ -567,9 +732,10 @@ impl ZonedTgt {
         let start = (sector << 9) & (zsize - 1);
         let end = start + ((nr_sects << 9) as u64);
         let za_start = super::args::round_up(start, za_size);
-        let za_end = super::args::round_up(end, za_size);
+        // nothing can be written behind zone capacity
+        let za_end = super::args::round_up(end, za_size).min(self.cfg.zone_capacity);
 
-        if za_start == za_end {
+        if za_start >= za_end {
             return;
         }
 
@@ -659,25 +825,20 @@ impl ZonedTgt {
             return Err(anyhow::anyhow!("reset conventional zone"));
         }
 
-        match zs.cond {
+        let old_cond = zs.cond;
+        match old_cond {
             BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return Ok(0),
-            BLK_ZONE_COND_IMP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_imp_open -= 1;
-            }
-            BLK_ZONE_COND_EXP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_exp_open -= 1;
-            }
-            BLK_ZONE_COND_CLOSED => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_closed -= 1;
-            }
-            BLK_ZONE_COND_FULL => {}
+            BLK_ZONE_COND_IMP_OPEN
+            | BLK_ZONE_COND_EXP_OPEN
+            | BLK_ZONE_COND_CLOSED
+            | BLK_ZONE_COND_FULL => {}
             _ => return Err(anyhow::anyhow!("bad zone cond {} in zone_reset", zs.cond)),
         }
 
+        // Zone condition isn't changed if discarding zone fails, so update
+        // the counters after it succeeds.
         self.discard_zone(self.get_zone_no(sector), &mut zs)?;
+        self.account_cond_change(old_cond, BLK_ZONE_COND_EMPTY);
 
         let start = z.start;
         zs.cond = BLK_ZONE_COND_EMPTY;
@@ -776,34 +937,28 @@ impl ZonedTgt {
             return Err(anyhow::anyhow!("finish conventional zone"));
         }
 
-        match zs.cond {
+        let old_cond = zs.cond;
+        match old_cond {
             // finish operation on full is not an error
-            BLK_ZONE_COND_FULL => {}
-            BLK_ZONE_COND_EMPTY => {
-                self.check_zone_resources(BLK_ZONE_COND_EMPTY)?;
-            }
-            BLK_ZONE_COND_IMP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_imp_open -= 1;
-            }
-            BLK_ZONE_COND_EXP_OPEN => {
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_exp_open -= 1;
-            }
-            BLK_ZONE_COND_CLOSED => {
-                self.check_zone_resources(BLK_ZONE_COND_CLOSED)?;
-                let mut data = self.data.write().unwrap();
-                data.nr_zones_closed -= 1;
+            BLK_ZONE_COND_FULL | BLK_ZONE_COND_IMP_OPEN | BLK_ZONE_COND_EXP_OPEN => {}
+            BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_CLOSED => {
+                self.check_zone_resources(old_cond)?;
             }
             _ => return Err(anyhow::anyhow!("bad zone cond {}", zs.cond)),
         };
 
         if !self.ram_backed() {
             let zno = self.get_zone_no(sector);
-            if let Err(e) = self.back_file_truncate(zno, self.cfg.zone_size) {
+            // The zone file can't be bigger than zone capacity, and write
+            // pointer is figured out from the file size when the device is
+            // setup again.
+            if let Err(e) = self.back_file_truncate(zno, self.cfg.zone_capacity) {
                 bail!(zs.set_seq_err(format!("truncate zone {zno} file, err {e:?}")));
             }
         }
+        // Zone condition isn't changed if truncating zone file fails, so
+        // update the counters after it succeeds.
+        self.account_cond_change(old_cond, BLK_ZONE_COND_FULL);
         zs.cond = BLK_ZONE_COND_FULL;
         zs.wp = z.start + z.len as u64;
         zs.clear_seq_err();
@@ -813,13 +968,21 @@ impl ZonedTgt {
 
     fn discard_zone(&self, zno: u32, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<i32> {
         if self.ram_backed() {
-            unsafe {
-                let off = zno as u64 * self.cfg.zone_size;
-
+            let off = zno as u64 * self.cfg.zone_size;
+            let res = unsafe {
                 libc::madvise(
                     (self.start + off) as *mut libc::c_void,
                     self.cfg.zone_size.try_into().unwrap(),
                     libc::MADV_DONTNEED,
+                )
+            };
+            // old data would be read behind write pointer after this zone
+            // is written again, so the zone can't be reset
+            if res != 0 {
+                anyhow::bail!(
+                    "discard ram-backed zone {} failed: {}",
+                    zno,
+                    std::io::Error::last_os_error()
                 );
             }
         } else if let Err(e) = self.back_file_truncate(zno, 0) {
@@ -841,7 +1004,9 @@ fn handle_report_zones(
     let blkz_sz = core::mem::size_of::<libublk::sys::blk_zone>() as u32;
 
     // USER_COPY is enabled, so we have to allocate buffer for report_zones
-    let buf = IoBuf::<u8>::new((blkz_sz * zones) as usize);
+    // and it has to be zeroed, since not all fields of `blk_zone` are filled
+    let mut buf = IoBuf::<u8>::new((blkz_sz * zones) as usize);
+    buf.zero_buf();
     let buf_addr = buf.as_mut_ptr();
     let mut off = buf_addr as u64;
 
@@ -1100,6 +1265,12 @@ async fn handle_write(
     let zone_end = z.start + z.capacity as u64;
     let (wp, sector) = {
         let mut zs = z.get_stat_mut();
+
+        // Zone condition and write pointer have to be updated first, before
+        // any of them is checked.
+        if zs.is_seq_err() {
+            tgt.__update_seq_zone(z, &mut zs)?;
+        }
         let cond = zs.cond;
 
         if cond == BLK_ZONE_COND_FULL
@@ -1116,10 +1287,6 @@ async fn handle_write(
 
         if zs.wp + iod.nr_sectors as u64 > zone_end {
             return Err(anyhow::anyhow!("write out of zone"));
-        }
-
-        if zs.is_seq_err() {
-            tgt.__update_seq_zone(z, &mut zs)?;
         }
 
         if cond == BLK_ZONE_COND_CLOSED || cond == BLK_ZONE_COND_EMPTY {
@@ -1152,16 +1319,14 @@ async fn handle_write(
     if wp == zone_end {
         let mut zs = z.get_stat_mut();
 
-        if zs.cond != BLK_ZONE_COND_FULL {
-            if zs.cond == BLK_ZONE_COND_EXP_OPEN {
-                let mut data = tgt.data.write().unwrap();
-
-                data.nr_zones_exp_open -= 1;
-            } else if zs.cond == BLK_ZONE_COND_IMP_OPEN {
-                let mut data = tgt.data.write().unwrap();
-
-                data.nr_zones_imp_open -= 1;
-            }
+        // The zone isn't locked when this write is in progress, so it may
+        // have been closed, either explicitly or implicitly for opening
+        // another zone, and it may have been finished or reset too.
+        //
+        // So account from its current condition, and leave the zone alone
+        // if its write pointer has been moved.
+        if zs.wp == zone_end && zs.cond != BLK_ZONE_COND_FULL {
+            tgt.account_cond_change(zs.cond, BLK_ZONE_COND_FULL);
             zs.cond = BLK_ZONE_COND_FULL;
         }
     }
@@ -1293,10 +1458,19 @@ pub(crate) struct ZonedAddArgs {
 
     #[clap(
         long,
+        help = "zone capacity of sequential zones, the writable part from the\n\
+        start of each zone, default unit is MiB, with common suffixes supported\n\
+        ([B|KiB|MiB|GiB]), has to be a multiple of 1MiB and can't be bigger\n\
+        than zone size. Default: same as zone size"
+    )]
+    zone_capacity: Option<String>,
+
+    #[clap(
+        long,
         default_value = "256MiB",
         help = "how many bytes preallocated before appending data to zone, default\n\
-        unit is MiB, with common suffixes supported([B|KiB|MiB|GiB]), can't be\n\
-        bigger than zone size and has to be power2_of"
+        unit is MiB, with common suffixes supported([B|KiB|MiB|GiB]), has to\n\
+        be power of 2, and preallocation is capped by zone capacity"
     )]
     pre_alloc_size: String,
 
@@ -1304,22 +1478,26 @@ pub(crate) struct ZonedAddArgs {
     #[clap(long, default_value_t = 2)]
     conv_zones: u32,
 
-    /// Max open zones allowed
+    /// Max open zones allowed, 0 means no limit. It is capped by max
+    /// active zones, and disabled if it isn't less than sequential zones
     #[clap(long, default_value_t = 0)]
     max_open_zones: u32,
 
-    /// Max active zones allowed
+    /// Max active zones allowed, 0 means no limit. It is disabled if it
+    /// isn't less than sequential zones
     #[clap(long, default_value_t = 0)]
     max_active_zones: u32,
 }
 
-fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
+/// Return zoned parameters, if the device is one new one, and the locked
+/// base directory for file-backed zoned.
+fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool, Option<File>)> {
     if zo.path.is_none() {
         if zo.gen_arg.user_recovery {
             return Err(anyhow::anyhow!("zoned(ramdisk) can't support recovery\n"));
         }
 
-        Ok((TgtCfg::from_argument(zo)?, true))
+        Ok((TgtCfg::from_argument(zo)?, true, None))
     } else {
         let path = zo.path.clone().ok_or(PathBuf::new()).expect("path failure");
         let path = zo.gen_arg.build_abs_path(path);
@@ -1327,19 +1505,30 @@ fn parse_zone_params(zo: &ZonedAddArgs) -> anyhow::Result<(TgtCfg, bool)> {
         if !path.exists() {
             return Err(anyhow::anyhow!("base dir doesn't exist"));
         }
+        // `superblock.json` can be created, and it is removed if setting up
+        // the new device fails, so the directory has to be locked first,
+        // otherwise the one of another live device may be overwritten or
+        // removed.
+        let lock = Some(lock_base_dir(&path)?);
         let zf = path.join("superblock");
         let zfj = path.join("superblock.json");
         if zfj.exists() {
-            Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false))
+            Ok((TgtCfg::from_file_json(&zfj, Some(zo))?, false, lock))
         } else if zf.exists() {
-            let c = TgtCfg::from_file(&zf, Some(zo))?;
+            let mut c = TgtCfg::from_file(&zf, Some(zo))?;
+            c.validate()?;
+            c.adjust_zone_limits();
             c.save_file_json(&zfj)?;
             std::fs::remove_file(zf)?;
-            Ok((c, false))
+            Ok((c, false, lock))
         } else {
-            let c = TgtCfg::from_argument(zo)?;
+            let mut c = TgtCfg::from_argument(zo)?;
+            // don't leave bad parameters in `superblock.json`, which can't
+            // be overridden from command line any more
+            c.validate()?;
+            c.adjust_zone_limits();
             c.save_file_json(&zfj)?;
-            Ok((c, true))
+            Ok((c, true, lock))
         }
     }
 }
@@ -1350,7 +1539,7 @@ pub(crate) fn ublk_add_zoned(
     comm_arc: &Arc<crate::DevIdComm>,
 ) -> anyhow::Result<i32> {
     //It doesn't make sense to support recovery for zoned_ramdisk
-    let (cfg, is_new) = match opt {
+    let (mut cfg, is_new, base_lock) = match opt {
         Some(ref o) => parse_zone_params(o)?,
         None => match ctrl.get_target_data_from_json() {
             Some(val) => {
@@ -1360,7 +1549,7 @@ pub(crate) fn ublk_add_zoned(
                 match tgt_data {
                     Ok(t) => {
                         let p = t.path.join("superblock.json");
-                        (TgtCfg::from_file_json(&p, None)?, false)
+                        (TgtCfg::from_file_json(&p, None)?, false, None)
                     }
                     Err(_) => return Err(anyhow::anyhow!("wrong json data")),
                 }
@@ -1369,22 +1558,9 @@ pub(crate) fn ublk_add_zoned(
         },
     };
 
-    if cfg.zone_size == 0
-        || !cfg.zone_size.is_power_of_two()
-        || cfg.size < cfg.zone_size
-        || (cfg.size % cfg.zone_size) != 0
-        || (cfg.zone_size % 512) != 0
-    {
-        return Err(anyhow::anyhow!("size or zone_size is invalid\n"));
-    }
-
-    if ((cfg.zone_nr_conv as u64) * cfg.zone_size) >= cfg.size {
-        return Err(anyhow::anyhow!("Too many conventioanl zones"));
-    }
-
-    if cfg.pre_alloc_size > cfg.zone_size && !super::args::is_power2_of(cfg.pre_alloc_size, 4096) {
-        bail!(anyhow::anyhow!("bad pre_alloc_size"));
-    }
+    cfg.validate()?;
+    // `superblock.json` may be created before the limits are adjusted
+    cfg.adjust_zone_limits();
 
     let cfg_i = cfg.clone();
     let tgt_init = |dev: &mut UblkDev| {
@@ -1394,7 +1570,7 @@ pub(crate) fn ublk_add_zoned(
         dev.tgt.params.zoned = libublk::sys::ublk_param_zoned {
             max_open_zones: cfg_i.zone_max_open,
             max_active_zones: cfg_i.zone_max_active,
-            max_zone_append_sectors: (cfg_i.zone_size >> 9) as u32,
+            max_zone_append_sectors: (cfg_i.zone_capacity >> 9) as u32,
             ..Default::default()
         };
 
@@ -1410,7 +1586,34 @@ pub(crate) fn ublk_add_zoned(
         Ok(())
     };
 
-    let zoned_tgt = Arc::new(ZonedTgt::new(cfg, is_new)?);
+    // `superblock.json` of new device is created already, and remove it if
+    // the device can't be setup, otherwise this directory can't be used any
+    // more because zone files are expected to exist next time.
+    let new_sb = match (is_new, &cfg.base) {
+        (true, Some(base)) => Some(base.join("superblock.json")),
+        _ => None,
+    };
+    // keep the base directory locked until `superblock.json` is removed
+    let sb_lock = match (&new_sb, &base_lock) {
+        (Some(sb), Some(l)) => match l.try_clone() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                let _ = std::fs::remove_file(sb);
+                return Err(e.into());
+            }
+        },
+        _ => None,
+    };
+    let zoned_tgt = match ZonedTgt::new(cfg, is_new, base_lock) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            if let Some(sb) = new_sb {
+                let _ = std::fs::remove_file(sb);
+            }
+            return Err(e);
+        }
+    };
+    drop(sb_lock);
     let depth = ctrl.dev_info().queue_depth;
 
     match ctrl.get_driver_features() {
@@ -1456,10 +1659,12 @@ pub(crate) fn ublk_add_zoned(
     };
 
     let comm = comm_arc.clone();
+    // Return the failure to caller, so that the parent of daemon can be
+    // notified, instead of waiting for the device forever.
     ctrl.run_target(tgt_init, q_handler, move |ctrl: &_| {
         comm.send_dev_id(ctrl.dev_info().dev_id).unwrap();
     })
-    .unwrap();
+    .map_err(|e| anyhow::anyhow!("run zoned target failed: {:?}", e))?;
 
     Ok(0)
 }
