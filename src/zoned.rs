@@ -319,12 +319,54 @@ struct ZoneJson {
     path: PathBuf,
 }
 
+/// Anonymous private mapping for holding data of ram-backed zoned.
+///
+/// Pages are allocated when they are written, and both unwritten pages and
+/// pages discarded by MADV_DONTNEED are guaranteed to be read as zero, which
+/// is required for reading behind write pointer and for resetting zone.
+struct RamBuf {
+    addr: usize,
+    len: usize,
+}
+
+impl RamBuf {
+    fn new(len: usize) -> anyhow::Result<Self> {
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            anyhow::bail!(
+                "fail to allocate {} bytes for ram-backed zoned: {}",
+                len,
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(RamBuf {
+            addr: addr as usize,
+            len,
+        })
+    }
+}
+
+impl Drop for RamBuf {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.addr as *mut c_void, self.len) };
+    }
+}
+
 struct ZonedTgt {
     start: u64,
     nr_zones: u32,
     zones: Vec<Zone>,
     data: RwLock<TgtData>,
-    _buf: Option<IoBuf<u8>>,
+    _buf: Option<RamBuf>,
     zfiles: Vec<File>,
     cfg: TgtCfg,
     // lock of the base directory, which is released when it is closed
@@ -516,13 +558,16 @@ impl ZonedTgt {
     fn new(cfg: TgtCfg, new_dev: bool, base_lock: Option<File>) -> anyhow::Result<ZonedTgt> {
         let ram_backed = cfg.base.is_none();
         let _buf = if ram_backed {
-            Some(IoBuf::<u8>::new(cfg.size as usize))
+            let size = usize::try_from(cfg.size).map_err(|_| {
+                anyhow::anyhow!("size {} is too big for ram-backed zoned", cfg.size)
+            })?;
+            Some(RamBuf::new(size)?)
         } else {
             None
         };
         let buf_addr = match _buf {
             None => 0,
-            Some(ref val) => val.as_mut_ptr() as u64,
+            Some(ref val) => val.addr as u64,
         };
         let zone_cap = cfg.zone_capacity >> 9;
         let nr_zones = cfg.size / cfg.zone_size;
@@ -923,13 +968,21 @@ impl ZonedTgt {
 
     fn discard_zone(&self, zno: u32, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<i32> {
         if self.ram_backed() {
-            unsafe {
-                let off = zno as u64 * self.cfg.zone_size;
-
+            let off = zno as u64 * self.cfg.zone_size;
+            let res = unsafe {
                 libc::madvise(
                     (self.start + off) as *mut libc::c_void,
                     self.cfg.zone_size.try_into().unwrap(),
                     libc::MADV_DONTNEED,
+                )
+            };
+            // old data would be read behind write pointer after this zone
+            // is written again, so the zone can't be reset
+            if res != 0 {
+                anyhow::bail!(
+                    "discard ram-backed zone {} failed: {}",
+                    zno,
+                    std::io::Error::last_os_error()
                 );
             }
         } else if let Err(e) = self.back_file_truncate(zno, 0) {
