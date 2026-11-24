@@ -313,7 +313,9 @@ fn ublk_recover(opt: args::UblkArgs) -> anyhow::Result<i32> {
         daemonize::Outcome::Child(Ok(_)) => ublk_recover_work(opt),
         daemonize::Outcome::Parent(Ok(_)) => {
             let mut ctrl = UblkCtrl::new_simple(id)?;
-            ublk_state_wait_until(&mut ctrl, libublk::sys::UBLK_S_DEV_LIVE, 5000)?;
+            // recovering may take a while, such as replaying or scanning what
+            // is stored in the backing
+            ublk_state_wait_until(&mut ctrl, libublk::sys::UBLK_S_DEV_LIVE, 30000)?;
 
             if (ctrl.dev_info().ublksrv_flags & target_flags::TGT_QUIET) == 0 {
                 ctrl.dump();
