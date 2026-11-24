@@ -444,6 +444,14 @@ impl ZonedTgt {
     }
 
     fn __update_seq_zone(&self, z: &Zone, zs: &mut WLGuard<'_, ZoneState>) -> anyhow::Result<()> {
+        // There isn't zone file for ram-backed zoned, and its zone condition
+        // and write pointer in memory are the only copy, which is always
+        // updated before any io is started.
+        if self.ram_backed() {
+            zs.clear_seq_err();
+            return Ok(());
+        }
+
         let zno = self.get_zone_no(z.start);
         let secs = match self.back_file_size(zno) {
             Ok(s) => s >> 9,
