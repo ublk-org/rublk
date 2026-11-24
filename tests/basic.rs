@@ -292,6 +292,39 @@ mod integration {
         }
     }
 
+    /// Kill every process which is started by `argv`, or forked from that
+    /// process without exec, such as the daemon of `rublk add`, which runs in
+    /// its own session and isn't killed with its parent.
+    fn kill_by_cmdline(argv: &[String]) {
+        let mut cmdline = argv.join("\0").into_bytes();
+        cmdline.push(0);
+
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            else {
+                continue;
+            };
+            if std::fs::read(entry.path().join("cmdline")).ok().as_deref() == Some(&cmdline[..]) {
+                let _ = Command::new("kill")
+                    .args(["-9", pid])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    /// Run rublk command and return its stdout, which has `exp_len` bytes at
+    /// least.
+    ///
+    /// Panic if the command fails or the expected output can't be observed,
+    /// instead of waiting for the output forever.
     fn run_rublk_cmd(s: Vec<&str>, exp_len: usize) -> String {
         let tgt_dir = get_curr_bin_dir().unwrap();
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
@@ -300,25 +333,42 @@ mod integration {
 
         //println!("top dir: path {:?} {:?}", &tgt_dir, &file);
         let rd_path = tgt_dir.display().to_string() + &"/rublk".to_string();
+        let cmdline = s.join(" ");
+        let argv: Vec<String> = std::iter::once(rd_path.clone())
+            .chain(s.iter().map(|a| a.to_string()))
+            .collect();
         let mut cmd = Command::new(&rd_path)
             .args(s)
             .stdout(Stdio::from(file))
             .spawn()
             .expect("Failed to execute process");
 
-        if !fg {
-            cmd.wait().unwrap();
-        }
-        let buf = loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let _buf = std::fs::read_to_string(tmpfile.path()).unwrap();
+        // Wait for 60 seconds at most. The background command may never exit
+        // if its daemon dies without telling it anything.
+        for _ in 0..3000 {
+            let status = cmd.try_wait().unwrap();
+            let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
 
-            if _buf.len() >= exp_len {
-                break _buf;
+            match (fg, status) {
+                // foreground command keeps running after its output is done
+                (true, _) if buf.len() >= exp_len => return buf,
+                (true, Some(status)) => panic!("`rublk {}` exits early: {}", cmdline, status),
+                // the whole output is available after background command exits
+                (false, Some(status)) => {
+                    assert!(status.success(), "`rublk {}` fails: {}", cmdline, status);
+                    let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
+                    assert!(buf.len() >= exp_len, "`rublk {}`: short output", cmdline);
+                    return buf;
+                }
+                _ => {}
             }
-        };
-
-        buf
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = cmd.kill();
+        let _ = cmd.wait();
+        // the daemon may be still running
+        kill_by_cmdline(&argv);
+        panic!("`rublk {}` isn't done in 60 seconds", cmdline);
     }
 
     fn run_rublk_add_dev(s: Vec<&str>) -> UblkCtrl {
@@ -577,12 +627,20 @@ mod integration {
             })
             .collect();
 
-        if zones.is_empty() {
-            eprintln!("blkzone doesn't report zone capacity: {}", out);
-            None
-        } else {
-            Some(zones)
+        // Zone capacity isn't reported by old blkzone, which is the only
+        // reason for returning nothing, then the caller can skip its test.
+        let nr_zones = out.lines().filter(|l| l.contains("start: 0x")).count();
+        if nr_zones > 0 && !out.contains(", cap 0x") {
+            println!("SKIP: blkzone doesn't report zone capacity");
+            return None;
         }
+        // otherwise every zone has to be parsed
+        assert!(
+            nr_zones > 0 && zones.len() == nr_zones,
+            "can't parse blkzone report: {}",
+            out
+        );
+        Some(zones)
     }
 
     fn blkzone_mgmt(ctrl: &UblkCtrl, op: &str, start: u64) -> bool {
@@ -1141,7 +1199,7 @@ mod integration {
         let probe = path_dir.path().join("seq-000000");
         std::fs::write(&probe, "").unwrap();
         if !chattr(0, "+a") {
-            eprintln!("append-only file isn't supported in {}", path_str);
+            println!("SKIP: append-only file isn't supported in {}", path_str);
             return;
         }
         assert!(chattr(0, "-a"));
