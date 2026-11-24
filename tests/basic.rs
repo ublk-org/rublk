@@ -47,6 +47,40 @@ mod integration {
             .is_ok()
     }
 
+    /// Mark the io errors of one ublk device as expected in kernel log, until
+    /// this guard is dropped.
+    ///
+    /// Tests covering rejected io make kernel log io errors, which look
+    /// like real failures for people reading the kernel log.
+    struct ExpectIoErrors(String);
+
+    impl ExpectIoErrors {
+        fn new(test: &str, ctrl: &UblkCtrl) -> Self {
+            let bdev = ctrl.get_bdev_path();
+            let name = bdev.rsplit('/').next().unwrap_or(&bdev);
+            let tag = format!("{} {}", test, name);
+
+            Self::kmsg(&format!("BEGIN {}", tag));
+            ExpectIoErrors(tag)
+        }
+
+        // it is just one hint, so ignore any failure
+        fn kmsg(msg: &str) {
+            use std::io::Write;
+
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+                let _ =
+                    f.write_all(format!("[RUBLK-TEST] EXPECTED IO ERRORS {}\n", msg).as_bytes());
+            }
+        }
+    }
+
+    impl Drop for ExpectIoErrors {
+        fn drop(&mut self) {
+            Self::kmsg(&format!("END {}", self.0));
+        }
+    }
+
     fn has_blkzone() -> bool {
         Command::new("blkzone")
             .arg("--version")
@@ -410,6 +444,7 @@ mod integration {
         }
         let tf = |ctrl: &UblkCtrl, _bs: u32, _file_size: usize| {
             // closing one empty zone is rejected
+            let expect = ExpectIoErrors::new("zoned_failed_mgmt_cmd", ctrl);
             let mut child = Command::new("blkzone")
                 .args(["close", "-o", "0", "-c", "1", &ctrl.get_bdev_path()])
                 .stdout(Stdio::null())
@@ -426,6 +461,7 @@ mod integration {
             }
             let status = status.expect("zone close isn't completed");
             assert!(!status.success());
+            drop(expect);
 
             // the device still works
             read_ublk_disk(ctrl);
@@ -604,6 +640,11 @@ mod integration {
             &zc_str,
             "--conv-zones",
             &conv_str,
+            // 1M write is used for covering rejected write, and keep it as
+            // one single request, otherwise the split 2nd half is aborted by
+            // kernel with one extra warning
+            "--io-buf-size",
+            "1MiB",
         ]
         .to_vec();
         if let Some(d) = dir {
@@ -638,6 +679,7 @@ mod integration {
                 return;
             }
         };
+        let expect = ExpectIoErrors::new("zoned_capacity", &ctrl);
         check_geometry(&zones);
         assert!(zones[1..].iter().all(|z| z.cond == ZONE_COND_EMPTY));
 
@@ -776,6 +818,7 @@ mod integration {
             assert!(dd_write_dev(&ctrl, &pattern_str, 1, 3 * zs_mb + 2, 1));
             assert!(report()[3].wptr == 3 * MB);
         }
+        drop(expect);
         run_rublk_del_dev(ctrl, false);
 
         // Add the device again from the existing directory: parameters are
@@ -942,7 +985,9 @@ mod integration {
     /// conventional zone
     fn add_zoned_4m_3m(extra: &[&str]) -> UblkCtrl {
         let cmdline = ["add", "zoned", "--zone-size", "4", "--zone-capacity", "3"];
-        let conv = ["--conv-zones", "0"];
+        // 1M rejected write is handled as one single request, see
+        // __test_ublk_zoned_capacity()
+        let conv = ["--conv-zones", "0", "--io-buf-size", "1MiB"];
 
         run_rublk_add_dev([&cmdline[..], &conv[..], extra].concat())
     }
@@ -964,12 +1009,14 @@ mod integration {
         const MB: u64 = (1 << 20) >> 9; // sectors
         const ZS: u64 = 4; // MiB
         const ZONE_COND_EXP_OPEN: u32 = 3;
+        const TEST: &str = "zoned_mgmt_limits";
         let limits = ["--max-open-zones", "2", "--max-active-zones", "3"];
         let ctrl = add_zoned_4m_3m(&[&["--size", "32"][..], &limits[..]].concat());
         if blkzone_report(&ctrl).is_none() {
             run_rublk_del_dev(ctrl, false);
             return;
         }
+        let expect = ExpectIoErrors::new(TEST, &ctrl);
         let mgmt = |op: &str, zno: u64| blkzone_mgmt(&ctrl, op, zno * ZS * MB);
         let write = |zno: u64, off_mb: u64, mbs: u64| {
             dd_write_dev(&ctrl, "/dev/zero", 1, zno * ZS + off_mb, mbs)
@@ -1055,6 +1102,7 @@ mod integration {
         assert!(write(0, 0, 1) && write(1, 0, 1) && write(2, 0, 1));
         assert!(!write(3, 0, 1));
 
+        drop(expect);
         run_rublk_del_dev(ctrl, false);
     }
 
@@ -1099,6 +1147,7 @@ mod integration {
         assert!(chattr(0, "-a"));
         std::fs::remove_file(&probe).unwrap();
 
+        const TEST: &str = "zoned_accounting_after_failure";
         let limits = ["--max-open-zones", "1", "--max-active-zones", "1"];
         let ctrl =
             add_zoned_4m_3m(&[&["--size", "32", "--path", &path_str][..], &limits[..]].concat());
@@ -1106,6 +1155,7 @@ mod integration {
             run_rublk_del_dev(ctrl, false);
             return;
         }
+        let expect = ExpectIoErrors::new(TEST, &ctrl);
         let mgmt = |op: &str, zno: u64| blkzone_mgmt(&ctrl, op, zno * ZS * MB);
         let write = |zno: u64, off_mb: u64, mbs: u64| {
             dd_write_dev(&ctrl, "/dev/zero", 1, zno * ZS + off_mb, mbs)
@@ -1159,6 +1209,7 @@ mod integration {
         assert!(write(4, 0, 1));
         assert!(!write(5, 0, 1));
 
+        drop(expect);
         run_rublk_del_dev(ctrl, false);
     }
 
